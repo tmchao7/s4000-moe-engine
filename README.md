@@ -1,66 +1,61 @@
 <p align="center">
-<img width="300" src="assets/logo.png">
+<img width="220" src="assets/logo.png">
 </p>
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+# moe-server-s4000
 
-# Nano-vLLM
+基于 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 的国产 GPU（摩尔线程 MTT S4000 / MUSA）MoE 大模型双卡推理引擎。
 
-A lightweight vLLM implementation built from scratch.
+> 本仓库 fork 自 nano-vllm（MIT License, © 2025 Xingkai Yu），上游代码保留完整 git 历史，本项目所有改动可通过 `git diff upstream/main` 查看。上游原文档见 [docs/upstream-readme.md](docs/upstream-readme.md)。
 
-## Key Features
+## 项目定位
 
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+在 ~1,400 行的轻量推理引擎 nano-vllm 基础上（上游已含 continuous batching、prefix caching、chunked prefill、CUDA graph、TP），针对摩尔线程 S4000 做三件事：
 
-## Installation
+1. **MUSA 适配**：把引擎从 CUDA 生态移植到 torch_musa + MCCL + Triton-mtgpu；
+2. **MoE 模型支持**：新增 Qwen3-MoE（30B-A3B）模型实现，含 FP8 量化权重反量化加载；
+3. **调度层扩展**：overlap scheduler、radix 前缀缓存、MoE 感知调度，逐项量化收益。
+
+目标硬件与软件栈：
+
+| 项 | 配置 |
+|---|---|
+| GPU | 2× MTT S4000（48GB / 卡，PCIe Gen5 x16） |
+| 软件栈 | torch 2.11 + torch_musa 2.11、MCCL 2.11、Triton（mtgpu backend）、Ubuntu 22.04 |
+| 目标模型 | Qwen/Qwen3-30B-A3B-Instruct-2507-FP8（30.5B 总参 / 3.3B 激活，128 专家 top-8） |
+
+## 架构
+
+```
+├── nanovllm/            # 引擎本体（fork 自上游）
+│   ├── engine/          # LLMEngine / Scheduler / ModelRunner / BlockManager
+│   ├── models/          # qwen3.py（上游）→ + qwen3_moe.py（本项目）
+│   ├── layers/          # attention / linear / layernorm / rope / sampler
+│   └── ...
+├── docs/                # 架构设计与 Roadmap
+├── benchmarks/          # 基线与优化收益记录
+└── scripts/             # 服务器侧下载 / 基准脚本
+```
+
+详细设计见 [docs/architecture.md](docs/architecture.md)，阶段计划与验收标准见 [docs/roadmap.md](docs/roadmap.md)。
+
+## Roadmap 一览
+
+- **P0** 基线：预装 vllm-musa 0.29.1 跑 Qwen3-8B（dense, bf16）TP2 工具链基线；HF transformers 加载 FP8 checkpoint 建立正确性基准
+- **P1** nano-vllm 移植 MUSA：单卡 Qwen3 dense，贪心输出与 HF 逐 token 对齐
+- **P2** Qwen3-MoE + FP8 权重反量化加载（e4m3 + block scale）+ 双卡 TP 跑通 30B-A3B
+- **P3** 调度层扩展：overlap scheduler / radix 前缀缓存 / MoE 感知调度（每项独立 benchmark）
+- **P4** OpenAI 兼容 API + 压测报告
+
+## 快速开始（NVIDIA 参考环境，继承上游）
 
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+pip install -e .
+python example.py
 ```
 
-## Model Download
+MUSA 环境各阶段运行方式见 docs/roadmap.md。
 
-To download the model weights manually, use the following command:
-```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
-```
+## License
 
-## Quick Start
-
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
-```python
-from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
-outputs[0]["text"]
-```
-
-## Benchmark
-
-See `bench.py` for benchmark.
-
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
-
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+MIT（沿用上游）
