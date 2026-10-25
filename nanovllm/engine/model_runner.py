@@ -7,10 +7,18 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.compat import DEVICE, IS_MUSA, DIST_BACKEND, accelerator
+
+
+def _model_cls(hf_config):
+    arch = (getattr(hf_config, "architectures", None) or [""])[0]
+    if "Moe" in arch:
+        return Qwen3MoeForCausalLM
+    return Qwen3ForCausalLM
 
 
 class ModelRunner:
@@ -31,7 +39,7 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device(self.device)
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = _model_cls(hf_config)(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
