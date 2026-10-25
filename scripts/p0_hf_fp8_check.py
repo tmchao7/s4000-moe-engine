@@ -31,6 +31,16 @@ def main():
         import torch, torch_musa
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        # accelerate device_map split leaves MoE grouped_mm `offs` on the wrong
+        # device with the musa (PrivateUse1) backend — align it to the weights.
+        import transformers.integrations.moe as tf_moe
+        _orig_grouped_mm = tf_moe._grouped_mm
+        def _grouped_mm_aligned(inp, w, offs=None, **kw):
+            if offs is not None and offs.device != w.device:
+                offs = offs.to(w.device)
+            return _orig_grouped_mm(inp, w, offs=offs, **kw)
+        tf_moe._grouped_mm = _grouped_mm_aligned
+
         tok = AutoTokenizer.from_pretrained(args.model)
         if args.tp == 2:
             torch.musa.set_device(0)
