@@ -56,9 +56,10 @@ def load_model(model: nn.Module, path: str):
                         try:
                             param = model.get_parameter(param_name)
                         except AttributeError:
-                            continue    # expert not owned by this rank (expert parallel)
-                        weight_loader = getattr(param, "weight_loader")
-                        weight_loader(param, tensor, shard_id)
+                            pass    # expert not owned by this rank (expert parallel)
+                        else:
+                            weight_loader = getattr(param, "weight_loader")
+                            weight_loader(param, tensor, shard_id)
                         break
                 else:
                     try:

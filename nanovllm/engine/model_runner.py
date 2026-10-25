@@ -37,7 +37,11 @@ class ModelRunner:
         dist.init_process_group(DIST_BACKEND, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         self.acc.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+        model_dtype = hf_config.dtype
+        if isinstance(model_dtype, str):
+            model_dtype = getattr(torch, model_dtype)
+        self.model_dtype = model_dtype
+        torch.set_default_dtype(model_dtype)
         torch.set_default_device(self.device)
         self.model = _model_cls(hf_config)(hf_config)
         load_model(self.model, config.model)
@@ -120,7 +124,7 @@ class ModelRunner:
         current = self.acc.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.model_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
@@ -222,6 +226,7 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None

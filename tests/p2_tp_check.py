@@ -19,6 +19,8 @@ MODEL_DIR = "/tmp/tiny_moe"
 
 def build_tiny_checkpoint():
     os.makedirs(MODEL_DIR, exist_ok=True)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29600")
     dist.init_process_group("gloo", rank=0, world_size=1)
     from transformers import Qwen3MoeConfig
     from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
@@ -29,19 +31,31 @@ def build_tiny_checkpoint():
         moe_intermediate_size=32, vocab_size=128, max_position_embeddings=512,
         rms_norm_eps=1e-6, rope_theta=10000.0, attention_bias=False,
         tie_word_embeddings=False, norm_topk_prob=True, hidden_act="silu",
-        architectures=["Qwen3MoeForCausalLM"],
+        architectures=["Qwen3MoeForCausalLM"], torch_dtype=torch.float32,
     )
     torch.manual_seed(42)
     model = Qwen3MoeForCausalLM(config)
     with torch.no_grad():
         for p in model.parameters():
-            p.copy_(torch.randn_like(p) * 0.05)
-    state = {k: v.contiguous() for k, v in model.state_dict().items()}
+            p.copy_(torch.randn_like(p) * 0.5)
+    # save HF-style names (gate_up_proj split back into gate_proj/up_proj)
+    state = {}
+    inter = config.moe_intermediate_size
+    for k, v in model.state_dict().items():
+        if "gate_up_proj" in k:
+            base = k.replace("gate_up_proj.weight", "")
+            state[base + "gate_proj.weight"] = v[:inter].contiguous()
+            state[base + "up_proj.weight"] = v[inter:].contiguous()
+        else:
+            state[k] = v.contiguous()
     from safetensors.torch import save_file
     save_file(state, os.path.join(MODEL_DIR, "model.safetensors"))
     config.save_pretrained(MODEL_DIR)
     print(f"[tp-check] tiny checkpoint saved to {MODEL_DIR} ({len(state)} tensors)")
     dist.destroy_process_group()
+    # build ran on CPU and polluted get_rope's lru_cache with a CPU rope module
+    from nanovllm.layers.rotary_embedding import get_rope
+    get_rope.cache_clear()
 
 
 def run_llm(tp):
