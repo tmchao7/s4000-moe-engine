@@ -21,3 +21,13 @@ def maybe_compile(fn):
 def accelerator():
     """torch.cuda / torch.musa module mirror."""
     return torch.musa if IS_MUSA else torch.cuda
+
+
+def math_sdp():
+    """Context forcing the math SDPA backend (fallback when flash SDPA fails on musa)."""
+    if IS_MUSA:
+        import torch_musa
+        ctx = getattr(torch.musa, "sdp_kernel", None) or torch_musa.sdp_kernel
+        return ctx(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+    import contextlib
+    return contextlib.nullcontext()

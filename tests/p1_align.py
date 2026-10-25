@@ -56,7 +56,10 @@ def main():
     ref = hf_reference(args.model, args.max_tokens)
     print("[align] running nanovllm (musa)...", flush=True)
     ours, llm = nanovllm_run(args.model, args.max_tokens)
-    llm.exit()
+    try:
+        llm.exit()
+    except Exception:
+        pass  # atexit already tore down the engine
 
     rows = []
     for p, r, o in zip(PROMPTS, ref, ours):

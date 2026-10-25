@@ -14,6 +14,8 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     assert slot_mapping.numel() == N
     flat_k = k_cache.view(-1, D)
     flat_v = v_cache.view(-1, D)
+    key = key.reshape(N, D)
+    value = value.reshape(N, D)
     if (slot_mapping < 0).any():
         valid = slot_mapping >= 0
         flat_k[slot_mapping[valid]] = key[valid]
@@ -31,20 +33,48 @@ def _gather_kv(cache, block_table, valid_len, block_size):
     return kv.view(-1, *cache.shape[-2:])[:valid_len]
 
 
-def _expand_kv(kv: torch.Tensor, num_heads: int) -> torch.Tensor:
-    # GQA: repeat kv heads to match q heads (SDPA enable_gqa is not guaranteed on musa)
-    if kv.size(-2) != num_heads:
-        kv = kv.repeat_interleave(num_heads // kv.size(-2), dim=-2)
-    return kv
+def _expand_kv(kv: torch.Tensor, num_heads: int, dim: int = -2) -> torch.Tensor:
+    """GQA: expand kv heads (kh -> num_heads) along `dim` via index_select
+    (repeat_interleave is unreliable on musa for non-head dims / odd layouts)."""
+    kh = kv.size(dim)
+    if kh == num_heads:
+        return kv
+    idx = torch.arange(kh, device=kv.device).repeat_interleave(num_heads // kh)
+    return kv.index_select(dim, idx)
+
+
+def _math_attention(q, k, v, scale, attn_mask=None, is_causal=False):
+    """Manual softmax attention; guaranteed-correct fallback (batch dim included)."""
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    if attn_mask is not None:
+        scores = scores.masked_fill(~attn_mask, float("-inf"))
+    elif is_causal:
+        sq, skv = q.size(-2), k.size(-2)
+        causal = torch.ones(sq, skv, dtype=torch.bool, device=q.device).tril()
+        scores = scores.masked_fill(~causal, float("-inf"))
+    return torch.softmax(scores, dim=-1) @ v
 
 
 def _sdpa(q, k, v, scale, attn_mask=None, is_causal=False):
-    # q: (h, sq, d); k/v: (h, skv, d)
-    o = F.scaled_dot_product_attention(
-        q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
-        attn_mask=attn_mask.unsqueeze(0) if attn_mask is not None else None,
-        scale=scale, is_causal=is_causal,
-    )
+    # q: (h, sq, d); k/v: (h, skv, d); musa flash SDPA requires contiguous inputs
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    if attn_mask is not None:
+        attn_mask = attn_mask.contiguous()
+    try:
+        o = F.scaled_dot_product_attention(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+            attn_mask=attn_mask.unsqueeze(0) if attn_mask is not None else None,
+            scale=scale, is_causal=is_causal,
+        )
+    except RuntimeError:
+        print(f"[attention] flash SDPA failed, falling back to math: "
+              f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)} "
+              f"mask={None if attn_mask is None else tuple(attn_mask.shape)} causal={is_causal}", flush=True)
+        o = _math_attention(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), scale,
+            attn_mask=attn_mask.unsqueeze(0) if attn_mask is not None else None,
+            is_causal=is_causal,
+        )
     return o.squeeze(0)
 
 
@@ -82,17 +112,18 @@ class Attention(nn.Module):
         outs = []
         for i in range(len(cu_q) - 1):
             sq, sk = cu_q[i + 1] - cu_q[i], cu_k[i + 1] - cu_k[i]
+            if sq == 0 or sk == 0:
+                continue
             q_i = q[cu_q[i]:cu_q[i + 1]].transpose(0, 1)          # (h, sq, d)
             if context.block_tables is None:                       # no prefix cache
-                k_i = k[cu_k[i]:cu_k[i + 1]].transpose(0, 1)
-                v_i = v[cu_k[i]:cu_k[i + 1]].transpose(0, 1)
-                outs.append(_sdpa(q_i, _expand_kv(k_i, self.num_heads), _expand_kv(v_i, self.num_heads), self.scale, is_causal=True))
+                # expand kv heads BEFORE transpose: layout here is (seq, kh, d)
+                k_i = _expand_kv(k[cu_k[i]:cu_k[i + 1]], self.num_heads).transpose(0, 1)
+                v_i = _expand_kv(v[cu_k[i]:cu_k[i + 1]], self.num_heads).transpose(0, 1)
+                outs.append(_sdpa(q_i, k_i, v_i, self.scale, is_causal=True))
             else:                                                  # prefix cache hit
                 start = sk - sq
-                k_i = _gather_kv(k_cache, context.block_tables[i], sk, self.block_size).transpose(0, 1)
-                v_i = _gather_kv(v_cache, context.block_tables[i], sk, self.block_size).transpose(0, 1)
-                k_i = _expand_kv(k_i, self.num_heads)
-                v_i = _expand_kv(v_i, self.num_heads)
+                k_i = _expand_kv(_gather_kv(k_cache, context.block_tables[i], sk, self.block_size), self.num_heads).transpose(0, 1)
+                v_i = _expand_kv(_gather_kv(v_cache, context.block_tables[i], sk, self.block_size), self.num_heads).transpose(0, 1)
                 positions = torch.arange(start, sk, device=q.device)
                 allowed = torch.arange(sk, device=q.device) <= positions.unsqueeze(1)
                 outs.append(_sdpa(q_i, k_i, v_i, self.scale, attn_mask=allowed))
@@ -112,9 +143,12 @@ class Attention(nn.Module):
         q = q.transpose(0, 1).unsqueeze(2)                          # (h, bs, 1, d)
         k = _expand_kv(k, self.num_heads).permute(2, 0, 1, 3)       # (h, bs, kv_len, d)
         v = _expand_kv(v, self.num_heads).permute(2, 0, 1, 3)
-        o = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=mask.unsqueeze(0).unsqueeze(2),
-            scale=self.scale,
-        )                                                            # (h, bs, 1, d)
+        mask = mask.unsqueeze(0).unsqueeze(2)
+        try:
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)
+        except RuntimeError:
+            print(f"[attention] flash SDPA (decode) failed, falling back to math: "
+                  f"q={tuple(q.shape)} k={tuple(k.shape)}", flush=True)
+            o = _math_attention(q.contiguous(), k.contiguous(), v.contiguous(),
+                                self.scale, attn_mask=mask.contiguous())
         return o.squeeze(2).permute(1, 0, 2)                         # (bs, h, d)
