@@ -53,7 +53,7 @@ def main():
         t0 = time.perf_counter()
         outs = llm.generate(prompts, sps)
         dt = time.perf_counter() - t0
-        gen = sum(len(o["token_ids"]) - len(o["prompt_token_ids"]) for o in outs)
+        gen = sum(len(o.outputs[0].token_ids) for o in outs)
         rec = {
             "concurrency": c,
             "wall_s": round(dt, 2),
