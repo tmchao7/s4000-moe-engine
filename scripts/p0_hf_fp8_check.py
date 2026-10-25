@@ -47,10 +47,12 @@ def main():
         outputs = []
         with torch.no_grad():
             for p in MODEL_PROMPTS:
-                ids = tok.apply_chat_template(
+                # transformers>=5: apply_chat_template returns BatchEncoding when return_dict=True (default)
+                enc = tok.apply_chat_template(
                     [{"role": "user", "content": p}],
-                    add_generation_prompt=True, return_tensors="pt",
-                ).to(model.device)
+                    add_generation_prompt=True, return_tensors="pt", return_dict=True,
+                )
+                ids = (enc["input_ids"] if not torch.is_tensor(enc) else enc).to(model.device)
                 gen = model.generate(ids, max_new_tokens=args.max_new, do_sample=False)
                 text = tok.decode(gen[0][ids.shape[1]:], skip_special_tokens=True)
                 outputs.append(text)
