@@ -46,7 +46,7 @@ def main():
 
     results = {}
     for tp in (1, 2):
-        for backend in ("loop", "grouped_mm"):
+        for backend in ("loop", "grouped_mm", "fused_grouped_mm"):
             key = f"tp{tp}-{backend}"
             results[key] = run(tp, backend, args.max_tokens)
             print(f"[grouped-mm] {key}: {results[key]}", flush=True)
@@ -62,7 +62,7 @@ def main():
     reference = results["tp1-loop"]
     for key, output in results.items():
         assert output == reference, f"{key} diverged: {output} != {reference}"
-    print("[grouped-mm] loop/grouped_mm and TP1/TP2 all match", flush=True)
+    print("[grouped-mm] loop/grouped_mm/fused and TP1/TP2 all match", flush=True)
 
     # Guard the deterministic top-k combine: the same engine config must give
     # the same tokens when rebuilt (a non-deterministic reduction would show up

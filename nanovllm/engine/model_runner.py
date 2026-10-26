@@ -9,6 +9,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.profiling import DeviceProfiler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.compat import DEVICE, IS_MUSA, DIST_BACKEND, accelerator
@@ -53,6 +54,15 @@ class ModelRunner:
             self.model = model_cls(hf_config, config)
         else:
             self.model = model_cls(hf_config)
+        self.profiler = DeviceProfiler(self.acc)
+        attention_layer_id = 0
+        for module in self.model.modules():
+            if hasattr(module, "profiler"):
+                module.profiler = self.profiler
+            if hasattr(module, "attention_backend"):
+                module.attention_backend = config.attention_backend
+                module.layer_id = attention_layer_id
+                attention_layer_id += 1
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -61,6 +71,8 @@ class ModelRunner:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+        if config.enable_profiling:
+            self.profiler.start()
 
         if self.world_size > 1:
             if rank == 0:
@@ -113,10 +125,30 @@ class ModelRunner:
         return method(*args)
 
     def set_moe_backend(self, backend: str):
-        assert backend in ("loop", "grouped_mm")
+        assert backend in ("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused")
         for module in self.model.modules():
             if hasattr(module, "moe_backend"):
                 module.moe_backend = backend
+
+    def set_attention_backend(self, backend: str):
+        assert backend in ("sdpa", "triton_paged")
+        for module in self.model.modules():
+            if hasattr(module, "attention_backend"):
+                module.attention_backend = backend
+
+    def start_profiling(self):
+        self.profiler.start(reset=True)
+
+    def profile_snapshot(self):
+        local = {"rank": self.rank, **self.profiler.snapshot(reset=True)}
+        if self.world_size == 1:
+            return [local]
+        gathered = [None for _ in range(self.world_size)] if self.rank == 0 else None
+        dist.gather_object(local, gathered, dst=0)
+        return gathered if self.rank == 0 else None
+
+    def stop_profiling(self):
+        self.profiler.stop()
 
     def warmup_model(self):
         self.acc.empty_cache()
@@ -254,10 +286,13 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], mode: str) -> list[int]:
-        input_ids, positions = self.prepare_decode(seqs) if mode == "decode" else self.prepare_prefill(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, mode)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        with self.profiler.range("runner.prepare", mode=mode):
+            input_ids, positions = self.prepare_decode(seqs) if mode == "decode" else self.prepare_prefill(seqs)
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        with self.profiler.range("runner.forward", mode=mode):
+            logits = self.run_model(input_ids, positions, mode)
+        with self.profiler.range("runner.sample", mode=mode):
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 

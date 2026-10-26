@@ -10,12 +10,18 @@ run before the expensive sweep instead of after it.  ``--cache-modes`` sweeps
 prefix-cache cold/hot behaviour inside the same model load.
 """
 import argparse
+import hashlib
 import json
 import platform
 import random
 import statistics
+import subprocess
 import time
 from pathlib import Path
+
+from nanovllm.benchmarking import coefficient_of_variation, percentile
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 VERIFY_PROMPTS = [
     "简单介绍一下 MoE（Mixture of Experts）架构的核心思想。",
@@ -23,14 +29,6 @@ VERIFY_PROMPTS = [
     "1 到 100 的整数中所有质数之和是多少？给出答案即可。",
     "请用 Python 写一个快速排序，附注释。",
 ]
-
-
-def percentile(values, q):
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * q)))
-    return ordered[index]
 
 
 def prompts(batch, prompt_len, vocab_size, seed, shared_prefix_len=0):
@@ -42,7 +40,7 @@ def prompts(batch, prompt_len, vocab_size, seed, shared_prefix_len=0):
     ]
 
 
-def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repeats, backends, require_deterministic=False):
+def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repeats, backends):
     """Check greedy reproducibility before spending GPU time on the sweep.
 
     Design (measured on 30B, see docs/HANDOFF.md):
@@ -50,14 +48,9 @@ def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repea
     * The **first** forward of a backend right after ``set_moe_backend`` may
       pick a different kernel/workspace and can therefore return different
       token ids; every backend gets one discarded warm-up generate first.
-    * The hard gate is then *steady-state internal* reproducibility: the
-      measured repeats must produce identical token ids.
-    * Agreement with the frozen reference JSON, and between backends, is
-      recorded but not fatal.  A bf16 near-tie can flip the greedy argmax when
-      the reduction order changes (``loop`` accumulates per expert,
-      ``grouped_mm`` accumulates with ``index_add_``), so demanding 30B
-      cross-backend token identity is not a sound acceptance criterion; the
-      tiny float32 four-way check covers numerical equivalence instead.
+    * Steady-state reproducibility, the committed reference, and cross-backend
+      token identity are hard gates.  A performance run with different output
+      is not comparable to the frozen correct baseline.
     """
     reference = None
     if reference_path:
@@ -69,7 +62,7 @@ def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repea
         "repeats": repeats,
         "backends": {},
     }
-    unstable = []
+    failures = []
     for backend in backends:
         llm.model_runner.call("set_moe_backend", backend)
         params = sampling_params_cls(temperature=0, max_tokens=max_tokens)
@@ -102,6 +95,8 @@ def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repea
                         f"actual={actual} expected={want}",
                         flush=True,
                     )
+            if not all(entry["reference_matches"]):
+                failures.append(f"{backend}: committed reference mismatch")
         verification["backends"][backend] = entry
         print(
             f"[verify] {backend} deterministic={entry['deterministic']} "
@@ -110,7 +105,7 @@ def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repea
             flush=True,
         )
         if not entry["deterministic"]:
-            unstable.append(backend)
+            failures.append(f"{backend}: repeat nondeterminism")
     if len(backends) > 1:
         baseline = verification["backends"][backends[0]]["runs"][0]
         for backend in backends[1:]:
@@ -118,13 +113,31 @@ def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repea
             agreement = [actual == want for actual, want in zip(baseline, other)]
             verification["backends"][backend]["matches_" + backends[0]] = agreement
             print(f"[verify] {backend} vs {backends[0]} prompt matches={agreement}", flush=True)
-    verification["deterministic_all"] = not unstable
-    if unstable:
-        message = f"steady-state token ids differ between repeats: {unstable}"
-        if require_deterministic:
-            raise SystemExit(f"[verify] {message}")
-        print(f"[verify] WARNING {message} (advisory; pass --verify-require-deterministic to abort)", flush=True)
+            if not all(agreement):
+                failures.append(f"{backend}: differs from {backends[0]}")
+    verification["deterministic_all"] = all(
+        entry["deterministic"] for entry in verification["backends"].values()
+    )
+    verification["passed"] = not failures
+    verification["failures"] = failures
+    if failures:
+        raise SystemExit("[verify] hard gate failed: " + "; ".join(failures))
     return verification
+
+
+def file_sha256(path):
+    path = Path(path)
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
+def git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
 def main():
@@ -135,6 +148,7 @@ def main():
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--moe-backends", default="loop,grouped_mm")
+    parser.add_argument("--attention-backends", default="sdpa", help="comma list of sdpa|triton_paged")
     parser.add_argument("--expert-placement", choices=("linear", "round_robin", "profiled"), default="linear")
     parser.add_argument("--expert-map-path")
     parser.add_argument("--scheduler-policy", choices=("fcfs", "stall_free", "stall_free_lpm"), default="fcfs")
@@ -145,12 +159,19 @@ def main():
         "--cache-modes", "--cache-mode", dest="cache_modes", default="none",
         help="comma list of none|cold|hot; cold clears prefix hashes before every repeat",
     )
-    parser.add_argument("--verify-prompts", action="store_true")
-    parser.add_argument("--reference-outputs", default="/root/p2_outputs.json")
+    parser.add_argument("--verify-prompts", action="store_true", help="compatibility no-op; verification is on by default")
+    parser.add_argument("--skip-verification", action="store_true", help="explicitly bypass the correctness gate")
+    parser.add_argument("--reference-outputs", default=str(REPO_ROOT / "benchmarks" / "p2-reference-8tok.json"))
     parser.add_argument("--verify-max-tokens", type=int, default=8)
     parser.add_argument("--verify-repeats", type=int, default=3)
     parser.add_argument("--verify-backends", default="loop,grouped_mm")
-    parser.add_argument("--verify-require-deterministic", action="store_true")
+    parser.add_argument(
+        "--probe-batches", default="",
+        help="optional extra phase in the same model load, e.g. 8 for the prefix-cache probe",
+    )
+    parser.add_argument("--probe-prompt-len", type=int, default=512)
+    parser.add_argument("--probe-shared-prefix-len", type=int, default=384)
+    parser.add_argument("--probe-cache-modes", default="cold,hot")
     args = parser.parse_args()
 
     cache_modes = [mode.strip() for mode in args.cache_modes.split(",") if mode.strip()]
@@ -159,21 +180,41 @@ def main():
     if any(mode != "none" for mode in cache_modes):
         assert args.shared_prefix_len > 0, "cache modes require --shared-prefix-len"
 
+    probe_batches = [int(value) for value in args.probe_batches.split(",") if value.strip()]
+    probe_cache_modes = [mode.strip() for mode in args.probe_cache_modes.split(",") if mode.strip()]
+    if probe_batches:
+        assert probe_cache_modes and all(
+            mode in ("none", "cold", "hot") for mode in probe_cache_modes
+        ), probe_cache_modes
+        assert 0 <= args.probe_shared_prefix_len <= args.probe_prompt_len
+        if any(mode != "none" for mode in probe_cache_modes):
+            # block-hash prefix caching only reuses full 256-token blocks
+            assert args.probe_shared_prefix_len >= 256, (
+                "prefix cache probe needs a shared prefix of at least one 256-token block"
+            )
+
     from nanovllm import LLM, SamplingParams
 
     batches = [int(value) for value in args.batches.split(",")]
     backends = args.moe_backends.split(",")
-    assert backends and all(backend in ("loop", "grouped_mm") for backend in backends)
+    assert backends and all(backend in ("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused") for backend in backends)
+    attention_backends = [value.strip() for value in args.attention_backends.split(",") if value.strip()]
+    assert attention_backends and all(value in ("sdpa", "triton_paged") for value in attention_backends)
     llm = LLM(
         args.model,
         enforce_eager=True,
         tensor_parallel_size=2,
         expert_parallel_size=2,
         moe_backend=backends[0],
+        attention_backend=attention_backends[0],
         expert_placement=args.expert_placement,
         expert_map_path=args.expert_map_path,
         scheduler_policy=args.scheduler_policy,
-        max_model_len=max(2048, args.prompt_len + args.output_len),
+        max_model_len=max(
+            2048,
+            args.prompt_len + args.output_len,
+            args.probe_prompt_len + args.output_len if probe_batches else 0,
+        ),
         gpu_memory_utilization=0.85,
     )
     vocab_size = llm.model_runner.config.hf_config.vocab_size
@@ -181,90 +222,148 @@ def main():
     records = []
     verification = None
     try:
-        if args.verify_prompts:
+        if not args.skip_verification:
             reference_path = args.reference_outputs
             if not Path(reference_path).is_file():
-                print(f"[verify] reference {reference_path} missing; recording only", flush=True)
-                reference_path = None
+                raise SystemExit(f"[verify] committed reference missing: {reference_path}")
             verify_backends = [b.strip() for b in args.verify_backends.split(",") if b.strip()]
-            assert verify_backends and all(b in ("loop", "grouped_mm") for b in verify_backends)
+            assert verify_backends and all(
+                b in ("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused")
+                for b in verify_backends
+            )
             verification = run_verification(
                 llm, SamplingParams, reference_path, args.verify_max_tokens,
                 args.verify_repeats, verify_backends,
-                args.verify_require_deterministic,
             )
-        for cache_mode in cache_modes:
-            for backend in backends:
-                llm.model_runner.call("set_moe_backend", backend)
-                for batch in batches:
-                    batch_prompts = prompts(
-                        batch, args.prompt_len, vocab_size, seed=batch,
-                        shared_prefix_len=args.shared_prefix_len,
-                    )
-                    llm.generate(batch_prompts, params, use_tqdm=False)
-                    for repeat in range(args.repeats):
-                        if cache_mode == "cold":
-                            llm.scheduler.block_manager.clear_prefix_cache()
-                        start = time.perf_counter()
-                        outputs = llm.generate(batch_prompts, params, use_tqdm=False)
-                        elapsed = time.perf_counter() - start
-                        ttfts = [output["metrics"]["ttft_s"] for output in outputs]
-                        tpots = [
-                            interval
-                            for output in outputs
-                            for interval in output["metrics"]["token_intervals_s"]
-                        ]
-                        output_tokens = sum(len(output["token_ids"]) for output in outputs)
-                        record = {
-                            "backend": backend,
-                            "batch": batch,
-                            "repeat": repeat,
-                            "prompt_len": args.prompt_len,
-                            "output_len": args.output_len,
-                            "shared_prefix_len": args.shared_prefix_len,
-                            "cache_mode": cache_mode,
-                            "elapsed_s": elapsed,
-                            "output_tokens": output_tokens,
-                            "output_tokens_per_s": output_tokens / elapsed,
-                            "ttft_p50_s": percentile(ttfts, 0.50),
-                            "ttft_p95_s": percentile(ttfts, 0.95),
-                            "tpot_p50_s": percentile(tpots, 0.50),
-                            "tpot_p95_s": percentile(tpots, 0.95),
+        def measure(attention_backend, backend, batch, prompt_len, shared_prefix_len, cache_mode, phase):
+            llm.model_runner.call("set_attention_backend", attention_backend)
+            llm.model_runner.call("set_moe_backend", backend)
+            batch_prompts = prompts(
+                batch, prompt_len, vocab_size, seed=batch,
+                shared_prefix_len=shared_prefix_len,
+            )
+            llm.generate(batch_prompts, params, use_tqdm=False)
+            for repeat in range(args.repeats):
+                if cache_mode == "cold":
+                    llm.scheduler.block_manager.clear_prefix_cache()
+                start = time.perf_counter()
+                outputs = llm.generate(batch_prompts, params, use_tqdm=False)
+                elapsed = time.perf_counter() - start
+                ttfts = [output["metrics"]["ttft_s"] for output in outputs]
+                itls = [
+                    interval
+                    for output in outputs
+                    for interval in output["metrics"]["itls_s"]
+                ]
+                tpots = [output["metrics"]["tpot_s"] for output in outputs]
+                output_tokens = sum(len(output["token_ids"]) for output in outputs)
+                input_tokens = sum(output["metrics"]["prompt_tokens"] for output in outputs)
+                record = {
+                    "phase": phase,
+                    "attention_backend": attention_backend,
+                    "backend": backend,
+                    "batch": batch,
+                    "repeat": repeat,
+                    "prompt_len": prompt_len,
+                    "output_len": args.output_len,
+                    "shared_prefix_len": shared_prefix_len,
+                    "cache_mode": cache_mode,
+                    "elapsed_s": elapsed,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "input_tokens_per_s": input_tokens / elapsed,
+                    "output_tokens_per_s": output_tokens / elapsed,
+                    "total_tokens_per_s": (input_tokens + output_tokens) / elapsed,
+                    "ttft_p50_s": percentile(ttfts, 0.50),
+                    "ttft_p95_s": percentile(ttfts, 0.95),
+                    "tpot_p50_s": percentile(tpots, 0.50),
+                    "tpot_p95_s": percentile(tpots, 0.95),
+                    "itl_p50_s": percentile(itls, 0.50),
+                    "itl_p95_s": percentile(itls, 0.95),
+                    "requests": [
+                        {
+                            **output["metrics"],
+                            "token_ids": output["token_ids"],
                         }
-                        records.append(record)
-                        print("[bench]", json.dumps(record, sort_keys=True), flush=True)
+                        for output in outputs
+                    ],
+                }
+                records.append(record)
+                printable = {key: value for key, value in record.items() if key != "requests"}
+                print("[bench]", json.dumps(printable, sort_keys=True), flush=True)
+
+        for attention_backend in attention_backends:
+            for cache_mode in cache_modes:
+                for backend in backends:
+                    for batch in batches:
+                        measure(
+                            attention_backend, backend, batch,
+                            args.prompt_len, args.shared_prefix_len, cache_mode, "matrix",
+                        )
+
+        # Extra phase in the same model load: prefix-cache cold/hot probe with a
+        # long shared prefix (>= 256 tokens, otherwise no full block is reused).
+        if probe_batches:
+            for attention_backend in attention_backends:
+                for backend in backends:
+                    for batch in probe_batches:
+                        for cache_mode in probe_cache_modes:
+                            measure(
+                                attention_backend, backend, batch,
+                                args.probe_prompt_len, args.probe_shared_prefix_len,
+                                cache_mode, "probe",
+                            )
     finally:
         llm.exit()
 
     summary = []
-    for cache_mode in cache_modes:
-        for backend in backends:
-            for batch in batches:
-                rows = [
-                    record for record in records
-                    if record["cache_mode"] == cache_mode
-                    and record["backend"] == backend
-                    and record["batch"] == batch
-                ]
-                throughput = [row["output_tokens_per_s"] for row in rows]
-                median = statistics.median(throughput)
-                summary.append({
-                    "backend": backend,
-                    "batch": batch,
-                    "cache_mode": cache_mode,
-                    "throughput_median": median,
-                    "throughput_cv": statistics.pstdev(throughput) / median if len(throughput) > 1 else 0.0,
-                    "ttft_p95_median_s": statistics.median(row["ttft_p95_s"] for row in rows),
-                    "tpot_p95_median_s": statistics.median(row["tpot_p95_s"] for row in rows),
-                })
+    for phase in ("matrix", "probe"):
+        for attention_backend in attention_backends:
+            for cache_mode in cache_modes if phase == "matrix" else probe_cache_modes:
+                for backend in backends:
+                    for batch in batches if phase == "matrix" else probe_batches:
+                        rows = [
+                            record for record in records
+                            if record["phase"] == phase
+                            and record["attention_backend"] == attention_backend
+                            and record["cache_mode"] == cache_mode
+                            and record["backend"] == backend
+                            and record["batch"] == batch
+                        ]
+                        if not rows:
+                            continue
+                        throughput = [row["output_tokens_per_s"] for row in rows]
+                        median = statistics.median(throughput)
+                        summary.append({
+                            "phase": phase,
+                            "attention_backend": attention_backend,
+                            "backend": backend,
+                            "batch": batch,
+                            "cache_mode": cache_mode,
+                            "prompt_len": rows[0]["prompt_len"],
+                            "shared_prefix_len": rows[0]["shared_prefix_len"],
+                            "throughput_median": median,
+                            "throughput_cv": coefficient_of_variation(throughput),
+                            "ttft_p95_median_s": statistics.median(row["ttft_p95_s"] for row in rows),
+                            "tpot_p95_median_s": statistics.median(row["tpot_p95_s"] for row in rows),
+                            "itl_p95_median_s": statistics.median(row["itl_p95_s"] for row in rows),
+                        })
     payload = {
+        "schema_version": 2,
         "model": args.model,
         "moe_backends": backends,
+        "attention_backends": attention_backends,
         "expert_placement": args.expert_placement,
         "scheduler_policy": args.scheduler_policy,
         "shared_prefix_len": args.shared_prefix_len,
         "cache_modes": cache_modes,
         "verification": verification,
+        "provenance": {
+            "git_commit": git_commit(),
+            "model_config_sha256": file_sha256(Path(args.model) / "config.json"),
+            "tokenizer_config_sha256": file_sha256(Path(args.model) / "tokenizer_config.json"),
+            "reference_sha256": file_sha256(args.reference_outputs),
+        },
         "environment": {
             "python": platform.python_version(),
             "platform": platform.platform(),

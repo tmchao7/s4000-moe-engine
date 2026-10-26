@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from contextlib import nullcontext
 from torch import nn
 
 from nanovllm.utils.context import get_context
@@ -94,6 +95,14 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.block_size = None  # set on first use from kv cache shape
         self.k_cache = self.v_cache = torch.tensor([])
+        self.attention_backend = "sdpa"
+        self.profiler = None
+        self.layer_id = -1
+
+    def _profile(self, name):
+        if self.profiler is None:
+            return nullcontext()
+        return self.profiler.range(name, layer=self.layer_id)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
@@ -101,9 +110,11 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             if self.block_size is None:
                 self.block_size = k_cache.size(1)
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            with self._profile("attention.kv_store"):
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-            return self._forward_prefill(q, k, v, k_cache, v_cache, context)
+            with self._profile("attention.prefill"):
+                return self._forward_prefill(q, k, v, k_cache, v_cache, context)
         return self._forward_decode(q, k_cache, v_cache, context)
 
     def _forward_prefill(self, q, k, v, k_cache, v_cache, context):
@@ -130,6 +141,18 @@ class Attention(nn.Module):
         return torch.cat(outs, dim=1).transpose(0, 1)              # (sq_total, h, d)
 
     def _forward_decode(self, q, k_cache, v_cache, context):
+        if self.attention_backend == "triton_paged":
+            from nanovllm.kernels.paged_attention import paged_decode_attention
+            with self._profile("attention.triton_paged"):
+                return paged_decode_attention(
+                    q,
+                    k_cache,
+                    v_cache,
+                    context.block_tables,
+                    context.context_lens,
+                    self.scale,
+                    context.max_context_len,
+                )
         bs = q.size(0)
         block_size = self.block_size
         context_lens = context.context_lens
@@ -140,24 +163,26 @@ class Attention(nn.Module):
         # applying the boolean mask, making decode depend on allocator contents.
         full_kv_len = max_blocks * block_size
         kv_len = context.max_context_len or full_kv_len
-        k = k_cache[blocks].view(bs, full_kv_len, *k_cache.shape[-2:])
-        v = v_cache[blocks].view(bs, full_kv_len, *v_cache.shape[-2:])
-        k = k[:, :kv_len]
-        v = v[:, :kv_len]
-        arange = torch.arange(kv_len, device=q.device)
-        valid = arange.unsqueeze(0) < context_lens.unsqueeze(1)     # (bs, kv_len)
-        q = q.transpose(0, 1).unsqueeze(2)                          # (h, bs, 1, d)
-        k = _expand_kv(k, self.num_heads).permute(2, 0, 1, 3)       # (h, bs, kv_len, d)
-        v = _expand_kv(v, self.num_heads).permute(2, 0, 1, 3)
-        kv_valid = valid.unsqueeze(0).unsqueeze(-1)                  # (1, bs, kv_len, 1)
-        k = torch.where(kv_valid, k, torch.zeros((), dtype=k.dtype, device=k.device))
-        v = torch.where(kv_valid, v, torch.zeros((), dtype=v.dtype, device=v.device))
-        mask = valid.unsqueeze(0).unsqueeze(2)
-        try:
-            o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)
-        except RuntimeError:
-            print(f"[attention] flash SDPA (decode) failed, falling back to math: "
-                  f"q={tuple(q.shape)} k={tuple(k.shape)}", flush=True)
-            o = _math_attention(q.contiguous(), k.contiguous(), v.contiguous(),
-                                self.scale, attn_mask=mask.contiguous())
+        with self._profile("attention.gather_mask"):
+            k = k_cache[blocks].view(bs, full_kv_len, *k_cache.shape[-2:])
+            v = v_cache[blocks].view(bs, full_kv_len, *v_cache.shape[-2:])
+            k = k[:, :kv_len]
+            v = v[:, :kv_len]
+            arange = torch.arange(kv_len, device=q.device)
+            valid = arange.unsqueeze(0) < context_lens.unsqueeze(1)     # (bs, kv_len)
+            q = q.transpose(0, 1).unsqueeze(2)                          # (h, bs, 1, d)
+            k = _expand_kv(k, self.num_heads).permute(2, 0, 1, 3)       # (h, bs, kv_len, d)
+            v = _expand_kv(v, self.num_heads).permute(2, 0, 1, 3)
+            kv_valid = valid.unsqueeze(0).unsqueeze(-1)                  # (1, bs, kv_len, 1)
+            k = torch.where(kv_valid, k, torch.zeros((), dtype=k.dtype, device=k.device))
+            v = torch.where(kv_valid, v, torch.zeros((), dtype=v.dtype, device=v.device))
+            mask = valid.unsqueeze(0).unsqueeze(2)
+        with self._profile("attention.sdpa"):
+            try:
+                o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)
+            except RuntimeError:
+                print(f"[attention] flash SDPA (decode) failed, falling back to math: "
+                      f"q={tuple(q.shape)} k={tuple(k.shape)}", flush=True)
+                o = _math_attention(q.contiguous(), k.contiguous(), v.contiguous(),
+                                    self.scale, attn_mask=mask.contiguous())
         return o.squeeze(2).permute(1, 0, 2)                         # (bs, h, d)
