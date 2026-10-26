@@ -23,6 +23,19 @@ def accelerator():
     return torch.musa if IS_MUSA else torch.cuda
 
 
+def is_capturing():
+    """True while a graph capture is recording.
+
+    Inside a capture the stream rejects any host synchronization (``.item()``,
+    ``.tolist()``, ``bool(x.any())`` ...), so code that branches on device data
+    must check this first.  vLLM-MUSA uses the same idiom in its MoE kernels.
+    """
+    try:
+        return bool(accelerator().is_current_stream_capturing())
+    except Exception:  # backend without the query: treat as eager
+        return False
+
+
 def math_sdp():
     """Context forcing the math SDPA backend (fallback when flash SDPA fails on musa)."""
     if IS_MUSA:

@@ -136,6 +136,40 @@ class ModelRunner:
             if hasattr(module, "attention_backend"):
                 module.attention_backend = backend
 
+    def set_enforce_eager(self, value: bool):
+        """Switch between graph replay and eager forward without reloading.
+
+        The graphs captured at init stay alive, so an eager-vs-graph A/B can
+        run inside one process/one weight load.
+        """
+        self.enforce_eager = bool(value)
+        return self.enforce_eager
+
+    def graph_report(self):
+        return {
+            "rank": self.rank,
+            "enabled": not self.enforce_eager,
+            "buckets": getattr(self, "graph_bs", None),
+            "decode_moe_backend": getattr(self, "captured_moe_backend", None),
+            "allocated_delta_gib": getattr(self, "graph_memory_delta_gib", None),
+            "reserved_delta_gib": getattr(self, "graph_memory_reserved_delta_gib", None),
+            "memory": self.memory_report(),
+        }
+
+    def memory_report(self):
+        gib = 2 ** 30
+
+        def _get(name):
+            fn = getattr(self.acc, name, None)
+            return fn() / gib if fn is not None else None
+
+        return {
+            "rank": self.rank,
+            "allocated_gib": _get("memory_allocated"),
+            "reserved_gib": _get("memory_reserved"),
+            "peak_gib": _get("max_memory_allocated"),
+        }
+
     def start_profiling(self):
         self.profiler.start(reset=True)
 
@@ -313,6 +347,16 @@ class ModelRunner:
         self.graph_pool = None
         Graph = self.acc.MUSAGraph if IS_MUSA else self.acc.CUDAGraph
         graph_ctx = self.acc.graph
+        # The decode graphs embed whatever MoE kernel runs during capture, so a
+        # backend that is fast but not capturable (grouped_mm) is swapped for a
+        # capturable one (vllm_fused) here only, and restored afterwards: eager
+        # prefill keeps the fast kernel and pays nothing for the graph.
+        eager_backend = config.moe_backend
+        capture_backend = config.decode_moe_backend or eager_backend
+        if capture_backend != eager_backend:
+            self.set_moe_backend(capture_backend)
+        self.captured_moe_backend = capture_backend
+        memory_before = self.memory_report()
 
         for bs in reversed(self.graph_bs):
             graph = Graph()
@@ -325,6 +369,28 @@ class ModelRunner:
             self.graphs[bs] = graph
             self.acc.synchronize()
             reset_context()
+
+        if capture_backend != eager_backend:
+            self.set_moe_backend(eager_backend)
+        memory_after = self.memory_report()
+        allocated_before = memory_before.get("allocated_gib") or 0.0
+        allocated_after = memory_after.get("allocated_gib") or 0.0
+        reserved_before = memory_before.get("reserved_gib") or 0.0
+        reserved_after = memory_after.get("reserved_gib") or 0.0
+        # A graph pool usually shows up as reserved (not "allocated") memory and
+        # then shrinks again once instantiate() releases it, so report both and
+        # let the frozen gate use the larger delta.
+        self.graph_memory_delta_gib = allocated_after - allocated_before
+        self.graph_memory_reserved_delta_gib = reserved_after - reserved_before
+        print(
+            f"[graph] rank{self.rank} buckets={self.graph_bs} "
+            f"decode_moe_backend={capture_backend} eager_moe_backend={eager_backend} "
+            f"attention_backend={config.attention_backend} "
+            f"allocated={allocated_before:.2f}->{allocated_after:.2f} GiB "
+            f"reserved={reserved_before:.2f}->{reserved_after:.2f} GiB "
+            f"peak={memory_after.get('peak_gib'):.2f} GiB",
+            flush=True,
+        )
 
         self.graph_vars = dict(
             input_ids=input_ids,

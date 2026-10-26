@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from contextlib import nullcontext
 from torch import nn
 
+from nanovllm.utils.compat import is_capturing
 from nanovllm.utils.context import get_context
 
 
@@ -17,7 +18,10 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     flat_v = v_cache.view(-1, D)
     key = key.reshape(N, D)
     value = value.reshape(N, D)
-    if (slot_mapping < 0).any():
+    # ``(slot_mapping < 0).any()`` turns a device value into a Python bool, i.e.
+    # a stream sync, which a capturing stream rejects.  While a graph is being
+    # recorded take the branch-free masked path instead.
+    if is_capturing() or (slot_mapping < 0).any():
         valid = slot_mapping >= 0
         flat_k[slot_mapping[valid]] = key[valid]
         flat_v[slot_mapping[valid]] = value[valid]

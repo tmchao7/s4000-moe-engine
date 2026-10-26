@@ -21,6 +21,13 @@ class Config:
     shm_name: str = ""
     expert_parallel_size: int = 0
     moe_backend: Literal["loop", "grouped_mm", "fused_grouped_mm", "vllm_fused"] = "grouped_mm"
+    # MoE backend baked into the captured decode graphs.  ``None`` = use
+    # ``moe_backend`` everywhere.  Needed when the fast backend is not
+    # graph-capturable: the decode graphs embed the capturable one, while eager
+    # prefill (and decode above the largest bucket) keep the fast one.
+    decode_moe_backend: Literal[
+        "loop", "grouped_mm", "fused_grouped_mm", "vllm_fused"
+    ] | None = None
     attention_backend: Literal["sdpa", "triton_paged"] = "sdpa"
     expert_placement: Literal["linear", "round_robin", "profiled"] = "linear"
     expert_map_path: str | None = None
@@ -42,6 +49,9 @@ class Config:
             "to equal tensor_parallel_size"
         )
         assert self.moe_backend in ("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused")
+        assert self.decode_moe_backend in (
+            None, "loop", "grouped_mm", "fused_grouped_mm", "vllm_fused",
+        )
         assert self.attention_backend in ("sdpa", "triton_paged")
         assert self.expert_placement in ("linear", "round_robin", "profiled")
         assert self.scheduler_policy in ("fcfs", "stall_free", "stall_free_lpm")

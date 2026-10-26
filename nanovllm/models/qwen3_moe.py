@@ -15,6 +15,7 @@ from nanovllm.layers.linear import QKVParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.models.qwen3 import Qwen3Attention
+from nanovllm.utils.compat import is_capturing
 
 
 class _ExpertView:
@@ -184,7 +185,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         for local_id, expert in enumerate(self.experts):
             expert_id = self.expert_ids[local_id]
             mask = flat_ids == expert_id
-            if not bool(mask.any()):
+            # ``mask.any()`` is a host sync; while a graph is being captured the
+            # per-expert branch must go (empty index_select/index_add_ are no-ops).
+            if not is_capturing() and not bool(mask.any()):
                 continue
             idx = mask.nonzero(as_tuple=True)[0]
             tokens = token_idx[idx]
@@ -198,7 +201,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         with self._profile("moe.local_map"):
             local_ids = self.global_to_local[topk_ids].reshape(-1)
             valid = local_ids >= 0
-        if not bool(valid.any()):
+        if not is_capturing() and not bool(valid.any()):
             return out
         with self._profile("moe.route_pack"):
             flat_token = torch.arange(num_tokens, device=hidden_states.device).unsqueeze(1).expand_as(topk_ids).reshape(-1)
