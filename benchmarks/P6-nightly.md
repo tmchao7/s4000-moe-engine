@@ -102,7 +102,7 @@
 | p6_attention_ab.json | P1 attention A/B | 26e2d457eacca22c |
 | p6-attention-ab-decision.json | 冻结门决策 | 8bfd072c4ed854de |
 | online-v3.json | P2 在线 v3 | 84b8ac7a44b8eda4 |
-| online-v3-highload.json | P2b 高负载四档 | 见 benchmarks/data/p6b/ |
+| online-v3-highload.json | P2b 高负载四档（真实拐点 0.87–0.957 QPS） | 9f1c8ea91ec4969aa5906c40fccf753512052b77a99948e2b1a53cac7f7ad8b8 |
 | p6_graph_5x.log / p6_graph_bisect1.log / p6_graph_bisect2.log / p6_graph_3gen_bisect12.log | P3 复现率与修复证据 | 见文件 |
 | p5_graph_ab.log | 30B 图 A/B（捕获成功 + replay 失败现场） | 见文件 |
 | P6-serving-v3.md / P6-nightly.md | 报告 | d1d65309ed07e7a9 / （本文件） |

@@ -76,6 +76,13 @@ cd /root/moe-server-s4000                            # 代码（服务器无 .gi
 | 4 | 终局 schema-v2 矩阵 + 前缀缓存冷热 | ⏸ 未做 | `/root/p5_final_matrix.json`、`benchmarks/P5-final-matrix.md` |
 | 5 | 在线 Poisson 容量/goodput | ⏸ 未做 | `benchmarks/P5-serving-v2.md` |
 | ~~6~~ | ~~graph capture A/B~~ | ❌ 取消 | 证据在 `docs/P6-graph-capture.md` |
+| 7 | P0：30B eager 新栈矩阵（2 attention × 2 decode × b1..b32，同加载 A/B） | ✅ 完成 | `/root/p6_eager_matrix.json/.jsonl`、`benchmarks/P6-nightly.md` §1；**bmm_dense 采用**（b16/b32 比 1.44–1.53/1.29–1.37） |
+| 8 | P1：D2 合并验证（det cases A–D + b32×10 三栈 + attention A/B + b64×3） | ✅ 完成 | `/root/p6_d2_nightly.json/.jsonl`、`benchmarks/p6-attention-ab-decision.json`（**keep_sdpa**）；b32/b64 均已治好 |
+| 9 | P2：在线容量 v3（sdpa + bmm_dense，50/75/90/100% 四档） | ✅ 完成 | `benchmarks/data/online-v3.json`、`benchmarks/P6-serving-v3.md`；**四档全 100% SLO**（100% 档 goodput 15.4×） |
+| 10 | P2b：高负载拐点探索（`--max-qps 1.74`，fractions 0.55/0.625/0.75/1.0） | ✅ 完成 | `benchmarks/data/online-v3-highload.json`、`benchmarks/P6-nightly.md` §4；真实拐点 0.87–0.957 目标 QPS，硬饱和 0.94 req/s / 60 tok/s |
+| 11 | 30B graph A/B（8B ①+② 5/5 绿后按门放行） | ❌ 第一次 replay 仍打死设备（捕获成功） | `/root/p5_graph_ab.log`、`benchmarks/P6-nightly.md` §5；图方向时间盒关闭 |
+
+夜间台账总账见 `docs/NIGHTLY-LOG.md`（每发预冻结门 + 实际结果）；交接 successor 文档 `docs/HANDOFF-P6c.md`。
 
 ### 第 2 发（attention A/B）——如果还在跑或要重跑
 
