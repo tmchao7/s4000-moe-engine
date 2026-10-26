@@ -2,49 +2,49 @@
 
 > 每阶段有明确验收标准；时间按课余 ~10h/周估算，合计约 10–12 周。
 
-## P0 基线（1 周）—— 当前阶段
+## P0 基线（已完成）
 
 **目标**：建立性能与正确性的参照系。
 
-- [ ] 下载 `Qwen/Qwen3-30B-A3B-Instruct-2507-FP8`（~31.2G）到数据盘 `/root/autodl-tmp`
-- [ ] 下载 `Qwen/Qwen3-8B`（dense, bf16, ~16G）到数据盘
-- [ ] vllm-musa（预装 0.29.1）TP2 跑 Qwen3-8B：不同并发下吞吐 / TTFT / TPOT → `benchmarks/P0-vllm-musa-baseline.md`
-- [ ] HF transformers 加载 FP8 checkpoint（自动反量化）跑贪心输出，存固定 prompt 集的参考输出 → `benchmarks/P0-hf-reference.md`
-- [ ] 实测 vllm-musa 能否加载 FP8 checkpoint（预期失败，失败原因记录，作为自研动机素材）
-- [ ] 复核环境结论：Triton-mtgpu / MCCL / SDPA（已完成初验，写入 benchmarks）
+- [x] 下载 Qwen3-30B-A3B FP8 与 Qwen3-8B。
+- [x] 建立 vllm-musa Qwen3-8B TP2 基线与 HF 正确性参照。
+- [x] 验证 Triton-mtgpu、MCCL、MUSA SDPA 和 `torch._grouped_mm`。
 
-## P1 移植 MUSA（2 周）
+## P1 移植 MUSA（已完成）
 
 **目标**：nano-vllm 单卡在 S4000 上跑通 Qwen3 dense。
 
-- [ ] 设备抽象：`cuda` → `musa`（model_runner / utils context）
-- [ ] Triton paged attention 内核 → SDPA 替换（P1 简化实现，正确性优先）
-- [ ] CUDA graph：先 enforce_eager；torch_musa graph capture 实测后决定是否启用
-- [ ] MCCL 分布式初始化替换 NCCL
-- [ ] **验收**：Qwen3-8B（或 4B）单卡贪心输出与 HF 逐 token 对齐；吞吐记录
+- [x] MUSA/MCCL 设备抽象、SDPA attention、MUSAGraph 兼容层。
+- [x] Qwen3-8B 贪心与 HF 对齐；batch 64 达到 113.5 tok/s。
 
-## P2 Qwen3-MoE + FP8 加载 + 双卡 TP（3 周）
+## P2 Qwen3-MoE + FP8 加载 + 双卡 TP/EP（已完成）
 
 **目标**：30B-A3B 在 2×S4000 上跑通。
 
-- [ ] `models/qwen3_moe.py`：router（sigmoid + top-8）、expert MLP、权重映射
-- [ ] FP8（e4m3 + block scale）→ bf16 反量化加载器，与 transformers 数值对齐
-- [ ] MoE 层 TP 切分：128 专家按 rank 对半切（expert-parallel in TP），dense 部分列/行切分
-- [ ] **验收**：FP8 checkpoint 加载后贪心输出对齐 HF 参考；吞吐 vs 显存占用曲线；每层 allreduce 通信量实测
+- [x] softmax top-8 router、FP8 block dequant、Attention TP2 + experts EP2。
+- [x] 修复 loader 静默漏权重、RMSNorm 原位污染和 decode KV 尾部非确定性。
+- [x] packed experts + MUSA grouped GEMM；TP1/TP2、loop/grouped-MM 四路一致。
+- [x] 30B 四组中英文 prompt 输出连贯。
+- [x] 完成 loop/grouped-MM batch 1–64 三次重复性能消融：grouped-MM **74.0 tok/s @b32 / 120.4 tok/s @b64**，比 loop 快 **3.0–3.2×**，CV ≤1.1%，验收门 PASS。
+- [x] 修复 grouped-MM 用原子 `index_add_` 合并 top-k 导致的贪心不可复现：改为 slot scatter + 固定顺序求和；30B 上两端确定性、loop↔grouped 4/4 prompt 逐 token 一致。
 
-## P3 调度层扩展（3–4 周，简历核心）
+详见 [benchmarks/P2-moe-tp2.md](../benchmarks/P2-moe-tp2.md)。
+
+## P3 调度层扩展（已完成）
 
 **目标**：在调度层做出可量化的优化。
 
-- [ ] overlap scheduler：CPU 调度与 GPU 前向重叠（参考 Sarathi-Serve / mini-sglang）
-- [ ] radix 前缀缓存：上游 block-hash 前缀缓存升级为 radix tree，多轮对话场景命中率与 TTFT 对比
-- [ ] MoE 感知调度：专家负载感知的 batch 组装（探索性，视 P2 profiling 结果定方向）
-- [ ] **验收**：每项优化独立 benchmark（吞吐 / TTFT / TPOT 曲线），写入 `benchmarks/`
+- [x] decode-first stall-free scheduler：同一步混合 decode 与 bounded prefill chunks。
+- [x] block-hash prefix cache 上的 longest-prefix admission + starvation guard。
+- [x] 逐层 expert load 采集与静态 profile-guided placement 生成器。
+- [x] 完成 FCFS/stall-free 的在线独立 benchmark（TTFT/TPOT/达成 QPS + mixed step 证据），见 [benchmarks/P3-scheduler.md](../benchmarks/P3-scheduler.md)。
 
-## P4 服务化与报告（1–2 周）
+## P4 服务化与报告（已完成）
 
-- [ ] OpenAI 兼容 API（FastAPI，流式）
-- [ ] 完整压测报告 + README 定稿（架构图、性能曲线、MUSA 适配踩坑记录）
+- [x] OpenAI chat completions API（FastAPI，SSE 流式、取消、metrics）。
+- [x] 可复现 benchmark JSON、Markdown 与 PNG 生成脚本。
+- [x] 修复 transformers 5.x `apply_chat_template` 返回 `BatchEncoding` 导致 API 无法接真实 tokenizer 的问题（并对该分支补了契约测试）。
+- [x] 真实 30B API batch 32 开放环压测与最终报告数字，见 [benchmarks/P4-serving.md](../benchmarks/P4-serving.md)。
 
 ## 长期打磨（不设期限）
 
