@@ -206,8 +206,24 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.model_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        # An explicit positive block count wins over the utilisation heuristic:
+        # graph capture needs contiguous headroom on top of the KV cache, and the
+        # heuristic deliberately fills the device (capture then OOMs, e.g. 384 MiB
+        # short with 44.29 GiB already allocated).
+        explicit_blocks = config.num_kvcache_blocks > 0
+        if not explicit_blocks:
+            config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        assert config.num_kvcache_blocks > 0, (
+            f"no KV cache memory: total={total / 2**30:.2f} GiB used={used / 2**30:.2f} GiB "
+            f"peak={peak / 2**30:.2f} GiB utilization={config.gpu_memory_utilization}"
+        )
+        print(
+            f"[kvcache] rank{self.rank} blocks={config.num_kvcache_blocks} "
+            f"block_bytes={block_bytes} kv={config.num_kvcache_blocks * block_bytes / 2**30:.2f} GiB "
+            f"explicit={explicit_blocks} total={total / 2**30:.2f} GiB used={used / 2**30:.2f} GiB "
+            f"peak={peak / 2**30:.2f} GiB current={current / 2**30:.2f} GiB free={free / 2**30:.2f} GiB",
+            flush=True,
+        )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -358,16 +374,34 @@ class ModelRunner:
         self.captured_moe_backend = capture_backend
         memory_before = self.memory_report()
 
-        for bs in reversed(self.graph_bs):
+        # Ascending: capture the small buckets first, so a bucket that runs out of
+        # memory leaves the small buckets usable instead of losing the whole
+        # capture.  (Measured: the graph pool itself is cheap -- ``MUSAGraph()``
+        # and a tiny capture cost <0.1 GiB; the ~15.6 GiB seen on the 30B work up
+        # is spent *inside* the vendor MoE call, see docs/HANDOFF-P6-next.md T1.)
+        for bs in self.graph_bs:
             graph = Graph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            report = self.memory_report()
+            print(
+                f"[graph] rank{self.rank} bucket={bs} warmup "
+                f"allocated={report['allocated_gib']:.2f} reserved={report['reserved_gib']:.2f} GiB",
+                flush=True,
+            )
             with graph_ctx(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
             self.acc.synchronize()
+            report = self.memory_report()
+            print(
+                f"[graph] rank{self.rank} bucket={bs} "
+                f"allocated={report['allocated_gib']:.2f} reserved={report['reserved_gib']:.2f} "
+                f"peak={report['peak_gib']:.2f} GiB",
+                flush=True,
+            )
             reset_context()
 
         if capture_backend != eager_backend:

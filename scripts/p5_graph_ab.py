@@ -65,6 +65,13 @@ def main():
     parser.add_argument("--prefill-moe-backend", default="grouped_mm")
     parser.add_argument("--attention-backend", default="triton_paged")
     parser.add_argument("--max-num-seqs", type=int, default=32)
+    # Graph capture needs headroom on top of the KV cache, which is sized to
+    # gpu_memory_utilization.  At 0.85 the capture OOMed (384 MiB short with
+    # 44.29 GiB already allocated), so the default here leaves room for the pool.
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.72)
+    # Explicit, small KV cache: capture needs contiguous headroom, and the
+    # utilisation heuristic fills the device (two OOMs during capture).
+    parser.add_argument("--num-kvcache-blocks", type=int, default=64)
     parser.add_argument("--verify-tokens", type=int, default=32)
     parser.add_argument("--output", default="/root/p5_graph_ab.json")
     args = parser.parse_args()
@@ -101,7 +108,8 @@ def main():
             scheduler_policy="fcfs",
             max_num_seqs=args.max_num_seqs,
             max_model_len=max(2048, args.prompt_len + args.output_len),
-            gpu_memory_utilization=0.85,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            num_kvcache_blocks=args.num_kvcache_blocks,
         )
     except Exception as exc:  # noqa: BLE001 - capture failure is a result, not a crash
         payload["capture_error"] = f"{type(exc).__name__}: {exc}"
