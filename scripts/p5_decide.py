@@ -24,6 +24,11 @@ ATTENTION_GATES = {
     "tpot_ratio_max": 0.90,
     "throughput_ratio_min": 1.00,
     "cv_max": 0.05,
+    # Bit-identity is not attainable: the MUSA SDPA decode path is itself
+    # non-deterministic at large batch/context (measured at b32/c512), so the
+    # cross-backend criterion is "candidate must be deterministic and agree on
+    # >=99% of requests".  Strict identity is still reported for transparency.
+    "token_agreement_min": 0.99,
 }
 
 MOE_GATES = {
@@ -101,11 +106,24 @@ def decide_attention(payload):
             "pass": passed,
         })
     token_identity = all(row.get("token_identity", True) for row in rows)
-    adopt = token_identity and bool(checks) and all(check["pass"] for check in checks)
+    candidate_rows = [
+        row for row in rows if row["attention_backend"] == ATTENTION_GATES["candidate"]
+    ]
+    agreements = [row.get("token_agreement", 1.0) for row in candidate_rows]
+    min_agreement = min(agreements) if agreements else 0.0
+    candidate_deterministic = all(row.get("deterministic", True) for row in candidate_rows)
+    adopt = (
+        candidate_deterministic
+        and min_agreement >= ATTENTION_GATES["token_agreement_min"]
+        and bool(checks)
+        and all(check["pass"] for check in checks)
+    )
     return {
         "decision": "adopt_triton_paged" if adopt else "keep_sdpa",
         "adopt": adopt,
         "token_identity": token_identity,
+        "token_agreement_min": min_agreement,
+        "candidate_deterministic": candidate_deterministic,
         "points": checks,
     }
 
@@ -280,7 +298,13 @@ def render_markdown(mode, result, thresholds):
                 f"| {point.get('batch')} | {point.get('throughput_ratio', float('nan')):.3f} | "
                 f"{'PASS' if point.get('pass') else 'FAIL'} |"
             )
-    lines += ["", f"token_identity: `{result.get('token_identity')}`", ""]
+    lines += [
+        "",
+        f"token_identity(strict): `{result.get('token_identity')}`",
+        f"token_agreement_min: `{result.get('token_agreement_min')}`",
+        f"candidate_deterministic: `{result.get('candidate_deterministic')}`",
+        "",
+    ]
     return "\n".join(lines)
 
 

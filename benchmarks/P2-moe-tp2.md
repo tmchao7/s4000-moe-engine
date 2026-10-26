@@ -5,8 +5,8 @@
 
 ## 结论（TL;DR）
 
-1. **packed experts + `torch._grouped_mm` 相对 loop 后端稳定快 3.0–3.2×**（batch 16–64），TPOT p95 降到 0.31×；batch 1–8 也有 2.67–2.80×。
-2. **batch 32：74.0 tok/s（loop 24.2）、p95 TPOT 0.404s、p95 TTFT 1.52s；batch 64：120.4 tok/s、p95 TPOT 0.477s、p95 TTFT 2.49s**，CV ≤ 1.1%，全部点满足 3 次重复的稳定性要求。
+1. **packed experts + `torch._grouped_mm` 相对 loop 后端稳定快 3.0–3.2×**（batch 16–64），legacy p95 ITL 降到 0.31×；batch 1–8 也有 2.67–2.80×。
+2. **batch 32：74.0 tok/s（loop 24.2）、legacy p95 ITL 0.404s、p95 TTFT 1.52s；batch 64：120.4 tok/s、legacy p95 ITL 0.477s、p95 TTFT 2.49s**，旧口径 CV ≤ 1.1%。
 3. 吞吐随 batch **近似线性**（1.27→39.8 tok/s loop；3.38→120.4 tok/s grouped），说明瓶颈已从"每专家 Python 循环 + GPU 同步"转为 GEMM/带宽，PCIe TP 通信未成为限制。
 4. **正确性门**：tiny 模型 TP1/TP2 × loop/grouped 四路逐 token 一致；30B 四组中英文 prompt 输出连贯；30B 上 loop 与 grouped **4/4 条 prompt 逐 token 相同**，且**同一后端 3 次重复 + 首次调用全部一致**（本轮修掉了 grouped 的原子累加不确定性，见下）。
 5. packed 权重布局在加载期每卡约 **29.5 GiB**，比旧的 64 个独立专家模块（~32.8 GiB）少约 **3.3 GiB**，且没有为 grouped GEMM 额外复制一份权重。
@@ -51,9 +51,9 @@ grouped_mm vs loop prompt matches=[True, True, True, True]
 
 ## 3. 离线批处理消融（loop vs grouped-MM）
 
-方法：随机 token prompt（128 in / 32 out），每个点先 warmup 1 次再测 3 次；吞吐取中位数，CV = 样本标准差/中位数；TTFT/TPOT 取 p95 后跨重复取中位数。模型只加载一次，后端在进程内切换。
+方法：随机 token prompt（128 in / 32 out），每个点先 warmup 1 次再测 3 次，模型只加载一次、后端在进程内切换。本表冻结于 benchmark schema v1：脚本实际使用 `pstdev/median` 计算 CV，并把全部 token interval 打平后的 p95 记成了 TPOT；按当前规范应称 **legacy ITL**。原始 JSON 不篡改，P5 schema v2 已改为 `sample std/mean` 和逐请求 TPOT。
 
-| Backend | Batch | Output tok/s | CV | TTFT p95 (s) | TPOT p95 (s) | Speedup |
+| Backend | Batch | Output tok/s | legacy CV | TTFT p95 (s) | legacy ITL p95 (s) | Speedup |
 |---|---:|---:|---:|---:|---:|---:|
 | loop | 1 | 1.27 | 0.002 | 1.528 | 0.7722 | 1.00x |
 | loop | 2 | 2.25 | 0.002 | 1.749 | 0.8705 | 1.00x |
@@ -72,14 +72,14 @@ grouped_mm vs loop prompt matches=[True, True, True, True]
 
 ### 验收门
 
-| Batch | Speedup ≥1.5x | p95 TPOT ratio ≤1.10 | CV ≤5% | Result |
+| Batch | Speedup ≥1.5x | p95 legacy ITL ratio ≤1.10 | legacy CV ≤5% | Result |
 |---:|---:|---:|---:|---|
 | 16 | 3.18x | 0.303 | 0.005 | **PASS** |
 | 32 | 3.06x | 0.311 | 0.003 | **PASS** |
 
 ![throughput](data/throughput.png)
 
-![tpot p95](data/tpot-p95.png)
+![legacy itl p95](data/tpot-p95.png)
 
 ## 4. 交叉验证（两次独立运行）
 
@@ -108,6 +108,7 @@ grouped_mm vs loop prompt matches=[True, True, True, True]
 - 未启用 CUDAGraph（`enforce_eager`），b1–b8 的固定开销里仍有 Python 调度与张量构造。
 - grouped-MM 在小 batch 的固定开销（`argsort`/`bincount`/两次 `_grouped_mm`）使 b1–b8 的加速比（2.7–2.8×）低于 b16–64（3.0–3.2×）。
 - 本轮吞吐测试用 `temperature=0`；与外部数字对比时需统一说明。
+- **可复现性的边界（P5 补充）**：本报告的"同一后端稳态可复现"是在 4 条 prompt / batch≈4 / 8 token 下验证的。P5 的 attention A/B 进一步测到：**batch 32 的 decode 跨重复不可复现**，且 `sdpa` 与 `triton_paged` 都受影响（首次分歧在第 2 个 token），指向两者共享的 MoE grouped GEMM 或 MCCL all-reduce，而不是 attention 后端。在该问题定位前，b32 以上的逐 token 结论不可用，详见 `benchmarks/P5-attention-ab.md` §3。
 
 ## 7. 复现
 

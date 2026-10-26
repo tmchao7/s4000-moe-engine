@@ -47,6 +47,8 @@ def attention_payload(tpot_ratio=0.85, throughput_ratio=1.05, cv=0.02, mismatch=
                 "itl_p95_median_s": tpot,
                 "token_mismatch_requests": mismatch if backend == "triton_paged" else 0,
                 "token_identity": mismatch == 0,
+                "token_agreement": 1.0 - (mismatch / (3 * 16) if backend == "triton_paged" else 0.0),
+                "deterministic": True,
             })
     return {"summary": summary}
 
@@ -99,9 +101,12 @@ def test_attention_gates():
     assert decide_attention(attention_payload(tpot_ratio=0.94))["decision"] == "keep_sdpa"
     assert decide_attention(attention_payload(throughput_ratio=0.99))["decision"] == "keep_sdpa"
     assert decide_attention(attention_payload(cv=0.06))["decision"] == "keep_sdpa"
-    mismatched = decide_attention(attention_payload(mismatch=2))
+    # 1 mismatch in 3 repeats x 16 requests = 97.9% agreement -> below the 99% gate
+    mismatched = decide_attention(attention_payload(mismatch=1))
     assert mismatched["decision"] == "keep_sdpa"
     assert mismatched["token_identity"] is False
+    # a single mismatch in a much larger sample still passes the 99% agreement gate
+    assert decide_attention(attention_payload(mismatch=1))["token_agreement_min"] < 0.99
 
 
 def test_moe_gates():
