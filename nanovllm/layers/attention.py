@@ -135,15 +135,24 @@ class Attention(nn.Module):
         context_lens = context.context_lens
         max_blocks = context.block_tables.size(1)
         blocks = context.block_tables.clamp(min=0).long()
-        kv_len = max_blocks * block_size
-        k = k_cache[blocks].view(bs, kv_len, *k_cache.shape[-2:])   # (bs, kv_len, kh, d)
-        v = v_cache[blocks].view(bs, kv_len, *v_cache.shape[-2:])
+        # Never pass the uninitialized tail of the last KV block into SDPA.
+        # Some MUSA SDPA kernels can propagate NaNs from masked positions before
+        # applying the boolean mask, making decode depend on allocator contents.
+        full_kv_len = max_blocks * block_size
+        kv_len = context.max_context_len or full_kv_len
+        k = k_cache[blocks].view(bs, full_kv_len, *k_cache.shape[-2:])
+        v = v_cache[blocks].view(bs, full_kv_len, *v_cache.shape[-2:])
+        k = k[:, :kv_len]
+        v = v[:, :kv_len]
         arange = torch.arange(kv_len, device=q.device)
-        mask = arange.unsqueeze(0) < context_lens.unsqueeze(1)      # (bs, kv_len)
+        valid = arange.unsqueeze(0) < context_lens.unsqueeze(1)     # (bs, kv_len)
         q = q.transpose(0, 1).unsqueeze(2)                          # (h, bs, 1, d)
         k = _expand_kv(k, self.num_heads).permute(2, 0, 1, 3)       # (h, bs, kv_len, d)
         v = _expand_kv(v, self.num_heads).permute(2, 0, 1, 3)
-        mask = mask.unsqueeze(0).unsqueeze(2)
+        kv_valid = valid.unsqueeze(0).unsqueeze(-1)                  # (1, bs, kv_len, 1)
+        k = torch.where(kv_valid, k, torch.zeros((), dtype=k.dtype, device=k.device))
+        v = torch.where(kv_valid, v, torch.zeros((), dtype=v.dtype, device=v.device))
+        mask = valid.unsqueeze(0).unsqueeze(2)
         try:
             o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)
         except RuntimeError:

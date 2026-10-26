@@ -11,6 +11,7 @@ import sys
 
 import torch
 import torch.distributed as dist
+from types import SimpleNamespace
 
 sys.path.insert(0, "/root/moe-server-s4000")
 MODEL = "/root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8"
@@ -70,7 +71,14 @@ def main():
 
     # our layer (CPU, bf16)
     torch.set_default_dtype(torch.bfloat16)
-    ours = OurLayer(cfg).eval()
+    runtime = SimpleNamespace(
+        expert_parallel_size=1,
+        moe_backend="loop",
+        expert_placement="linear",
+        expert_map_path=None,
+        collect_expert_stats=False,
+    )
+    ours = OurLayer(cfg, runtime, 0).eval()
     from nanovllm.layers.rotary_embedding import get_rope
     get_rope.cache_clear()
     with torch.no_grad():

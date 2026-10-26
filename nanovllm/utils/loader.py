@@ -9,6 +9,7 @@ from safetensors import safe_open
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 _EXPERT_RE = re.compile(r"^(.*experts\.)(\d+)(\..*)$")
+_EXPERT_PART_RE = re.compile(r"^\.(gate_proj|up_proj|down_proj)(?:\.weight)?$")
 
 
 def _expert_offset(model: nn.Module) -> int | None:
@@ -70,12 +71,30 @@ def load_model(model: nn.Module, path: str):
         with safe_open(file, "pt", "cpu") as f:
             for k in f.keys():
                 keymap[k] = file
+    loaded_param_ids = set()
     for ckpt_name in sorted(keymap):
         if ckpt_name.endswith("_scale_inv"):
             continue    # consumed by dequant at load time
-        # expert parallel: global expert id -> local ModuleList index
+        # Packed experts own one contiguous parameter per projection.  Route
+        # HF per-expert checkpoint tensors directly into their local slices.
         weight_name = ckpt_name
         m = _EXPERT_RE.match(weight_name)
+        packed_expert_block = None
+        global_expert_id = None
+        expert_part = None
+        if m:
+            block_name = m.group(1)[:-len("experts.")].rstrip(".")
+            try:
+                candidate = model.get_submodule(block_name)
+            except AttributeError:
+                candidate = None
+            part_match = _EXPERT_PART_RE.match(m.group(3))
+            if candidate is not None and hasattr(candidate, "load_expert_weight") and part_match:
+                packed_expert_block = candidate
+                global_expert_id = int(m.group(2))
+                expert_part = part_match.group(1)
+                if not candidate.owns_expert(global_expert_id):
+                    continue
         if m and expert_start is not None:
             gid = int(m.group(2))
             if gid < expert_start:
@@ -91,6 +110,12 @@ def load_model(model: nn.Module, path: str):
                 if tensor.dtype == torch.uint8:
                     tensor = tensor.view(torch.float8_e4m3fn)
                 tensor = dequant_fp8_block(tensor, scale, block)
+        if packed_expert_block is not None:
+            packed_expert_block.load_expert_weight(global_expert_id, expert_part, tensor)
+            param = (packed_expert_block.down_proj if expert_part == "down_proj"
+                     else packed_expert_block.gate_up_proj)
+            loaded_param_ids.add(id(param))
+            continue
         for k in packed_modules_mapping:
             if k in weight_name:
                 v, shard_id = packed_modules_mapping[k]
@@ -98,10 +123,10 @@ def load_model(model: nn.Module, path: str):
                 try:
                     param = _get_param(model, param_name)
                 except AttributeError:
-                    pass    # expert not owned by this rank (expert parallel)
-                else:
-                    weight_loader = getattr(param, "weight_loader")
-                    weight_loader(param, tensor, shard_id)
+                    break    # expert not owned by this rank (expert parallel)
+                weight_loader = getattr(param, "weight_loader")
+                weight_loader(param, tensor, shard_id)
+                loaded_param_ids.add(id(param))
                 break
         else:
             try:
@@ -110,3 +135,29 @@ def load_model(model: nn.Module, path: str):
                 continue    # expert not owned by this rank
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, tensor)
+            loaded_param_ids.add(id(param))
+    for module in model.modules():
+        validator = getattr(module, "validate_expert_weights_loaded", None)
+        if validator is not None:
+            validator()
+    _assert_full_coverage(model, loaded_param_ids)
+
+
+def _assert_full_coverage(model: nn.Module, loaded_param_ids: set[int]):
+    """Every parameter owned by this rank must have been written by the loader.
+
+    A silently skipped weight leaves torch.empty garbage that produces
+    gibberish output, so fail loudly instead.
+    """
+    tied = set()
+    lm_head = getattr(model, "lm_head", None)
+    embed = getattr(getattr(model, "model", None), "embed_tokens", None)
+    if lm_head is not None and embed is not None and \
+            lm_head.weight.data_ptr() == embed.weight.data_ptr():
+        tied.add(id(lm_head.weight))
+    missing = [name for name, p in model.named_parameters()
+               if id(p) not in loaded_param_ids and id(p) not in tied]
+    assert not missing, (
+        f"{len(missing)} parameters were never loaded, e.g. {missing[:8]}. "
+        "Loader silently skipped them — checkpoint names and model names disagree."
+    )

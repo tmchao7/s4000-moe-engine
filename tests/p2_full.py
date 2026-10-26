@@ -15,11 +15,31 @@ def main():
     ap.add_argument("--model", default="/root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8")
     ap.add_argument("--bench-seqs", type=int, default=32)
     ap.add_argument("--bench-max-len", type=int, default=512)
+    ap.add_argument("--max-tokens", type=int, default=96)
+    ap.add_argument("--skip-bench", action="store_true")
+    ap.add_argument("--moe-backend", choices=("loop", "grouped_mm"), default="grouped_mm")
+    ap.add_argument("--scheduler-policy", choices=("fcfs", "stall_free", "stall_free_lpm"), default="fcfs")
     args = ap.parse_args()
 
     from nanovllm import LLM, SamplingParams
     llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=2,
+              expert_parallel_size=2, moe_backend=args.moe_backend,
+              scheduler_policy=args.scheduler_policy,
               max_model_len=2048, gpu_memory_utilization=0.85)
+
+    # weight-loading sanity probe: unloaded params are torch.empty garbage
+    m = llm.model_runner.model
+    import torch
+    with torch.no_grad():
+        l0 = m.model.layers[0]
+        l47 = m.model.layers[47]
+        gate_std = m.model.layers[0].mlp.gate.weight.float().std().item()
+        e0 = l0.mlp.experts[0].gate_up_proj.float()
+        eL = l47.mlp.experts[min(63, len(l47.mlp.experts) - 1)].gate_up_proj.float()
+        qkv = l0.self_attn.qkv_proj.weight.float()
+        print(f"[p2-weights] gate_std={gate_std:.4f} expert0_std={e0.std():.4f} "
+              f"expert_last_std={eL.std():.4f} qkv_std={qkv.std():.4f} "
+              f"expert0_absmax={e0.abs().max():.3f}", flush=True)
 
     prompts = [
         "简单介绍一下 MoE（Mixture of Experts）架构的核心思想。",
@@ -27,7 +47,7 @@ def main():
         "1 到 100 的整数中所有质数之和是多少？给出答案即可。",
         "请用 Python 写一个快速排序，附注释。",
     ]
-    sp = SamplingParams(temperature=0, max_tokens=96)
+    sp = SamplingParams(temperature=0, max_tokens=args.max_tokens)
     outs = llm.generate(prompts, sp, use_tqdm=False)
     results = []
     for p, o in zip(prompts, outs):
@@ -36,6 +56,10 @@ def main():
     import json
     with open("/root/p2_outputs.json", "w") as f:
         json.dump(results, f, indent=1, ensure_ascii=False)
+
+    if args.skip_bench:
+        llm.exit()
+        return
 
     # benchmark
     seed(0)

@@ -11,6 +11,7 @@ import sys
 
 import torch
 import torch.distributed as dist
+from types import SimpleNamespace
 
 sys.path.insert(0, "/root/moe-server-s4000")
 
@@ -34,18 +35,46 @@ def build_tiny_checkpoint():
         architectures=["Qwen3MoeForCausalLM"], torch_dtype=torch.float32,
     )
     torch.manual_seed(42)
-    model = Qwen3MoeForCausalLM(config)
+    runtime = SimpleNamespace(
+        expert_parallel_size=1,
+        moe_backend="loop",
+        expert_placement="linear",
+        expert_map_path=None,
+        collect_expert_stats=False,
+    )
+    model = Qwen3MoeForCausalLM(config, runtime)
     with torch.no_grad():
         for p in model.parameters():
             p.copy_(torch.randn_like(p) * 0.5)
-    # save HF-style names (gate_up_proj split back into gate_proj/up_proj)
+    # save HF-style names (gate_up_proj/qkv_proj split back into separate keys)
     state = {}
     inter = config.moe_intermediate_size
+    q_size = config.num_attention_heads * config.head_dim
+    kv_size = config.num_key_value_heads * config.head_dim
     for k, v in model.state_dict().items():
-        if "gate_up_proj" in k:
-            base = k.replace("gate_up_proj.weight", "")
-            state[base + "gate_proj.weight"] = v[:inter].contiguous()
-            state[base + "up_proj.weight"] = v[inter:].contiguous()
+        if k.endswith("mlp.gate_up_proj") and v.ndim == 3:
+            base = k[: -len("gate_up_proj")]
+            for expert_id in range(v.shape[0]):
+                state[f"{base}experts.{expert_id}.gate_proj.weight"] = \
+                    v[expert_id, :, :inter].transpose(0, 1).contiguous()
+                state[f"{base}experts.{expert_id}.up_proj.weight"] = \
+                    v[expert_id, :, inter:].transpose(0, 1).contiguous()
+        elif k.endswith("mlp.down_proj") and v.ndim == 3:
+            base = k[: -len("down_proj")]
+            for expert_id in range(v.shape[0]):
+                state[f"{base}experts.{expert_id}.down_proj.weight"] = \
+                    v[expert_id].transpose(0, 1).contiguous()
+        elif "gate_up_proj" in k:
+            # dense gate_up_proj is a module (…weight); expert params are bare (no suffix)
+            base = k.replace("gate_up_proj.weight", "").replace("gate_up_proj", "")
+            half = v.shape[0] // 2
+            state[base + "gate_proj.weight"] = v[:half].contiguous()
+            state[base + "up_proj.weight"] = v[half:].contiguous()
+        elif "qkv_proj" in k:
+            base = k.replace("qkv_proj.weight", "")
+            state[base + "q_proj.weight"] = v[:q_size].contiguous()
+            state[base + "k_proj.weight"] = v[q_size:q_size + kv_size].contiguous()
+            state[base + "v_proj.weight"] = v[q_size + kv_size:].contiguous()
         else:
             state[k] = v.contiguous()
     from safetensors.torch import save_file

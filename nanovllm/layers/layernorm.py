@@ -19,12 +19,11 @@ class RMSNorm(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        orig_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x
+        # out-of-place: for float32 inputs x.float() aliases x, and any
+        # in-place op would corrupt the caller's residual stream
+        xf = x.float()
+        var = xf.pow(2).mean(dim=-1, keepdim=True)
+        return (xf * torch.rsqrt(var + self.eps)).to(x.dtype).mul_(self.weight)
 
     @maybe_compile
     def add_rms_forward(
@@ -32,12 +31,10 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        orig_dtype = x.dtype
-        x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
+        xf = x.float().add_(residual.float())    # fresh float tensor, safe to mutate
+        residual = xf.to(x.dtype)
+        var = xf.pow(2).mean(dim=-1, keepdim=True)
+        x = (xf * torch.rsqrt(var + self.eps)).to(x.dtype).mul_(self.weight)
         return x, residual
 
     def forward(
