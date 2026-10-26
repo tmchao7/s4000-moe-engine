@@ -46,6 +46,19 @@
 1. **batch 32 的 decode 本身不可复现**：`sdpa` 在 b32/512 与 b32/2048 都跨重复不一致，且**首次分歧在第 2 个 token**（即第一个 decode step）。这与 attention 后端无关，指向两者共享的组件 —— MoE（`torch._grouped_mm`）或 MCCL all-reduce。
 2. b16 下两个后端都稳定且 token 完全一致（512 和 2048 都是 0 mismatch）→ **paged kernel 在可复现的区间内是正确的**。
 
+### 3.1 受控复现尝试（inconclusive）
+
+`tests/p5_determinism_b32.py` 在同一次 30B 加载里跑了四个对照（batch 32 / context 512 / **8 token** 生成 / 各 3 次）：
+
+| 对照 | 结果 |
+|---|---|
+| A `grouped_mm` b32 | stable=True |
+| B `loop` b32 | stable=True |
+| C `grouped_mm` b32 + 每次前清零 KV | stable=True |
+| D `grouped_mm` b16（对照） | stable=True |
+
+**没有复现**。因此 b32 的不可复现是**间歇性**的，并且与生成长度/运行序列有关（A/B 用 32 token，本次用 8 token）。脚本已参数化（`--batch/--context/--output-len/--repeats`），下一次应当用 **10 次重复 × 32 token × b32** 去稳定复现，再按 A/B/C 的判别逻辑定位（loop vs grouped、清零 KV、纯 all-reduce）。
+
 ## 4. 冻结门的裁决
 
 `scripts/p5_decide.py --mode attention` 输出：
@@ -63,7 +76,7 @@ candidate_deterministic: False (门 =True)
 ## 5. 这意味着什么 / 下一步
 
 1. **不要因此否定 paged kernel**：b16（512/2048）两个后端 token 完全一致且它快 19%~44%；b32 的性能优势更大。
-2. **首要任务是定位 b32 的不可复现**（这是新发现的 P5 级问题，优先于任何性能优化）：
+2. **首要任务是稳定复现并定位 b32 的不可复现**（受控 8-token 对照未复现，说明是间歇性的；下一步用 10 次 × 32 token）：
    - 候选 A：`torch._grouped_mm` 在 MUSA 上的 split-K/原子累加（可用 `loop` 后端在同一 workload 下对照：若 loop 稳定、grouped 不稳，则锁定 grouped GEMM）；
    - 候选 B：MCCL all-reduce 在 32 行 bf16 下的归约顺序（可写一个纯 all-reduce 重复性测试）；
    - 候选 C：decode 的 KV gather 在 b32 下读到未初始化尾部（现有 mask 只对 `kv_len` 内有效；可把 KV 全量清零后复测）。

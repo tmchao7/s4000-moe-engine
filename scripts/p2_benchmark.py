@@ -221,6 +221,11 @@ def main():
     params = SamplingParams(temperature=0, max_tokens=args.output_len, ignore_eos=True)
     records = []
     verification = None
+    # Stream every measurement to disk as it completes: a crash mid-matrix (e.g.
+    # a MUSA device error at the last batch) must not lose the finished points.
+    jsonl_path = Path(args.jsonl) if args.jsonl else Path(args.output).with_suffix(".jsonl")
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_handle = jsonl_path.open("w", encoding="utf-8")
     try:
         if not args.skip_verification:
             reference_path = args.reference_outputs
@@ -289,6 +294,8 @@ def main():
                     ],
                 }
                 records.append(record)
+                jsonl_handle.write(json.dumps(record, sort_keys=True) + "\n")
+                jsonl_handle.flush()
                 printable = {key: value for key, value in record.items() if key != "requests"}
                 print("[bench]", json.dumps(printable, sort_keys=True), flush=True)
 
@@ -314,6 +321,7 @@ def main():
                                 cache_mode, "probe",
                             )
     finally:
+        jsonl_handle.close()
         llm.exit()
 
     summary = []
@@ -373,13 +381,8 @@ def main():
     }
     output_path = Path(args.output)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    jsonl_path = Path(args.jsonl) if args.jsonl else output_path.with_suffix(".jsonl")
-    jsonl_path.write_text(
-        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
-        encoding="utf-8",
-    )
     print(f"[bench] wrote {output_path}")
-    print(f"[bench] wrote {jsonl_path}")
+    print(f"[bench] wrote {jsonl_path} (streamed during the run)")
 
 
 if __name__ == "__main__":
