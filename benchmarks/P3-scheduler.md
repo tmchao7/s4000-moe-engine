@@ -69,7 +69,7 @@ PYTHONPATH=. python3 scripts/benchmark_online.py --model qwen3-30b-a3b \
 
 ## 5. 下一步（更可能量出收益的实验）
 
-1. **长 prompt 混合负载**：`--prompt-words 1024`（≈1k token），prefill 成本上升一个量级，stall-free 的 decode 保护才有机会体现。预期 TTFT 换 E2E/TPOT 的曲线更明显。
+1. **长 prompt 混合负载**：使用 tokenizer 记录实际约 1k token 输入，prefill 成本上升一个量级后，再用 schema v2 请求级 TPOT/ITL 区分 decode 保护效果。
 2. **异构长度**：短请求 + 长请求同时打（p2_benchmark 已支持 `--shared-prefix-len` 与不同 batch，但开放环更能体现），或让一半请求 128 token、一半 1024 token。
 3. **注入率拉满**：`--max-qps 1.5` 才能把在线并发堆到 ~32，从而和离线 batch-32 的 74 tok/s 对齐比较。
 4. **`stall_free_lpm`**：前缀缓存感知的 admission，需要共享前缀（≥256 token 整块）才能命中；用 `--prompt-words 512` 让所有请求共享同一前缀再对比。

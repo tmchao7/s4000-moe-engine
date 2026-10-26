@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-26",
+  "hardware": "2x MTT S4000 48GB",
+  "model": "Qwen3-30B-A3B-Instruct-2507-FP8 loaded as BF16",
+  "source_raw_sha256": "147e7761799863017210d74f5da236cc07f027971c4eb7afc4f95fe7bdbc089d",
+  "source_raw_path": "benchmarks/data/p5_profile.json",
+  "model_load_index": 1,
+  "thresholds": {
+    "attention_fraction": 0.3,
+    "moe_compute_fraction": 0.35,
+    "route_combine_fraction_of_moe": 0.1,
+    "collective_fraction": 0.2,
+    "rank_pair_imbalance": 0.1
+  },
+  "observed": {
+    "max_attention_fraction": 0.5855921320678441,
+    "max_moe_compute_fraction": 0.5347974618642072,
+    "max_route_combine_fraction_of_moe": 0.4492787131854793,
+    "max_collective_fraction": 0.05451625806766891,
+    "max_rank_pair_imbalance": 0.05190022786458326
+  },
+  "triggered_candidates": [
+    "triton_paged",
+    "fused_grouped_mm"
+  ],
+  "priority": "triton_paged",
+  "rejected": {
+    "collective_overlap": "5.45% maximum is below the 20% gate",
+    "profiled_placement": "5.19% maximum rank pair imbalance is below the 10% gate"
+  },
+  "notes": [
+    "The committed 30B reference gate passed for loop and grouped_mm before profiling.",
+    "Device-event profiling has instrumentation overhead and is used for route selection, not throughput claims.",
+    "Defaults must not change before the independent 30B SDPA versus Triton A/B passes correctness and performance acceptance."
+  ]
+}

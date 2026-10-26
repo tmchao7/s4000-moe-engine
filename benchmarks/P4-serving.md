@@ -13,7 +13,7 @@
 | `GET /metrics` | Prometheus 文本格式，暴露请求级 + 引擎级 + KV 级计数器 |
 
 - 引擎侧是 `AsyncLLMEngine`：后台线程跑 `LLMEngine.step()`，HTTP 协程通过命令队列 `add_request` / `cancel`，token 通过 `Queue` 单向下发；请求到达可在任意 step 边界被接纳。
-- 请求级指标（`queue_s` / `ttft_s` / `e2e_s` / `mean_tpot_s` / `token_intervals_s`）随请求返回，可做离线分布分析。
+- 请求级指标现使用 schema v2：`queue_s` / `ttft_s` / `e2e_s` / 请求级 `tpot_s` / `itls_s` / token 计数 / finish reason；旧键暂时保留兼容。
 
 ### 1.1 本轮修掉的阻塞级 bug
 
@@ -53,7 +53,7 @@ MoE（Mixture of Experts）是一种神经网络架构，通过动态地...
 ## 5. 局限与下一步
 
 - 单实例、单模型、无 tokenizer 批处理、无多副本/负载均衡；HTTP 层每 token 做一次 `decode(全部 token_ids)`（O(n²)，短输出可接受，长输出应改成增量解码）。
-- `enforce_eager`，无 CUDAGraph；在线 TPOT 仍受 SDPA + KV gather 限制。
+- 本轮冻结在线结果只测量 TTFT/E2E，未形成工业口径 TPOT 结论；P5 客户端已补齐真实 usage、请求级 TPOT、ITL、goodput 和 `[DONE]` 硬校验。
 - **把在线并发拉到 32**：`--max-qps 1.5` 或 `--requests 64`，才能直接和离线 batch-32 对比（本轮未做）。
 - 长 prompt（`--prompt-words 1024`）+ 长输出（`--max-tokens 256`）下的 TTFT/TPOT 曲线、以及 `stall_free_lpm` 的前缀缓存命中收益，都是现成的下一步（`--shared-prefix-len` 需 ≥256 才能命中整块）。
 
