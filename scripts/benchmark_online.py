@@ -1,26 +1,21 @@
-"""Open-loop benchmark for the OpenAI-compatible streaming endpoint.
+"""Industrial-style open-loop benchmark for the streaming chat endpoint."""
 
-Supply the empirically sustainable request rate with ``--max-qps``.  The
-default load points inject 25/50/75/90 percent of it and write raw JSONL plus
-aggregate JSON/Markdown artifacts.
-"""
 import argparse
 import asyncio
 import json
-import statistics
+import random
 import time
 from pathlib import Path
 
-
-def percentile(values, q):
-    ordered = sorted(values)
-    if not ordered:
-        return 0.0
-    return ordered[round((len(ordered) - 1) * q)]
+from nanovllm.benchmarking import (
+    coefficient_of_variation,
+    distribution,
+    goodput,
+    request_tpot,
+)
 
 
 async def scrape_metrics(client, base_url):
-    """Read the engine-side counters so scheduler behaviour is measurable."""
     try:
         response = await client.get(f"{base_url.rstrip('/')}/metrics", timeout=10.0)
         response.raise_for_status()
@@ -28,8 +23,10 @@ async def scrape_metrics(client, base_url):
         return {"error": f"{type(exc).__name__}: {exc}"}
     metrics = {}
     for line in response.text.splitlines():
+        if not line or line.startswith("#"):
+            continue
         name, _, value = line.strip().partition(" ")
-        if not name.startswith("nanovllm_"):
+        if not name.startswith("nanovllm_") or "{" in name:
             continue
         try:
             metrics[name[len("nanovllm_"):]] = float(value)
@@ -39,67 +36,184 @@ async def scrape_metrics(client, base_url):
 
 
 def _delta(before, after):
-    """Window counters.  A mode counter is absent until that mode has run at
-    least once, so a missing 'before' value means zero activity, not unknown."""
     delta = {}
     for key, value in after.items():
-        if not isinstance(value, (int, float)):
-            continue
-        previous = before.get(key, 0.0)
-        if isinstance(previous, (int, float)):
-            delta[key] = value - previous
+        if isinstance(value, (int, float)):
+            previous = before.get(key, 0.0)
+            if isinstance(previous, (int, float)):
+                delta[key] = value - previous
     return delta
 
 
-async def one_request(client, url, model, prompt, max_tokens, request_id, due):
+class ConcurrencyTracker:
+
+    def __init__(self):
+        self.current = 0
+        self.maximum = 0
+
+    def enter(self):
+        self.current += 1
+        self.maximum = max(self.maximum, self.current)
+
+    def exit(self):
+        self.current -= 1
+
+
+def _token_count(tokenizer, text):
+    if tokenizer is None:
+        return None
+    encoded = tokenizer(text, add_special_tokens=False)
+    ids = encoded["input_ids"] if hasattr(encoded, "keys") else encoded.input_ids
+    return len(ids)
+
+
+def _prompt_token_count(tokenizer, messages):
+    if tokenizer is None:
+        return None
+    ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
+    if hasattr(ids, "keys"):
+        ids = ids["input_ids"]
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    if ids and isinstance(ids[0], (list, tuple)):
+        ids = ids[0]
+    return len(ids)
+
+
+async def one_request(
+    client, url, model, prompt, max_tokens, request_id, due, tracker,
+    tokenizer=None,
+):
     await asyncio.sleep(max(0.0, due - time.perf_counter()))
     start = time.perf_counter()
+    tracker.enter()
     first = None
+    end = start
     error = None
-    chunks = 0
+    done_received = False
+    content_times = []
+    generated_text = ""
+    usage = None
+    finish_reason = None
+    messages = [{"role": "user", "content": prompt}]
     try:
         async with client.stream(
             "POST",
             url,
             json={
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": messages,
                 "temperature": 0,
                 "max_tokens": max_tokens,
                 "stream": True,
+                "stream_options": {"include_usage": True},
             },
             timeout=None,
         ) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
-                if not line.startswith("data: ") or line == "data: [DONE]":
+                if not line.startswith("data: "):
+                    continue
+                if line == "data: [DONE]":
+                    done_received = True
                     continue
                 payload = json.loads(line[6:])
-                content = payload.get("choices", [{}])[0].get("delta", {}).get("content")
+                if payload.get("usage"):
+                    usage = payload["usage"]
+                choices = payload.get("choices") or []
+                if not choices:
+                    continue
+                finish_reason = choices[0].get("finish_reason") or finish_reason
+                content = choices[0].get("delta", {}).get("content")
                 if content:
-                    chunks += 1
+                    now = time.perf_counter()
+                    generated_text += content
+                    content_times.append(now)
                     if first is None:
-                        first = time.perf_counter()
+                        first = now
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-    end = time.perf_counter()
+    finally:
+        end = time.perf_counter()
+        tracker.exit()
+
+    prompt_tokens = usage.get("prompt_tokens") if usage else _prompt_token_count(tokenizer, messages)
+    output_tokens = usage.get("completion_tokens") if usage else _token_count(tokenizer, generated_text)
+    if error is None and not done_received:
+        error = "stream ended before [DONE]"
+    if error is None and (prompt_tokens is None or output_tokens is None):
+        error = "token usage missing and no local tokenizer was configured"
+    itls = [right - left for left, right in zip(content_times, content_times[1:])]
+    latency = end - start
+    ttft = None if first is None else first - start
+    tpot = request_tpot(latency, ttft, output_tokens or 0)
     return {
         "request_id": request_id,
         "scheduled_s": due,
         "started_s": start,
-        "latency_s": end - start,
-        "ttft_s": None if first is None else first - start,
-        "chunks": chunks,
+        "arrival_lag_s": start - due,
+        "ended_s": end,
+        "e2e_s": latency,
+        "ttft_s": ttft,
+        "tpot_s": tpot,
+        "itls_s": itls,
+        "prompt_tokens": prompt_tokens,
+        "output_tokens": output_tokens,
+        "stream_events": len(content_times),
+        "done_received": done_received,
+        "finish_reason": finish_reason,
         "ok": error is None,
         "error": error,
     }
 
 
-async def run_point(client, args, fraction):
+def arrival_offsets(count, qps, pattern, seed):
+    if pattern == "fixed":
+        return [index / qps for index in range(count)]
+    rng = random.Random(seed)
+    offsets = []
+    elapsed = 0.0
+    for _ in range(count):
+        offsets.append(elapsed)
+        elapsed += rng.expovariate(qps)
+    return offsets
+
+
+async def warmup(client, args, prompt, tokenizer):
+    if args.warmup_requests == 0:
+        return
+    tracker = ConcurrencyTracker()
+    start = time.perf_counter() + 0.05
+    rows = await asyncio.gather(*[
+        one_request(
+            client,
+            f"{args.base_url.rstrip('/')}/v1/chat/completions",
+            args.model,
+            prompt,
+            args.max_tokens,
+            -index - 1,
+            start + index * 0.05,
+            tracker,
+            tokenizer,
+        )
+        for index in range(args.warmup_requests)
+    ])
+    failures = [row for row in rows if not row["ok"]]
+    if failures:
+        raise RuntimeError(f"warmup failed: {failures[0]['error']}")
+
+
+async def run_point(client, args, fraction, point_index, prompt, tokenizer):
     qps = args.max_qps * fraction
+    await warmup(client, args, prompt, tokenizer)
     metrics_before = await scrape_metrics(client, args.base_url)
     start = time.perf_counter() + 0.2
-    prompt = (args.prompt_word + " ") * args.prompt_words
+    offsets = arrival_offsets(
+        args.requests, qps, args.arrival_pattern, args.seed + point_index
+    )
+    tracker = ConcurrencyTracker()
     tasks = [
         one_request(
             client,
@@ -108,7 +222,9 @@ async def run_point(client, args, fraction):
             prompt,
             args.max_tokens,
             request_id,
-            start + request_id / qps,
+            start + offsets[request_id],
+            tracker,
+            tokenizer,
         )
         for request_id in range(args.requests)
     ]
@@ -116,66 +232,122 @@ async def run_point(client, args, fraction):
     metrics_after = await scrape_metrics(client, args.base_url)
     for row in rows:
         row.update({"load_fraction": fraction, "target_qps": qps})
-    return rows, metrics_before, metrics_after
+    return rows, metrics_before, metrics_after, tracker.maximum
+
+
+def summarize(rows, max_concurrency, metrics_delta, args, fraction):
+    good = [row for row in rows if row["ok"]]
+    if not rows:
+        raise ValueError("benchmark point produced no requests")
+    duration = max(row["ended_s"] for row in rows) - min(row["started_s"] for row in rows)
+    ttfts = [row["ttft_s"] for row in good]
+    tpots = [row["tpot_s"] for row in good]
+    itls = [value for row in good for value in row["itls_s"]]
+    e2es = [row["e2e_s"] for row in good]
+    input_tokens = sum(row["prompt_tokens"] or 0 for row in good)
+    output_tokens = sum(row["output_tokens"] or 0 for row in good)
+    result = {
+        "load_fraction": fraction,
+        "target_qps": args.max_qps * fraction,
+        "achieved_qps": len(good) / duration,
+        "request_throughput_per_s": len(good) / duration,
+        "input_tokens_per_s": input_tokens / duration,
+        "output_tokens_per_s": output_tokens / duration,
+        "total_tokens_per_s": (input_tokens + output_tokens) / duration,
+        "success_rate": len(good) / len(rows),
+        "goodput_per_s": goodput(good, duration, args.slo_ttft_ms / 1000, args.slo_tpot_ms / 1000),
+        "slo_ttft_ms": args.slo_ttft_ms,
+        "slo_tpot_ms": args.slo_tpot_ms,
+        "max_concurrency": max_concurrency,
+        "e2e_cv": coefficient_of_variation(e2es),
+        "mixed_steps": metrics_delta.get("engine_mixed_steps_total", 0.0),
+        "prefill_steps": metrics_delta.get("engine_prefill_steps_total", 0.0),
+        "decode_steps": metrics_delta.get("engine_decode_steps_total", 0.0),
+    }
+    result.update(distribution(ttfts, "ttft"))
+    result.update(distribution(tpots, "tpot"))
+    result.update(distribution(itls, "itl"))
+    result.update(distribution(e2es, "e2e"))
+    return result
+
+
+def fmt_seconds(value, digits):
+    return "—" if value is None else f"{value:.{digits}f}s"
 
 
 async def async_main(args):
     import httpx
 
-    limits = httpx.Limits(max_connections=args.requests, max_keepalive_connections=args.requests)
+    tokenizer = None
+    if args.tokenizer:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
+    prompt = (args.prompt_word + " ") * args.prompt_words
+    limits = httpx.Limits(
+        max_connections=args.requests + args.warmup_requests,
+        max_keepalive_connections=args.requests + args.warmup_requests,
+    )
     async with httpx.AsyncClient(limits=limits) as client:
         all_rows = []
         points = []
-        for fraction in args.fractions:
-            rows, metrics_before, metrics_after = await run_point(client, args, fraction)
+        for point_index, fraction in enumerate(args.fractions):
+            rows, before, after, max_concurrency = await run_point(
+                client, args, fraction, point_index, prompt, tokenizer
+            )
             all_rows.extend(rows)
+            delta = _delta(before, after)
             points.append({
                 "load_fraction": fraction,
-                "metrics_before": metrics_before,
-                "metrics_after": metrics_after,
-                "metrics_delta": _delta(metrics_before, metrics_after),
+                "metrics_before": before,
+                "metrics_after": after,
+                "metrics_delta": delta,
+                "max_concurrency": max_concurrency,
             })
-            print(f"[online] load={fraction:.0%} ok={sum(row['ok'] for row in rows)}/{len(rows)}")
+            print(
+                f"[online] load={fraction:.0%} "
+                f"ok={sum(row['ok'] for row in rows)}/{len(rows)}",
+                flush=True,
+            )
 
     summaries = []
     for point in points:
         fraction = point["load_fraction"]
         rows = [row for row in all_rows if row["load_fraction"] == fraction]
-        good = [row for row in rows if row["ok"]]
-        elapsed = max(row["started_s"] + row["latency_s"] for row in rows) - min(row["started_s"] for row in rows)
-        delta = point["metrics_delta"]
-        summaries.append({
-            "load_fraction": fraction,
-            "target_qps": args.max_qps * fraction,
-            "achieved_qps": len(good) / elapsed,
-            "success_rate": len(good) / len(rows),
-            "ttft_p50_s": percentile([row["ttft_s"] for row in good if row["ttft_s"] is not None], 0.50),
-            "ttft_p95_s": percentile([row["ttft_s"] for row in good if row["ttft_s"] is not None], 0.95),
-            "latency_p95_s": percentile([row["latency_s"] for row in good], 0.95),
-            "latency_cv": statistics.pstdev([row["latency_s"] for row in good]) / statistics.mean([row["latency_s"] for row in good]) if len(good) > 1 else 0.0,
-            "mixed_steps": delta.get("engine_mixed_steps_total", 0.0),
-            "prefill_steps": delta.get("engine_prefill_steps_total", 0.0),
-            "decode_steps": delta.get("engine_decode_steps_total", 0.0),
-        })
+        summaries.append(summarize(
+            rows, point["max_concurrency"], point["metrics_delta"], args, fraction
+        ))
 
+    payload = {
+        "schema_version": 2,
+        "arrival_pattern": args.arrival_pattern,
+        "seed": args.seed,
+        "warmup_requests": args.warmup_requests,
+        "prompt_tokens": _prompt_token_count(
+            tokenizer, [{"role": "user", "content": prompt}]
+        ),
+        "summary": summaries,
+        "points": points,
+        "records": all_rows,
+    }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        json.dumps({"summary": summaries, "points": points, "records": all_rows}, indent=2),
+    output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    output.with_suffix(".jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in all_rows),
         encoding="utf-8",
     )
-    output.with_suffix(".jsonl").write_text(
-        "".join(json.dumps(row, sort_keys=True) + "\n" for row in all_rows), encoding="utf-8"
-    )
     markdown = [
-        "| Load | Target QPS | Achieved QPS | Success | TTFT p50 | TTFT p95 | E2E p95 | Mixed steps |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Load | QPS | Req/s | Out tok/s | Success | Goodput | TTFT p95 | TPOT p95 | ITL p95 | E2E p95 | Max conc |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summaries:
         markdown.append(
-            f"| {row['load_fraction']:.0%} | {row['target_qps']:.3f} | {row['achieved_qps']:.3f} | "
-            f"{row['success_rate']:.1%} | {row['ttft_p50_s']:.3f}s | {row['ttft_p95_s']:.3f}s | "
-            f"{row['latency_p95_s']:.3f}s | {row['mixed_steps']:.0f} |"
+            f"| {row['load_fraction']:.0%} | {row['target_qps']:.3f} | "
+            f"{row['request_throughput_per_s']:.3f} | {row['output_tokens_per_s']:.2f} | "
+            f"{row['success_rate']:.1%} | {row['goodput_per_s']:.3f} | "
+            f"{fmt_seconds(row['ttft_p95_s'], 3)} | {fmt_seconds(row['tpot_p95_s'], 4)} | "
+            f"{fmt_seconds(row['itl_p95_s'], 4)} | {fmt_seconds(row['e2e_p95_s'], 3)} | "
+            f"{row['max_concurrency']} |"
         )
     output.with_suffix(".md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
 
@@ -184,15 +356,26 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", required=True)
+    parser.add_argument("--tokenizer", help="local tokenizer path for usage validation/fallback")
     parser.add_argument("--max-qps", type=float, required=True)
-    parser.add_argument("--fractions", type=lambda value: [float(x) for x in value.split(",")], default=[0.25, 0.5, 0.75, 0.9])
-    parser.add_argument("--requests", type=int, default=32)
+    parser.add_argument(
+        "--fractions",
+        type=lambda value: [float(x) for x in value.split(",")],
+        default=[0.25, 0.5, 0.75, 0.9],
+    )
+    parser.add_argument("--requests", type=int, default=128)
+    parser.add_argument("--warmup-requests", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--prompt-words", type=int, default=128)
     parser.add_argument("--prompt-word", default="benchmark")
-    parser.add_argument("--output", default="benchmarks/data/online.json")
+    parser.add_argument("--arrival-pattern", choices=("fixed", "poisson"), default="poisson")
+    parser.add_argument("--seed", type=int, default=20261026)
+    parser.add_argument("--slo-ttft-ms", type=float, default=2000.0)
+    parser.add_argument("--slo-tpot-ms", type=float, default=500.0)
+    parser.add_argument("--output", default="benchmarks/data/online-v2.json")
     args = parser.parse_args()
-    assert args.max_qps > 0 and args.requests > 0
+    assert args.max_qps > 0 and args.requests > 0 and args.warmup_requests >= 0
+    assert args.slo_ttft_ms > 0 and args.slo_tpot_ms > 0
     assert all(0 < fraction <= 1 for fraction in args.fractions)
     asyncio.run(async_main(args))
 

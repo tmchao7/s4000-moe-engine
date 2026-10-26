@@ -61,6 +61,7 @@ class LLMEngine:
         self.schedule_time_total = 0.0
         self.forward_time_total = 0.0
         self.metrics_path = config.metrics_path
+        self.last_step_metrics = None
         atexit.register(self.exit)
 
     def exit(self):
@@ -103,6 +104,11 @@ class LLMEngine:
         self.decode_tokens_total += decode_tokens
         self.schedule_time_total += schedule_elapsed
         self.forward_time_total += forward_elapsed
+        self.last_step_metrics = {
+            "mode": mode,
+            "schedule_s": schedule_elapsed,
+            "forward_s": forward_elapsed,
+        }
         if self.metrics_path:
             record = {
                 "kind": "step",

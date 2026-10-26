@@ -20,7 +20,8 @@ class Config:
     distributed_init_method: str = ""
     shm_name: str = ""
     expert_parallel_size: int = 0
-    moe_backend: Literal["loop", "grouped_mm"] = "grouped_mm"
+    moe_backend: Literal["loop", "grouped_mm", "fused_grouped_mm", "vllm_fused"] = "grouped_mm"
+    attention_backend: Literal["sdpa", "triton_paged"] = "sdpa"
     expert_placement: Literal["linear", "round_robin", "profiled"] = "linear"
     expert_map_path: str | None = None
     scheduler_policy: Literal["fcfs", "stall_free", "stall_free_lpm"] = "fcfs"
@@ -28,6 +29,7 @@ class Config:
     scheduler_starvation_steps: int = 32
     collect_expert_stats: bool = False
     metrics_path: str | None = None
+    enable_profiling: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -39,7 +41,8 @@ class Config:
             "single-node hybrid TP+EP currently requires expert_parallel_size "
             "to equal tensor_parallel_size"
         )
-        assert self.moe_backend in ("loop", "grouped_mm")
+        assert self.moe_backend in ("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused")
+        assert self.attention_backend in ("sdpa", "triton_paged")
         assert self.expert_placement in ("linear", "round_robin", "profiled")
         assert self.scheduler_policy in ("fcfs", "stall_free", "stall_free_lpm")
         assert self.prefill_chunk_size > 0

@@ -36,6 +36,7 @@ class Sequence:
         self.finish_time = None
         self.token_times = []
         self.wait_steps = 0
+        self.finish_reason = None
 
     def __len__(self):
         return self.num_tokens
@@ -88,12 +89,23 @@ class Sequence:
         intervals = [
             right - left for left, right in zip(self.token_times, self.token_times[1:])
         ]
+        tpot = None
+        if e2e is not None and ttft is not None and self.num_completion_tokens > 1:
+            tpot = (e2e - ttft) / (self.num_completion_tokens - 1)
         return {
+            "prompt_tokens": self.num_prompt_tokens,
+            "output_tokens": self.num_completion_tokens,
             "queue_s": None if self.first_scheduled_time is None else self.first_scheduled_time - self.arrival_time,
             "ttft_s": ttft,
             "e2e_s": e2e,
-            "mean_tpot_s": sum(intervals) / len(intervals) if intervals else 0.0,
+            # TPOT is a per-request decode average.  ITL is the distribution
+            # of individual gaps between streamed tokens.  Keep the old key
+            # for one release so existing result readers do not break.
+            "tpot_s": tpot,
+            "mean_tpot_s": tpot,
+            "itls_s": intervals,
             "token_intervals_s": intervals,
+            "finish_reason": self.finish_reason,
         }
 
     def __getstate__(self):

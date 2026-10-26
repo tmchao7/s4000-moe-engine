@@ -57,6 +57,7 @@ class Scheduler:
                     self.block_manager.deallocate(seq)
                 seq.status = SequenceStatus.FINISHED
                 seq.finish_time = perf_counter()
+                seq.finish_reason = "cancelled"
                 return True
         return False
 
@@ -234,9 +235,12 @@ class Scheduler:
             seq.append_token(token_id)
             now = perf_counter()
             seq.record_token(now)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            hit_eos = not seq.ignore_eos and token_id == self.eos
+            hit_length = seq.num_completion_tokens == seq.max_tokens
+            if hit_eos or hit_length:
                 seq.status = SequenceStatus.FINISHED
                 seq.finish_time = now
+                seq.finish_reason = "stop" if hit_eos else "length"
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
             token_events.append((

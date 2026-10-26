@@ -51,6 +51,12 @@ class FakeEngine:
         return {"requests_total": 2, "active_requests": 0}
 
 
+class FakeOverloadedEngine(FakeEngine):
+
+    async def add_request(self, prompt, sampling_params):
+        raise OverflowError("engine request queue is full")
+
+
 def main():
     from fastapi.testclient import TestClient
 
@@ -71,14 +77,24 @@ def main():
             assert response.json()["usage"]["completion_tokens"] == 2
             assert response.json()["usage"]["prompt_tokens"] == 3
             with client.stream(
-                "POST", "/v1/chat/completions", json={**request, "stream": True}
+                "POST", "/v1/chat/completions", json={
+                    **request,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                }
             ) as response:
                 body = "".join(response.iter_text())
             assert "chat.completion.chunk" in body
+            assert '"completion_tokens": 2' in body
             assert "data: [DONE]" in body
             metrics = client.get("/metrics").text
+            assert "# TYPE nanovllm_requests_total counter" in metrics
             assert "nanovllm_requests_total 2" in metrics
         print(f"[api] {type(tokenizer).__name__}: stream+nonstream/metrics passed")
+    overloaded = create_app(FakeOverloadedEngine(), "tiny-moe")
+    with TestClient(overloaded) as client:
+        response = client.post("/v1/chat/completions", json=request)
+        assert response.status_code == 429, response.text
     print("[api] health/models/chat stream+nonstream/metrics passed")
 
 

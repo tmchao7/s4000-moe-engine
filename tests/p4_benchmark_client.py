@@ -29,6 +29,7 @@ class StubState:
         self.lock = threading.Lock()
         self.requests = 0
         self.mixed = 0
+        self.omit_done = False
 
     def record_request(self):
         with self.lock:
@@ -91,7 +92,17 @@ def build_handler(state):
                 })
                 self._chunk(f"data: {payload}\n\n")
                 time.sleep(TOKEN_DELAY)
-            self._chunk("data: [DONE]\n\n")
+            usage = json.dumps({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": CHUNKS,
+                    "total_tokens": 12 + CHUNKS,
+                },
+            })
+            self._chunk(f"data: {usage}\n\n")
+            if not state.omit_done:
+                self._chunk("data: [DONE]\n\n")
             self._chunk("")
 
     return Handler
@@ -119,8 +130,10 @@ def main():
                 "--model", "stub",
                 "--max-qps", "20",
                 "--requests", "8",
+                "--warmup-requests", "1",
                 "--max-tokens", "4",
                 "--fractions", "0.5,1.0",
+                "--arrival-pattern", "fixed",
                 "--output", str(output),
             ],
             check=True,
@@ -135,11 +148,50 @@ def main():
     assert len(summaries) == 2, summaries
     assert len(payload["records"]) == 16, len(payload["records"])
     assert len(payload["points"]) == 2, payload["points"]
+    assert payload["schema_version"] == 2
     for row in summaries:
         assert row["success_rate"] == 1.0, row
         assert row["achieved_qps"] > 0, row
         assert row["ttft_p50_s"] and row["ttft_p50_s"] > 0, row
+        assert row["tpot_p95_s"] and row["tpot_p95_s"] > 0, row
+        assert row["output_tokens_per_s"] > 0, row
+        assert row["max_concurrency"] > 0, row
         assert row["mixed_steps"] > 0, row
+    assert all(row["done_received"] for row in payload["records"])
+    assert all(row["output_tokens"] == CHUNKS for row in payload["records"])
+    missing_done_output = output.with_name("missing-done.json")
+    missing_state = StubState()
+    missing_state.omit_done = True
+    missing_port = free_port()
+    missing_server = ThreadingHTTPServer(
+        ("127.0.0.1", missing_port), build_handler(missing_state)
+    )
+    missing_thread = threading.Thread(target=missing_server.serve_forever, daemon=True)
+    missing_thread.start()
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "benchmark_online.py"),
+                "--base-url", f"http://127.0.0.1:{missing_port}",
+                "--model", "stub",
+                "--max-qps", "20",
+                "--requests", "2",
+                "--warmup-requests", "0",
+                "--max-tokens", "4",
+                "--fractions", "1.0",
+                "--arrival-pattern", "fixed",
+                "--output", str(missing_done_output),
+            ],
+            check=True,
+            cwd=REPO_ROOT,
+        )
+    finally:
+        missing_server.shutdown()
+        missing_server.server_close()
+    missing_done = json.loads(missing_done_output.read_text(encoding="utf-8"))
+    assert missing_done["summary"][0]["success_rate"] == 0.0
+    assert all("before [DONE]" in row["error"] for row in missing_done["records"])
     assert output.with_suffix(".md").is_file()
     assert output.with_suffix(".jsonl").is_file()
     print("[online-client] stub SSE benchmark passed", summaries)

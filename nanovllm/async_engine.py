@@ -5,6 +5,7 @@ from queue import Empty, Queue
 from threading import Lock, Thread
 
 from nanovllm.engine.llm_engine import LLMEngine
+from nanovllm.prometheus_metrics import PrometheusMetrics
 from nanovllm.sampling_params import SamplingParams
 
 
@@ -26,6 +27,9 @@ class RequestHandle:
 class AsyncLLMEngine:
 
     def __init__(self, model: str, **kwargs):
+        self.max_queue_size = kwargs.pop("max_queue_size", 1024)
+        if self.max_queue_size <= 0:
+            raise ValueError("max_queue_size must be positive")
         self.engine = LLMEngine(model, **kwargs)
         self.tokenizer = self.engine.tokenizer
         self.commands = Queue()
@@ -35,13 +39,22 @@ class AsyncLLMEngine:
             "requests_total": 0,
             "requests_finished": 0,
             "requests_cancelled": 0,
+            "requests_errors": 0,
+            "requests_rejected": 0,
             "generated_tokens_total": 0,
             "active_requests": 0,
         }
+        self.prometheus = PrometheusMetrics()
         self.thread = Thread(target=self._run, name="nanovllm-engine", daemon=True)
         self.thread.start()
 
     async def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        with self._metrics_lock:
+            in_system = self._metrics["active_requests"]
+        if in_system >= self.max_queue_size:
+            self._bump(requests_rejected=1)
+            self.prometheus.rejected.inc()
+            raise OverflowError("engine request queue is full")
         ack = Queue(maxsize=1)
         events = Queue()
         self.commands.put(("add", (prompt, sampling_params, events), ack))
@@ -68,6 +81,9 @@ class AsyncLLMEngine:
         metrics.update(self.engine.metrics())
         return metrics
 
+    def prometheus_text(self):
+        return self.prometheus.render(self.metrics())
+
     def _bump(self, **changes):
         with self._metrics_lock:
             for key, delta in changes.items():
@@ -77,9 +93,15 @@ class AsyncLLMEngine:
         if command == "add":
             prompt, sampling_params, events = args
             try:
+                if len(self.handles) >= self.max_queue_size:
+                    self._bump(requests_rejected=1)
+                    self.prometheus.rejected.inc()
+                    raise OverflowError("engine request queue is full")
                 seq_id = self.engine.add_request(prompt, sampling_params)
                 self.handles[seq_id] = events
                 self._bump(requests_total=1, active_requests=1)
+                self.prometheus.requests.inc()
+                self.prometheus.active.inc()
                 ack.put(seq_id)
             except Exception as exc:
                 ack.put(exc)
@@ -90,11 +112,18 @@ class AsyncLLMEngine:
                 if events is not None:
                     events.put(TokenEvent(finished=True, cancelled=True))
                 self._bump(requests_cancelled=1, active_requests=-1)
+                self.prometheus.cancelled.inc()
+                self.prometheus.active.dec()
         elif command == "close":
+            cancelled = len(self.handles)
             for seq_id in list(self.handles):
                 self.engine.cancel_request(seq_id)
                 self.handles[seq_id].put(TokenEvent(finished=True, cancelled=True))
             self.handles.clear()
+            if cancelled:
+                self._bump(requests_cancelled=cancelled, active_requests=-cancelled)
+                self.prometheus.cancelled.inc(cancelled)
+                self.prometheus.active.set(0)
             self.engine.exit()
             ack.put(True)
             return False
@@ -124,14 +153,19 @@ class AsyncLLMEngine:
 
             try:
                 self.engine.step()
+                self.prometheus.observe_step(self.engine.last_step_metrics)
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"
                 for seq_id, events in list(self.handles.items()):
                     events.put(TokenEvent(finished=True, error=message))
                     self.engine.cancel_request(seq_id)
+                failed = len(self.handles)
                 self.handles.clear()
                 with self._metrics_lock:
                     self._metrics["active_requests"] = 0
+                    self._metrics["requests_errors"] += failed
+                self.prometheus.errors.inc(failed)
+                self.prometheus.active.set(0)
                 continue
 
             for seq_id, token_id, finished, metrics in self.engine.last_token_events:
@@ -140,6 +174,10 @@ class AsyncLLMEngine:
                     continue
                 events.put(TokenEvent(token_id=token_id, finished=finished, metrics=metrics))
                 self._bump(generated_tokens_total=1)
+                self.prometheus.generated_tokens.inc()
                 if finished:
                     self.handles.pop(seq_id, None)
                     self._bump(requests_finished=1, active_requests=-1)
+                    self.prometheus.finished.inc()
+                    self.prometheus.active.dec()
+                    self.prometheus.observe_request(metrics)

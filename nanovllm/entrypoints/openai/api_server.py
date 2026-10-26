@@ -5,6 +5,7 @@ import time
 import uuid
 
 from nanovllm.async_engine import AsyncLLMEngine
+from nanovllm.incremental_detokenizer import IncrementalDetokenizer
 from nanovllm.sampling_params import SamplingParams
 
 
@@ -31,9 +32,17 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
 
     @app.get("/metrics")
     async def metrics():
+        if hasattr(engine, "prometheus_text"):
+            return PlainTextResponse(engine.prometheus_text())
         lines = []
         for name, value in engine.metrics().items():
-            lines.append(f"nanovllm_{name} {value}")
+            metric = f"nanovllm_{name}"
+            metric_type = "counter" if name.endswith("_total") else "gauge"
+            lines.extend((
+                f"# HELP {metric} nano-vLLM engine metric {name}.",
+                f"# TYPE {metric} {metric_type}",
+                f"{metric} {value}",
+            ))
         return PlainTextResponse("\n".join(lines) + "\n")
 
     @app.post("/v1/chat/completions")
@@ -56,6 +65,10 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
             stop = [stop]
         if not isinstance(stop, list) or not all(isinstance(item, str) for item in stop):
             raise HTTPException(400, "stop must be a string or list of strings")
+        stream_options = body.get("stream_options") or {}
+        if not isinstance(stream_options, dict):
+            raise HTTPException(400, "stream_options must be an object")
+        include_usage = bool(stream_options.get("include_usage", False))
 
         try:
             prompt_ids = engine.tokenizer.apply_chat_template(
@@ -76,17 +89,21 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
         prompt_ids = [int(token_id) for token_id in prompt_ids]
         if not prompt_ids:
             raise HTTPException(400, "chat template produced an empty prompt")
-        handle = await engine.add_request(
-            prompt_ids,
-            SamplingParams(temperature=temperature, max_tokens=max_tokens),
-        )
+        try:
+            handle = await engine.add_request(
+                prompt_ids,
+                SamplingParams(temperature=temperature, max_tokens=max_tokens),
+            )
+        except OverflowError as exc:
+            raise HTTPException(429, str(exc)) from exc
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
 
         async def events():
             token_ids = []
-            previous = ""
-            finish_reason = "stop"
+            decoder = IncrementalDetokenizer(engine.tokenizer)
+            finish_reason = "length"
+            output_text = ""
             try:
                 while True:
                     if await request.is_disconnected():
@@ -101,13 +118,16 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
                         return
                     if event.token_id is not None:
                         token_ids.append(event.token_id)
-                        text = engine.tokenizer.decode(token_ids)
-                        matched = next((marker for marker in stop if marker in text), None)
+                        delta = decoder.push(event.token_id)
+                        output_text += delta
+                        matched = next((marker for marker in stop if marker in output_text), None)
                         if matched is not None:
-                            text = text.split(matched, 1)[0]
+                            visible = output_text.split(matched, 1)[0]
+                            retract = len(output_text) - len(visible)
+                            delta = delta[:-retract] if retract and retract <= len(delta) else ""
+                            output_text = visible
                             engine.cancel(handle.seq_id)
-                        delta = text[len(previous):]
-                        previous = text
+                            finish_reason = "stop"
                         chunk = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -120,6 +140,8 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
                         if matched is not None:
                             event.finished = True
                     if event.finished:
+                        if event.metrics and event.metrics.get("finish_reason"):
+                            finish_reason = event.metrics["finish_reason"]
                         final = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -128,6 +150,20 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                         }
                         yield f"data: {json.dumps(final)}\n\n"
+                        if include_usage:
+                            usage = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": len(prompt_ids),
+                                    "completion_tokens": len(token_ids),
+                                    "total_tokens": len(prompt_ids) + len(token_ids),
+                                },
+                            }
+                            yield f"data: {json.dumps(usage)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
             finally:
@@ -137,7 +173,10 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
             return StreamingResponse(events(), media_type="text/event-stream")
 
         token_ids = []
+        decoder = IncrementalDetokenizer(engine.tokenizer)
+        text = ""
         metrics = None
+        finish_reason = "length"
         try:
             while True:
                 event = await engine.next_event(handle)
@@ -145,14 +184,17 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
                     raise HTTPException(500, event.error)
                 if event.token_id is not None:
                     token_ids.append(event.token_id)
-                text = engine.tokenizer.decode(token_ids)
+                    text += decoder.push(event.token_id)
                 matched = next((marker for marker in stop if marker in text), None)
                 if matched is not None:
                     text = text.split(matched, 1)[0]
                     engine.cancel(handle.seq_id)
+                    finish_reason = "stop"
                     break
                 if event.finished:
                     metrics = event.metrics
+                    if metrics and metrics.get("finish_reason"):
+                        finish_reason = metrics["finish_reason"]
                     break
         finally:
             engine.cancel(handle.seq_id)
@@ -164,7 +206,7 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }],
             "usage": {
                 "prompt_tokens": len(prompt_ids),
@@ -183,12 +225,14 @@ def main():
     parser.add_argument("--served-model-name")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--moe-backend", choices=("loop", "grouped_mm"), default="grouped_mm")
+    parser.add_argument("--moe-backend", choices=("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused"), default="grouped_mm")
+    parser.add_argument("--attention-backend", choices=("sdpa", "triton_paged"), default="sdpa")
     parser.add_argument("--expert-placement", choices=("linear", "round_robin", "profiled"), default="linear")
     parser.add_argument("--expert-map-path")
     parser.add_argument("--scheduler-policy", choices=("fcfs", "stall_free", "stall_free_lpm"), default="stall_free")
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
     parser.add_argument("--metrics-path")
+    parser.add_argument("--max-queue-size", type=int, default=1024)
     args = parser.parse_args()
 
     import uvicorn
@@ -198,11 +242,13 @@ def main():
         tensor_parallel_size=2,
         expert_parallel_size=2,
         moe_backend=args.moe_backend,
+        attention_backend=args.attention_backend,
         expert_placement=args.expert_placement,
         expert_map_path=args.expert_map_path,
         scheduler_policy=args.scheduler_policy,
         prefill_chunk_size=args.prefill_chunk_size,
         metrics_path=args.metrics_path,
+        max_queue_size=args.max_queue_size,
         enforce_eager=True,
     )
     model_name = args.served_model_name or args.model.rstrip("/").rsplit("/", 1)[-1]
