@@ -31,6 +31,9 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.prefix_cache_hit_tokens = 0
+        self.allocations = 0
+        self.reclaims = 0
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -48,12 +51,14 @@ class BlockManager:
             del self.hash_to_block_id[block.hash]
         block.reset()
         self.used_block_ids.add(block_id)
+        self.allocations += 1
         return block_id
 
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
+        self.reclaims += 1
 
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
@@ -74,6 +79,7 @@ class BlockManager:
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
+        self.prefix_cache_hit_tokens += num_cached_blocks * self.block_size
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
@@ -118,3 +124,22 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+
+    def metrics(self):
+        capacity = len(self.blocks)
+        used = len(self.used_block_ids)
+        return {
+            "kv_blocks_capacity": capacity,
+            "kv_blocks_used": used,
+            "kv_cache_utilization": used / capacity if capacity else 0.0,
+            "kv_prefix_hit_tokens_total": self.prefix_cache_hit_tokens,
+            "kv_block_allocations_total": self.allocations,
+            "kv_block_reclaims_total": self.reclaims,
+        }
+
+    def clear_prefix_cache(self):
+        """Drop reusable hashes without touching blocks owned by live requests."""
+        self.hash_to_block_id.clear()
+        for block in self.blocks:
+            block.hash = -1
+            block.token_ids = []

@@ -34,7 +34,12 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group(DIST_BACKEND, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group(
+            DIST_BACKEND,
+            config.distributed_init_method,
+            world_size=self.world_size,
+            rank=rank,
+        )
         self.acc.set_device(rank)
         default_dtype = torch.get_default_dtype()
         model_dtype = hf_config.dtype
@@ -43,7 +48,11 @@ class ModelRunner:
         self.model_dtype = model_dtype
         torch.set_default_dtype(model_dtype)
         torch.set_default_device(self.device)
-        self.model = _model_cls(hf_config)(hf_config)
+        model_cls = _model_cls(hf_config)
+        if model_cls is Qwen3MoeForCausalLM:
+            self.model = model_cls(hf_config, config)
+        else:
+            self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -55,11 +64,11 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                self.shm = SharedMemory(name=config.shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name=config.shm_name)
                 self.loop()
 
     def exit(self):
@@ -103,6 +112,12 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    def set_moe_backend(self, backend: str):
+        assert backend in ("loop", "grouped_mm")
+        for module in self.model.modules():
+            if hasattr(module, "moe_backend"):
+                module.moe_backend = backend
+
     def warmup_model(self):
         self.acc.empty_cache()
         self.acc.reset_peak_memory_stats()
@@ -112,7 +127,7 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        self.run(seqs, "prefill")
         self.acc.empty_cache()
 
     def allocate_kv_cache(self):
@@ -155,7 +170,11 @@ class ModelRunner:
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
-            input_ids.extend(seq[start:end])
+            if seq.is_prefill:
+                input_ids.extend(seq[start:end])
+            else:
+                assert seqlen_q == 1
+                input_ids.append(seq.last_token)
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
@@ -197,9 +216,16 @@ class ModelRunner:
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        max_context_len = max(context_lens)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            max_context_len=max_context_len,
+        )
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -208,8 +234,8 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, mode: str):
+        if mode != "decode" or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -227,10 +253,10 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     @torch.inference_mode()
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run(self, seqs: list[Sequence], mode: str) -> list[int]:
+        input_ids, positions = self.prepare_decode(seqs) if mode == "decode" else self.prepare_prefill(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        logits = self.run_model(input_ids, positions, mode)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

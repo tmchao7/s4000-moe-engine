@@ -1,4 +1,8 @@
 import atexit
+import json
+import socket
+import uuid
+from collections import Counter
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -12,12 +16,29 @@ from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
 
+def _get_distributed_init_method() -> str:
+    """Reserve an ephemeral localhost port for this engine instance.
+
+    The socket is closed before torch.distributed binds it, so there is a very
+    small race, but unlike the old fixed port this permits sequential tests and
+    independent server processes without guaranteed collisions.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"tcp://127.0.0.1:{port}"
+
+
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        if not config.distributed_init_method:
+            config.distributed_init_method = _get_distributed_init_method()
+        if not config.shm_name:
+            config.shm_name = f"nanovllm_{uuid.uuid4().hex}"
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -32,6 +53,14 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.last_token_events = []
+        self.schedule_mode_counts = Counter()
+        self.step_count = 0
+        self.prefill_tokens_total = 0
+        self.decode_tokens_total = 0
+        self.schedule_time_total = 0.0
+        self.forward_time_total = 0.0
+        self.metrics_path = config.metrics_path
         atexit.register(self.exit)
 
     def exit(self):
@@ -47,14 +76,67 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
+
+    def cancel_request(self, seq_id: int):
+        return self.scheduler.cancel(seq_id)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        schedule_start = perf_counter()
+        batch = self.scheduler.schedule()
+        schedule_elapsed = perf_counter() - schedule_start
+        seqs, mode = batch
+        self.schedule_mode_counts[mode] += 1
+        prefill_tokens = sum(
+            seq.num_scheduled_tokens for seq in seqs if seq.is_prefill
+        )
+        decode_tokens = sum(
+            seq.num_scheduled_tokens for seq in seqs if not seq.is_prefill
+        )
+        num_tokens = batch.num_scheduled_tokens if mode != "decode" else -len(seqs)
+        forward_start = perf_counter()
+        token_ids = self.model_runner.call("run", seqs, mode)
+        forward_elapsed = perf_counter() - forward_start
+        self.last_token_events = self.scheduler.postprocess(seqs, token_ids, mode)
+        self.step_count += 1
+        self.prefill_tokens_total += prefill_tokens
+        self.decode_tokens_total += decode_tokens
+        self.schedule_time_total += schedule_elapsed
+        self.forward_time_total += forward_elapsed
+        if self.metrics_path:
+            record = {
+                "kind": "step",
+                "step": self.step_count,
+                "mode": mode,
+                "effective_batch": len(seqs),
+                "prefill_tokens": prefill_tokens,
+                "decode_tokens": decode_tokens,
+                "scheduled_tokens": batch.num_scheduled_tokens,
+                "query_lens": batch.query_lens,
+                "context_lens": batch.context_lens,
+                "schedule_s": schedule_elapsed,
+                "forward_s": forward_elapsed,
+            }
+            with open(self.metrics_path, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+        outputs = [
+            (seq.seq_id, seq.completion_token_ids, seq.metrics())
+            for seq in seqs if seq.is_finished
+        ]
         return outputs, num_tokens
+
+    def metrics(self):
+        result = {
+            "engine_steps_total": self.step_count,
+            "engine_prefill_tokens_total": self.prefill_tokens_total,
+            "engine_decode_tokens_total": self.decode_tokens_total,
+            "engine_schedule_seconds_total": self.schedule_time_total,
+            "engine_forward_seconds_total": self.forward_time_total,
+        }
+        for mode, count in self.schedule_mode_counts.items():
+            result[f"engine_{mode}_steps_total"] = count
+        result.update(self.scheduler.metrics())
+        return result
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -83,10 +165,13 @@ class LLMEngine:
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for seq_id, token_ids, metrics in output:
+                outputs[seq_id] = (token_ids, metrics)
                 pbar.update(1)
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [
+            {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids, "metrics": metrics}
+            for token_ids, metrics in outputs
+        ]
         return outputs

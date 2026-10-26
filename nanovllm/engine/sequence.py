@@ -1,6 +1,7 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from time import perf_counter
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -29,6 +30,12 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.arrival_time = perf_counter()
+        self.first_scheduled_time = None
+        self.first_token_time = None
+        self.finish_time = None
+        self.token_times = []
+        self.wait_steps = 0
 
     def __len__(self):
         return self.num_tokens
@@ -69,12 +76,42 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def record_token(self, timestamp: float):
+        if self.first_token_time is None:
+            self.first_token_time = timestamp
+        self.token_times.append(timestamp)
+
+    def metrics(self):
+        finish = self.finish_time or (self.token_times[-1] if self.token_times else None)
+        ttft = None if self.first_token_time is None else self.first_token_time - self.arrival_time
+        e2e = None if finish is None else finish - self.arrival_time
+        intervals = [
+            right - left for left, right in zip(self.token_times, self.token_times[1:])
+        ]
+        return {
+            "queue_s": None if self.first_scheduled_time is None else self.first_scheduled_time - self.arrival_time,
+            "ttft_s": ttft,
+            "e2e_s": e2e,
+            "mean_tpot_s": sum(intervals) / len(intervals) if intervals else 0.0,
+            "token_intervals_s": intervals,
+        }
+
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            self.is_prefill,
+            last_state,
+        )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+         self.num_scheduled_tokens, self.block_table, self.is_prefill,
+         last_state) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
