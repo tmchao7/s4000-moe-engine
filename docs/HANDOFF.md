@@ -1,197 +1,167 @@
 # HANDOFF — moe-server-s4000（MUSA S4000 双卡推理引擎）
 
-> 最后更新：2026-10-26（会话 #3：P2 性能验收收尾 + P3/P4 设备侧压测 + 报告与提交）
-> 项目：nano-vllm 移植到摩尔线程 MUSA S4000，目标 Qwen3-30B-A3B-FP8 TP2 推理。
+> 最后更新：2026-10-26（会话 #4：P5 指标/内核 + attention A/B + 上游 MoE 复用评估 + P6 graph 可行性）
+> **本文件是给下一位接手的 AI（DeepSeek/GPT）的唯一事实来源**。规则：**文档与代码/测试冲突时以代码和测试为准**，修完文档再继续；不要凭记忆补命令、补数字、补机制。
 
 ---
 
-## 0. 给新会话的最短开工指令
+## 0. 30 秒开工
 
 ```bash
-# 1) 连服务器（免密，中继偶发瞬断，长任务必须 nohup/setsid）
-ssh -p 28036 root@connect.sha1.seetacloud.com
-cd /root/moe-server-s4000        # 服务器上【没有 .git】，本地 Mac 仓库是唯一源头
-
-# 2) 先确认环境干净（跑任何测试前都要做）
-ps -eo pid,cmd | grep -E "python3 (tests|scripts)|spawn_main" | grep -v grep
-rm -f /dev/shm/nanovllm
-mthreads-gmi | grep -E "^[01] .*MiB"      # 两卡必须是 0MiB
-
-# 3) 便宜的门先跑（tiny，1-2 分钟），全绿才碰 30B
-PYTHONPATH=/root/moe-server-s4000 python3 tests/p2_grouped_mm.py   # 四路一致 + 重复确定性
-PYTHONPATH=/root/moe-server-s4000 python3 tests/p3_scheduler.py    # FCFS vs stall_free
-PYTHONPATH=/root/moe-server-s4000 python3 tests/p4_api.py          # API 契约（含 BatchEncoding）
-PYTHONPATH=/root/moe-server-s4000 python3 tests/p4_async_engine.py # 异步并发/取消
-
-# 4) 30B 验收 + 性能（一次加载 ~10 分钟，别重复加载）
-PYTHONPATH=/root/moe-server-s4000 nohup python3 scripts/p2_benchmark.py \
-  --batches 1,2,4,8,16,32,64 --prompt-len 128 --output-len 32 --repeats 3 \
-  --moe-backends loop,grouped_mm --scheduler-policy fcfs \
-  --verify-prompts --reference-outputs benchmarks/p2-reference-8tok.json \
-  --verify-repeats 3 --verify-backends loop,grouped_mm \
-  --output /root/p2_ablation_full.json > /root/p2_ablation_full.log 2>&1 &
+ssh -p 28036 root@connect.sha1.seetacloud.com        # 免密；中继偶发瞬断，长任务必须 setsid nohup
+cd /root/moe-server-s4000                            # 代码（服务器无 .git）
+# 先确认环境干净，再跑便宜的门（见 §6），最后才碰 30B（每次加载 ~10 分钟）
 ```
 
-- 服务器：AutoDL 容器，`/root/moe-server-s4000/`（代码），模型 `/root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8`、`/root/models/Qwen3-8B`
-- tiny 测试模型：`/tmp/tiny_moe`（随机权重 2 层 8 专家 float32，由 `tests/p2_tp_check.py` 自动重建；**没有 chat template**，不能用来验证 HTTP 服务）
-- 本地仓库：`feat/musa-port`（`origin` = github.com/tmchao7/moe-server-s4000）
+本地仓库 `feat/musa-port` 是唯一源头（origin = github.com/tmchao7/moe-server-s4000）。**不 push**，除非用户明确要求。
 
 ---
 
-## 1. 项目硬成果（截至会话 #3）
+## 1. 事实清单（不要猜，照抄）
 
-| 阶段 | 结果 | 文件 |
+| 项 | 值 |
+|---|---|
+| 服务器 | `root@connect.sha1.seetacloud.com -p 28036`（AutoDL 容器） |
+| 代码目录 | `/root/moe-server-s4000`（**没有 .git**） |
+| 30B 模型 | `/root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8`（加载期反量化为 bf16，约 29.5 GiB/卡） |
+| 8B 模型 | `/root/models/Qwen3-8B`（dense 基线，P1 用） |
+| tiny 模型 | `/tmp/tiny_moe`（float32，2 层 8 专家）与 `/tmp/tiny_moe_bf16`（由 `tests/p5_vllm_fused_tiny.py` 生成） |
+| 冻结参考 | `benchmarks/p2-reference-8tok.json`（4 条 prompt × 8 token，确定性构建） |
+| 节点规模 | 单机 2× MTT S4000 48GB，PCIe Gen5 x16，无 NVLink |
+| 软件栈 | torch 2.11 + torch_musa 2.11、MCCL、triton 3.2.0（backend `mtgpu`）、transformers 5.13、Python 3.10 |
+| 默认后端（不得擅改） | `attention_backend=sdpa`、`moe_backend=grouped_mm`、`expert_placement=linear`、`enforce_eager=True` |
+
+### 当前 commit 与证据
+
+- 代码：最近三个提交 `293b02e`（metrics/serving v2）、`7e0c451`（kernels/profiling/A-B/上游 MoE 复用）、以及本文件所在的 docs 提交。
+- profiling 原始证据：`benchmarks/data/p5_profile.json`（服务器 `/root/p5_profile.json`），SHA256 `147e7761799863017210d74f5da236cc07f027971c4eb7afc4f95fe7bdbc089d`。
+- 决策记录：`benchmarks/p5-profile-decision.json`（profiling 路线）、`benchmarks/p5-attention-ab-decision.json`（attention A/B，见 §3）。
+
+---
+
+## 2. 项目现在做到哪
+
+| 阶段 | 状态 | 一句话 |
 |---|---|---|
-| P0 基线 | vllm-musa 0.29.1 + Qwen3-8B TP2：8.4 tok/s（c=32，不随并发扩展） | `benchmarks/P0-vllm-musa-baseline.md` |
-| P1 MUSA 移植 | Qwen3-8B 单卡 113.5 tok/s（batch 64），首 token 与 HF 100% 对齐 | `benchmarks/P1-musa-port.md` |
-| P2 MoE 双卡 | 30B-A3B TP2+EP2 正确；**74.0 tok/s @b32、120.4 tok/s @b64**；grouped-MM 比 loop 快 **3.0–3.2×** | `benchmarks/P2-moe-tp2.md` |
-| P3 调度 | FCFS vs stall-free（decode-first mixed prefill）+ 前缀缓存 / 专家放置 | `benchmarks/P3-scheduler.md` |
-| P4 服务化 | OpenAI 兼容 API（SSE、取消、`/metrics`）+ 开放环压测 | `benchmarks/P4-serving.md` |
+| P0 基线 | 完成 | vllm-musa + Qwen3-8B TP2：8.4 tok/s（c=32，不扩展） |
+| P1 MUSA 移植 | 完成 | Qwen3-8B 单卡 113.5 tok/s @b64，首 token 与 HF 对齐 |
+| P2 MoE 双卡 | 完成 | 30B-A3B TP2+EP2；grouped-MM 74.0 tok/s @b32、120.4 @b64；比 loop 快 3.0–3.2×；贪心可复现 |
+| P3 调度 | 完成 | FCFS vs stall-free 在线对比（mixed step 0→124），短 prompt 收益个位数 |
+| P4 服务化 | 完成 | OpenAI 兼容 API + 开放环压测（128 请求 100% 成功） |
+| P5 指标/内核 | 进行中 | schema v2 + Prometheus + 增量 detokenizer + 设备 profiling + Triton paged decode + 上游 MoE 复用评估；**attention A/B 见 §3** |
+| P6 graph capture | **已判死（有证据）** | MUSA 上 `torch._grouped_mm` 与 Triton kernel 不可捕获（MCCL 可捕获），详见 `docs/P6-graph-capture.md` |
+
+### 已完成的实测结论（不要重跑）
+
+- **profiling（第 1 发）**：长上下文 b32 时 attention 占 forward 58.56%、MoE 计算 53.48%、通信 5.45%、rank 不平衡 5.19% → paged attention 第一优先；**通信重叠与专家放置被否决**（低于 20%/10% 门）。
+- **上游 MoE 复用**（`docs/P5-moe-optimization-survey.md`）：vLLM 的 Triton `fused_experts` 可直接调用，**token 与 grouped_mm 24/24 一致**；但默认配置下更慢（1024 token 262 ms/层），且 vllm-musa 的厂商 fast path（mp22）在 1024 token 直接 illegal memory access → 已集成但**保持 opt-in**，不改默认。
+- **手写融合**（`fused_grouped_mm`）在 bf16 tiny 上 22/24 token 一致（近并列翻转）→ 数值忠实度不如上游 kernel，不作为默认。
+- **graph capture**：plain op ✅、MCCL all_reduce ✅、`torch._grouped_mm` ❌（"operation not permitted when stream is capturing"）、Triton paged kernel ❌ → P6 取消。
 
 ---
 
-## 2. 会话 #3 完成的修复（都有设备侧证据）
+## 3. 加载台账（每一发都按此执行）
 
-### 2.1 grouped-MM 贪心不可复现 → 已修（本轮最重要）
+| # | 内容 | 状态 | 产物 |
+|---:|---|---|---|
+| 1 | profiling 矩阵（8 个 batch×context 点） | ✅ 完成 | `/root/p5_profile.json`、`benchmarks/P5-profiling.md`、`benchmarks/p5-profile-decision.json` |
+| 2 | SDPA vs Triton paged A/B | 🔄 运行中/见下 | `/root/p5_attention_ab.json`、`benchmarks/P5-attention-ab.md`、`benchmarks/p5-attention-ab-decision.json` |
+| 3 | MoE 三路 A/B（grouped / fused_grouped / vllm_fused） | ⏸ 未做（可选） | `/root/p5_moe_ab.json` + `--mode moe` 决策 |
+| 4 | 终局 schema-v2 矩阵 + 前缀缓存冷热 | ⏸ 未做 | `/root/p5_final_matrix.json`、`benchmarks/P5-final-matrix.md` |
+| 5 | 在线 Poisson 容量/goodput | ⏸ 未做 | `benchmarks/P5-serving-v2.md` |
+| ~~6~~ | ~~graph capture A/B~~ | ❌ 取消 | 证据在 `docs/P6-graph-capture.md` |
 
-- **现象**：同一进程内重复生成同样 4 条 prompt（temperature=0），`grouped_mm` 偶尔给出不同 token（近并列处）；`loop` 后端 3/3 稳定；`grouped_mm` 在 `set_moe_backend` 后的**第一次**前向也与稳态不同。
-- **根因**：`_forward_grouped_mm` 用 `out.index_add_(0, flat_token, contribution)` 合并 top-8 贡献。同一 token 的 8 个 slot 命中同一行 → 重复索引 → MUSA 上走原子累加，**顺序由 kernel 调度决定**；bf16 下几 ulp 差异即可翻转近并列 argmax。`loop` 每个专家内 token 索引唯一，不触发原子累加，所以确定。
-- **修复**：贡献先无累加 scatter 回 `(token, slot)` 布局，再沿 slot 维固定顺序求和：
-  ```python
-  dense = contribution.new_zeros(num_tokens, self.top_k, hidden)
-  dense.view(num_tokens * self.top_k, -1)[flat_slot] = contribution
-  return dense.sum(dim=1)
-  ```
-- **代价**：最坏（16k token prefill）多 ~512 MiB 临时缓冲；b32 吞吐 74.0 vs 修复前 75.4 tok/s（同量级）。
-- **验证**：30B 上 `loop`/`grouped_mm` 各 3 次重复 + 预热**全部一致**，且 **loop↔grouped 4/4 条 prompt 逐 token 相同**。
-- 副作用：旧参考 `p2_outputs.json`（原子累加时代的输出）作废，新参考写入 `benchmarks/p2-reference-8tok.json`；prompt 3 的贪心首 token 由 `\n\n\n```python` 变为 `当然可以！下面是一个带有详细注`（两者都连贯，新的才可复现）。
-
-### 2.2 API 无法接真实 tokenizer → 已修
-
-- transformers 5.x 的 `apply_chat_template(tokenize=True)` 返回 **`BatchEncoding`**（不是 list），直接喂给 `Sequence` 会坏。已实测确认（`TYPE BatchEncoding LEN 2`）。
-- 修复：`api_server.py` 把返回值统一归一化成 `list[int]`（兼容 `BatchEncoding` / Tensor / 嵌套 list），空 prompt 直接 400。
-- 测试：`tests/p4_api.py` 现在同时覆盖「返回 list」和「返回 BatchEncoding」两种 tokenizer；真实 30B 上 3 次同样请求输出完全一致。
-
-### 2.3 其他收尾
-
-- `scripts/p2_benchmark.py`：新增 `--verify-prompts`（先在进程内跑 4 条固定 prompt 的正确性/确定性门，再测性能）、`--cache-modes cold,hot`（一次加载测冷/热前缀缓存）、`--jsonl`；`ScheduledBatch` 兼容旧脚本。
-- `scripts/benchmark_online.py`：每个负载点抓一次 `/metrics`，把 `engine_mixed_steps_total` 等计入 summary —— 调度收益有引擎侧证据，不只是端到端数字。
-- `scripts/render_benchmark.py`：支持 `cache_mode` 维度、`--accept-batches`、`--markdown-out`。
-- 删除死配置 `enable_profiling`（只透传、无人使用）。
-- 新增 `tests/p4_benchmark_client.py`：用 stdlib 桩 SSE 服务在 **CPU** 上验证在线压测客户端（tiny 没有 chat template）。
-
----
-
-## 3. 代码地图与关键实现
-
-```
-nanovllm/
-├── config.py              # TP/EP、moe_backend、expert_placement、scheduler_policy、metrics_path
-├── async_engine.py        # 后台线程 + 命令队列；服务化入口
-├── engine/llm_engine.py   # step 循环、请求级/步级指标、--metrics-path JSONL
-├── engine/scheduler.py    # FCFS / stall_free / stall_free_lpm；返回 ScheduledBatch
-├── engine/block_manager.py# paged KV + block-hash 前缀缓存 + KV 计数器
-├── engine/model_runner.py # musa 设备、shm 多进程、prefill/decode/mixed 批构造
-├── entrypoints/openai/api_server.py  # /health /v1/models /v1/chat/completions /metrics
-├── models/qwen3_moe.py    # packed experts + grouped-MM + 确定性 top-k 合并 + EP
-└── layers/attention.py    # paged prefill/decode（decode 把 KV 尾部 mask 成 0，防 NaN 传播）
-```
-
-- **专家放置**：`linear`（0-63 / 64-127）、`round_robin`、`profiled`（`scripts/profile_experts.py` 生成静态均衡映射，带 `config.json` sha256 守卫，防止串用别的模型的地图）。
-- **调度**：`stall_free` 每步先保留全部 decode，再用剩余 token budget 填 `prefill_chunk_size`（默认 256）的 prefill chunk；`stall_free_lpm` 在其上按最长前缀匹配挑选 waiting 请求，并带 starvation guard。
-- **指标**：`LLMEngine.metrics()` / `Scheduler.metrics()` 暴露 step 数、prefill/decode token 数、各 mode step 数、抢占次数、KV 占用/前缀命中/分配回收；`--metrics-path` 按 step 输出 JSONL（`schedule_s` / `forward_s` 可分开看）。
-
----
-
-## 4. 验收门（顺序执行，任一层失败都不要看性能数字）
-
-| 层 | 测试 | 期望 |
-|---|---|---|
-| 逐层数值参考 | `tests/p2_ground_truth.py` | tiny TP1 与手写 CPU 参考逐 token 一致 |
-| 并行等价 | `tests/p2_tp_check.py` | TP1 == TP2 |
-| 后端/放置等价 | `tests/p2_grouped_mm.py` | TP1/TP2 × loop/grouped + round_robin 五路一致 + 重复确定性 |
-| 解码确定性 | `tests/p2_determinism.py` | 反复重建引擎结果相同 |
-| 调度等价 | `tests/p3_scheduler.py` | stall_free 出现 `mixed` step 且输出与 FCFS 相同 |
-| 指标契约 | `tests/p3_metrics.py` | ScheduledBatch 形状 + KV 计数器 |
-| API 契约 | `tests/p4_api.py` | health/models/stream/non-stream/metrics + BatchEncoding |
-| 异步引擎 | `tests/p4_async_engine.py` | 并发完成 + 取消 + 计数器 + 干净退出 |
-| 压测客户端 | `tests/p4_benchmark_client.py` | 桩 SSE 下分位数/成功率/`/metrics` 抓取正确 |
-| 30B 端到端 | `scripts/p2_benchmark.py --verify-prompts` | 两后端确定性 + 跨后端逐 token 一致 + 输出连贯 |
-
----
-
-## 5. 运维手册（每条都是血泪）
-
-1. **进程清理**：`mp.spawn` 子进程不会自己退。每次跑完/失败后：
-   ```bash
-   pkill -9 -f "[s]pawn_main"; pkill -9 -f "tests/p[0-9]_"; pkill -9 -f "api_serve[r]"
-   rm -f /dev/shm/nanovllm        # 残留会导致下次 barrier 卡死
-   mthreads-gmi | grep -E "^[01] .*MiB"   # 必须 0MiB
-   ```
-2. **`pkill -f` 自匹配**：`ssh host 'pkill -f foo'` 会杀掉自己（远端 shell 命令行含 `foo`）→ 用括号技巧 `"fo[o]"`。
-3. **SSH 中继不稳**：scp 大概闪断；**tar over ssh 流**实测稳定（`COPYFILE_DISABLE=1 tar -czf - . | ssh ... 'tar -xzf -'`）。后台长任务用 `setsid nohup ... &` 且 `ssh -f -n` 发起，**不要**让任务依赖会话；轮询用短 `ssh 'tail'`。
-4. **AppleDouble 垃圾**：从 macOS 传包会带 `._*`，远端 `find . -name "._*" -delete`。
-5. **MUSA 调试三铁律**：hook 里对比张量前必须 `torch.musa.synchronize()` 且先 `.contiguous()`；别信 strided view 的 bulk 拷贝；`get_rope` 有 `lru_cache`，换配置/换进程前 `get_rope.cache_clear()`。
-6. **30B 加载 ~10 分钟**（FP8→bf16 反量化，CPU 侧热点），显存到位不代表加载完成，看日志里的 `[verify]`/`[p2-weights]` 才准。
-7. **block 大小**：`kvcache_block_size` 必须是 256 的倍数；前缀缓存按 256-token 整块命中，**短 prompt（<256 token）不会命中**，测缓存收益要 `--prompt-len 512 --shared-prefix-len 384` 这种量级。
-8. 项目目录里的 `core_*.mudmp` 是 MUSA core dump，可删。
-
----
-
-## 6. 已知问题 / 下一步
-
-- **注意力**：仍是 SDPA + 每步 `k_cache[blocks]` gather，未接 Triton-mtgpu paged attention kernel；这是 decode 的主要优化点。
-- **CUDAGraph**：仍 `enforce_eager`，torch_musa graph capture 未验证。
-- **小 batch 固定开销**：grouped-MM 的 `argsort`/`bincount`/两次 `_grouped_mm` 使 b1–8 加速比（2.7–2.8×）低于 b16–64（3.0–3.2×）。
-- **温度**：本轮吞吐用 `temperature=0`；与外部数字对比时要统一口径。
-- 30B 的**跨进程**逐 token 一致性未直接测量（同进程内两端确定性 + 跨后端 4/4 一致已测；修复原理上消除了原子累加，跨进程应当稳定）。
-- 长期：Triton paged attention / fused MoE、W4/AWQ（GLM-4.5-Air 106B）、graph capture。
-
----
-
-## 7. 产物清单
-
-```
-benchmarks/P2-moe-tp2.md          # 正确性门 + loop/grouped 消融（1-64）+ 显存 + 确定性修复
-benchmarks/P3-scheduler.md        # FCFS vs stall-free 在线对比
-benchmarks/P4-serving.md          # 真实 30B OpenAI 接口开放环压测
-benchmarks/p2-reference-8tok.json # 30B 8-token 贪心参考（确定性构建）
-benchmarks/data/                  # 原始 JSON/JSONL 与 PNG（.gitignore）
-scripts/p2_benchmark.py           # 离线消融 + 正确性门 + 缓存冷热
-scripts/benchmark_online.py       # 开放环压测 + /metrics 抓取
-scripts/render_benchmark.py       # 表格 + PNG + 验收门
-scripts/profile_experts.py        # 专家路由画像 → 静态均衡映射
-tests/                            # 上述所有回归测试
-docs/architecture.md              # 架构 + 可观测性 + 基准方法论
-```
-
----
-
-## 8. 给接手的 AI：待办清单（照做即可）
-
-### 8.0 先读什么 / 别做什么
-
-- **先读 §5 运维手册**，否则会重复踩坑（进程清理、ssh 中继、270s 加载、block=256）。
-- **已经做完、不要重跑**（数字已冻结）：
-  - P2 消融 batch 1–64 × loop/grouped × 3 重复 → `benchmarks/P2-moe-tp2.md`
-  - 正确性门全套（§4）→ 全绿
-  - 在线 FCFS / stall-free 各 4 个负载点 → `benchmarks/P3-scheduler.md`、`P4-serving.md`
-- **不要改验收阈值**（`scripts/render_benchmark.py` 里 ≥1.5×、p95 TPOT 比 ≤1.10、CV ≤5%）。不达标就如实写 FAIL，不要调参让它 PASS。
-- **任何 30B 性能测量之前必须先跑 §4 的门**。30B 一次加载 ~10 分钟，一次错误的测量等于浪费 10 分钟。
-- 服务器上**没有 .git**；本地 Mac 仓库 `feat/musa-port` 是唯一源头，本次工作已提交（最近三个提交：MoE 模型与正确性 / 引擎与 API / 文档与结果）。
-
-### 8.1 环境速查
+### 第 2 发（attention A/B）——如果还在跑或要重跑
 
 ```bash
-ssh -p 28036 root@connect.sha1.seetacloud.com
-cd /root/moe-server-s4000                       # 代码（无 .git）
-# 模型
-/root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8   # 30G，主力
-/models/Qwen3-8B                                          # 16G，dense 基线
-/tmp/tiny_moe                                             # tiny，随机权重，无 chat template
+ssh -f -n -p 28036 root@connect.sha1.seetacloud.com \
+ 'cd /root/moe-server-s4000 && setsid nohup env PYTHONPATH=/root/moe-server-s4000 \
+  python3 scripts/p5_attention_ab.py --workloads 16x512,32x512,16x2048,32x2048 \
+    --output-len 32 --repeats 3 --attention-backends sdpa,triton_paged \
+    --output /root/p5_attention_ab.json > /root/p5_attention_ab.log 2>&1 < /dev/null &'
+```
+- 先看日志：`[p5-profile] 30B correctness gate PASS`，然后逐点 `[p5-ab] ... tok/s=... mismatches=...`。
+- 结束后**必须**跑决策（阈值已冻结在 `scripts/p5_decide.py`）：
+```bash
+PYTHONPATH=/root/moe-server-s4000 python3 scripts/p5_decide.py --mode attention \
+  --input /root/p5_attention_ab.json \
+  --output benchmarks/p5-attention-ab-decision.json \
+  --markdown benchmarks/P5-attention-ab.md
+```
+- `adopt_triton_paged` → 才允许改 `nanovllm/config.py` 与 `api_server.py` 的默认 `attention_backend`；`keep_sdpa` → 记录负结果，默认不动。
+
+### 第 3 发（MoE 三路 A/B，可选）
+
+```bash
+python3 scripts/p2_benchmark.py --batches 8,16,32 --prompt-len 128 --output-len 32 \
+  --repeats 3 --moe-backends grouped_mm,fused_grouped_mm,vllm_fused \
+  --attention-backends <第 2 发的决定> --output /root/p5_moe_ab.json
+PYTHONPATH=/root/moe-server-s4000 python3 scripts/p5_decide.py --mode moe \
+  --input /root/p5_moe_ab.json --output benchmarks/p5-moe-ab-decision.json \
+  --markdown benchmarks/P5-moe-ab.md
+```
+⚠️ `vllm_fused` 走 generic Triton 路径时 prefill 很慢（1024 token ≈262 ms/层），跑之前先确认时间预算；若只想要数据不必三路全跑，可用 `grouped_mm,fused_grouped_mm`。
+
+### 第 4 发（终局矩阵 + 前缀缓存）
+
+```bash
+python3 scripts/p2_benchmark.py --batches 1,2,4,8,16,32,64 --prompt-len 128 --output-len 32 \
+  --repeats 3 --moe-backends <决定> --attention-backends sdpa,<决定> \
+  --probe-batches 8 --probe-prompt-len 512 --probe-shared-prefix-len 384 \
+  --probe-cache-modes cold,hot --output /root/p5_final_matrix.json
+python3 scripts/render_benchmark.py /root/p5_final_matrix.json \
+  --output-dir benchmarks/data --accept-batches 16,32 --markdown-out benchmarks/P5-final-matrix.md
+```
+注意：前缀缓存按 **256-token 整块**命中，所以 `--probe-shared-prefix-len` 必须 ≥256（脚本会断言）。
+
+### 第 5 发（在线容量）
+
+```bash
+# 服务（用最终决定的默认栈）
+python3 -m nanovllm.entrypoints.openai.api_server --model <30B> \
+  --served-model-name qwen3-30b-a3b --scheduler-policy stall_free \
+  --attention-backend <决定> --moe-backend <决定>
+# 就绪后（curl /health）：
+PYTHONPATH=/root/moe-server-s4000 python3 scripts/benchmark_online.py --model qwen3-30b-a3b \
+  --tokenizer /root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8 \
+  --max-qps <由第 4 发 b32 吞吐 ÷64 ×0.8> --requests 128 --max-tokens 64 --prompt-words 128 \
+  --arrival-pattern poisson --slo-ttft-ms 2000 --slo-tpot-ms 500 \
+  --fractions 0.25,0.5,0.75,0.9 --output benchmarks/data/online-v2.json
 ```
 
-**本地 → 远端同步**（scp 不可靠，用 tar 流）：
+---
+
+## 4. 冻结门（写死在代码里，禁止"看结果再改阈值"）
+
+| 模式 | 门 | 代码 |
+|---|---|---|
+| `attention` | token 全等；context=2048 且 batch∈{16,32} 的 p95 TPOT 比值 ≤0.90；吞吐比 ≥1.00；CV ≤5% | `scripts/p5_decide.py::ATTENTION_GATES` |
+| `moe` | token 全等；b16、b32 吞吐比均 ≥1.08；p95 TPOT 比 ≤1.00；CV ≤5% | `MOE_GATES` |
+| `graph` | token 全等；b1 ≥+15%、b8 ≥+5%；b32/b64 ≥0.98；CV ≤5%；显存增量 ≤2 GiB | `GRAPH_GATES` |
+| profiling | attention ≥30%；MoE ≥35% 或 route/combine ≥10%（MoE 内）；通信 ≥20%；不平衡 >10% | `scripts/p5_profile.py::decide` |
+
+决策 JSON 一律包含 `thresholds / observed / decision / evidence_sha256`。**边界用例已单测**：`tests/p5_decide.py`。
+
+---
+
+## 5. 禁止事项（上一位 AI 最容易被坑的地方）
+
+1. **不要改默认后端**，除非对应模式的冻结门通过并在决策 JSON 里写清。
+2. **不要重跑第 1 发 profiling**（结果已冻结、原始 JSON 有 sha256）。
+3. **不要把 legacy v1（P2/P3/P4）指标与 v2 混比**：v1 的 `tpot` 字段实为 token-gap ITL、CV 用 `pstdev/median`。见 `docs/P5-metrics-audit.md`。
+4. **不要声称 graph capture 可用**：已实测不可捕获；也不要改 `enforce_eager` 默认。
+5. **不要声称移植了 MoonEP/UniEP/MegaMoE**：只借融合划分；理由与实测见 `docs/P5-moe-optimization-survey.md`。
+6. **不要用厂商 mp22 fast path**：1024 token 会 illegal memory access；`vllm_fused` 里已强制 `use_mp22_fused_moe=False`。
+7. **不要在 30B 上跳过正确性门**直接测性能：`p2_benchmark` 默认开启，`--skip-verification` 只在明确知道原因时使用。
+8. **不要在一个 30B 进程还在跑时启动第二个**（显存 48GB/卡，两个必挂）。
+9. **不要用 `from scripts.x import`**：这台机器的 site-packages 里有一个同名 `scripts` 包会把它覆盖，必须按文件路径导入（见 §6）。
+10. **不要相信 `scp` 与长 SSH 会话**：用 tar-over-ssh 与 `setsid nohup`。
+
+---
+
+## 6. 环境与运维
+
+### 同步代码（本地 → 服务器）
 
 ```bash
 cd <local repo> && COPYFILE_DISABLE=1 tar -czf - \
@@ -200,85 +170,112 @@ cd <local repo> && COPYFILE_DISABLE=1 tar -czf - \
   'cd /root/moe-server-s4000 && tar -xzf - && find . -name "._*" -delete && python3 -m compileall -q nanovllm tests scripts && echo COMPILE_OK'
 ```
 
-**长任务启动模板**（`ssh -f -n` + `setsid`，中继断了也不影响）：
-
-```bash
-ssh -f -n -p 28036 root@connect.sha1.seetacloud.com \
-  'cd /root/moe-server-s4000 && setsid nohup env PYTHONPATH=/root/moe-server-s4000 \
-   python3 <script> <args> > /root/<name>.log 2>&1 < /dev/null &'
-# 轮询（短连接，别 sleep 在 ssh 里）
-ssh -p 28036 ... 'tail -5 /root/<name>.log; ps -o pid,etime -p <pid>'
-```
-
-**注意**：`scripts/benchmark_online.py` 的 `print` 没有 flush，重定向到文件时是块缓冲 —— 日志会在结束时才出现，期间看 `/metrics` 或 `ps` 判断进度。
-
-### 8.2 任务 B1：前缀缓存冷/热对比（1 次加载 ≈ 20 min）
+### 启动长任务（SSH 断了不影响）
 
 ```bash
 ssh -f -n -p 28036 root@connect.sha1.seetacloud.com \
  'cd /root/moe-server-s4000 && setsid nohup env PYTHONPATH=/root/moe-server-s4000 \
-  python3 scripts/p2_benchmark.py --batches 8 --prompt-len 512 --output-len 32 --repeats 3 \
-    --moe-backends grouped_mm --shared-prefix-len 384 --cache-modes cold,hot \
-    --output /root/p3_prefix_cache.json > /root/p3_prefix_cache.log 2>&1 < /dev/null &'
+  python3 <script> <args> > /root/<name>.log 2>&1 < /dev/null &'
+# 轮询用短连接；不要 sleep 在 ssh 里
+ssh -p 28036 ... 'tail -5 /root/<name>.log; ps -o pid,etime -p <pid>'
 ```
 
-- **必须** `prompt_len ≥ 512` 且 `shared_prefix_len ≥ 256`：前缀缓存按 256-token 整块哈希，短 prompt 命中率为 0（本轮在线压测里 `kv_prefix_hit_tokens_total` 一直是 0 就是这个原因）。
-- 预期：`hot` 相对 `cold` 的 TTFT p95 明显下降（省掉 1 个 block 的 prefill）。
-- 写回 `benchmarks/P3-prefix-placement.md` 的"前缀缓存"小节，并更新 `docs/roadmap.md`。
-
-### 8.3 任务 B2：专家放置 linear vs profiled（2 次加载 ≈ 35 min）
-
-1. **先在 tiny 上验证哈希守卫**（1 分钟，别跳过）：
-   - `python3 scripts/profile_experts.py --model /tmp/tiny_moe --output /tmp/tiny_map.json`
-   - 用该 map 起 LLM（`expert_placement="profiled"`）→ 应成功；
-   - 故意改 `model_config_sha256` → 应 assert 失败。守卫在 `nanovllm/models/qwen3_moe.py::_expert_ids`。
-2. **生成 30B 映射**（1 次加载）：
-   ```bash
-   python3 scripts/profile_experts.py --batch 32 --prompt-len 128 --output-len 64 \
-     --output /root/p2_expert_map.json
-   ```
-   记录 `mean_balancedness`（越接近 1 越均衡）。
-3. **测 profiled 放置**（1 次加载，参数必须与 P2 的 linear 完全一致才能比）：
-   ```bash
-   python3 scripts/p2_benchmark.py --batches 8,16,32 --prompt-len 128 --output-len 32 \
-     --repeats 3 --moe-backends grouped_mm --expert-placement profiled \
-     --expert-map-path /root/p2_expert_map.json --output /root/p3_profiled.json
-   ```
-4. 对比基准（linear，同参）：`benchmarks/P2-moe-tp2.md` 的 grouped 行 —— b8 24.21、b16 42.68、b32 74.01 tok/s。
-5. 写回 `benchmarks/P3-prefix-placement.md`。**结论可能是"没有显著差异"**，如实写，并解释（EP2 下每卡 64 专家、hidden replicated，负载均衡对 all-reduce 前的工作量影响有限）。
-
-### 8.4 任务 B3：把在线并发拉满 + 长 prompt（1–2 次加载 ≈ 30 min）
-
-本轮在线最高只堆到 ~14–20 并发（达成 0.55 req/s ≈ 35 tok/s），低于离线 batch-32 的 74 tok/s。要直接对齐：
+### 清理仪式（每次测试前后）
 
 ```bash
-# 服务
-python3 -m nanovllm.entrypoints.openai.api_server --model <30B> \
-  --served-model-name qwen3-30b-a3b --scheduler-policy stall_free
-# 拉满并发（目标 qps 1.6 → Little's law 下并发 ≈ 32）
-python3 scripts/benchmark_online.py --model qwen3-30b-a3b --max-qps 1.6 \
-  --requests 32 --max-tokens 64 --fractions 0.5,0.75,1.0 \
-  --output benchmarks/data/online_highqps.json
+pkill -9 -f "[s]pawn_main"; pkill -9 -f "tests/p[0-9]_"; pkill -9 -f "api_serve[r]"
+rm -f /dev/shm/nanovllm*
+mthreads-gmi | grep -E "^[01] .*MiB"     # 必须 0MiB
+```
+`pkill -f` 会自匹配（远端 shell 命令行含模式）→ 用括号技巧 `"fo[o]"`。
+
+### 本机特有的坑（血泪）
+
+| 坑 | 症状 | 处理 |
+|---|---|---|
+| site-packages 有同名 `scripts` 包 | `from scripts.p5_profile import ...` → `ModuleNotFoundError` | 按文件路径导入（`sys.path.insert(0, str(Path(__file__).parent))` + `from p5_profile import ...`） |
+| 30B 加载 ~10 分钟 | 日志长时间为空、显存已到 29.5 GiB | 显存到位≠加载完，等 `[p5-profile] ... gate PASS` 或 `[bench verify]` |
+| vllm-musa mp22 fast path | `illegal memory access`（≥1024 token）或 `K must be divisible by AlignmentA/B` | 强制 `use_mp22_fused_moe=False`，或不要用 `vllm_fused` |
+| tiny 模型形状 | vllm fused MoE 的 muDNN 要求 tile 对齐，tiny 会 abort | tiny 验证用 generic Triton 路径；生产形状才用 fast path |
+| 前缀缓存 | 短 prompt 完全无命中 | `shared_prefix_len ≥ 256`（整块）才可能命中 |
+| Triton `.jit` 不能写在 `python -c` 里 | `OSError: could not get source code` | 必须写成 `.py` 文件运行 |
+| 中继拉大文件会截断 | 50KB JSON 偶发 0 字节 | 传/拉都带重试并校验大小 |
+| `useset -e` 下的管道 | 退出码丢失 | 用 `set -o pipefail` |
+
+---
+
+## 7. 代码地图
+
+```
+nanovllm/
+├── config.py                   # 运行配置：TP/EP、moe_backend、attention_backend、调度、metrics
+├── async_engine.py             # 后台线程引擎 + 命令队列 + Prometheus + 有界队列(429)
+├── benchmarking.py             # TPOT/ITL/CV/goodput/percentile 的唯一定义处
+├── prometheus_metrics.py       # counter/gauge/histogram 导出
+├── incremental_detokenizer.py  # 增量 detokenize（UTF-8 边界、stop 回退）
+├── profiling.py                # MUSA Event 分段计时 + observe 计数
+├── kernels/
+│   ├── paged_attention.py      # Triton paged GQA decode（head_dim 128 / page 256，runtime loop）
+│   └── moe_fusion.py           # 手写 SwiGLU + 确定性 combine（对照用）
+├── engine/
+│   ├── llm_engine.py           # step 循环、指标、JSONL trace
+│   ├── scheduler.py            # FCFS / stall_free / stall_free_lpm + ScheduledBatch
+│   ├── block_manager.py        # paged KV + block-hash 前缀缓存 + 计数
+│   ├── model_runner.py         # musa 设备、shm 多进程、prefill/decode/mixed、graph 骨架（禁用）
+│   └── sequence.py             # 序列状态 + 请求级指标
+├── entrypoints/openai/api_server.py  # /health /v1/models /v1/chat/completions /metrics
+├── models/qwen3_moe.py         # packed experts、loop/grouped/fused/vllm_fused 四种后端、确定性 top-k
+└── layers/attention.py         # prefill SDPA + decode 双后端（sdpa / triton_paged）
+scripts/  p5_profile.py, p5_attention_ab.py, p5_decide.py, p2_benchmark.py,
+          benchmark_online.py, render_benchmark.py, profile_experts.py
+tests/    p2_*（正确性）, p3_*（调度/指标）, p4_*（服务）, p5_*（指标/内核/决策/上游复用）, p6_graph_probe.py
+docs/     P5-metrics-audit.md, engine-vs-vllm-sglang.md, P5-moe-optimization-survey.md,
+          P6-graph-capture.md, architecture.md, roadmap.md, musa-pitfalls.md
+benchmarks/ P2-moe-tp2.md, P3-scheduler.md, P4-serving.md, P5-profiling.md,
+          p2-reference-8tok.json, p5-profile-decision.json, data/（原始 JSON，不入库）
 ```
 
-第二个实验（更能体现 stall-free 收益）：把 prompt 拉长到 ~1k token。
+---
+
+## 8. 先跑哪些测试（顺序不要乱）
 
 ```bash
-python3 scripts/benchmark_online.py ... --prompt-words 1024 --max-tokens 64 \
-  --fractions 0.5,0.75,1.0 --output benchmarks/data/online_longprompt.json
+# CPU，秒级
+PYTHONPATH=/root/moe-server-s4000 python3 tests/p5_metrics_v2.py
+PYTHONPATH=/root/moe-server-s4000 python3 tests/p5_detokenizer.py
+PYTHONPATH=/root/moe-server-s4000 python3 tests/p4_api.py
+PYTHONPATH=/root/moe-server-s4000 python3 tests/p4_benchmark_client.py
+PYTHONPATH=/root/moe-server-s4000 python3 tests/p5_decide.py
+# 设备，无需模型
+PYTHONPATH=/root/moe-server-s4000 python3 tests/p5_paged_attention.py
+# tiny（每次 1–2 分钟，注意清理）
+PYTHONPATH=/root/moe-server-s4000 python3 tests/p2_grouped_mm.py
+PYTHONPATH=/root/moe-server-s4000 python3 tests/p5_vllm_fused_tiny.py
+PYTHONPATH=/root/moe-server-s4000 python3 tests/p3_scheduler.py
+PYTHONPATH=/root/moe-server-s4000 python3 tests/p4_async_engine.py
+PYTHONPATH=/root/moe-server-s4000 python3 tests/p6_graph_probe.py      # 预期 FAIL（已知阻塞）
 ```
 
-- 预期：prefill 成本从 ~0.2s 涨到 ~2s，FCFS 的 decode stall 变成主要延迟来源，stall-free 的 E2E/TPOT 收益应当从个位数百分比变得明显。
-- 写回 `benchmarks/P3-scheduler.md` §3（把"短 prompt 收益小"的结论升级为两条 workload 的对比）。
+---
 
-### 8.5 任务 B4（可选）：30B 跨进程一致性（1 次加载）
+## 9. 下一步候选与进入条件
 
-本轮只测了**同进程内**确定性（loop/grouped 各 3 次 + 预热全一致、跨后端 4/4 一致）。若要把"跨进程也稳定"写实：跑两次 `p2_benchmark.py --verify-prompts ...`（可以只跑 `--batches 1`），比对两份 JSON 里 `verification.backends.*.runs[0]` 的 token ids。一致就补进 `benchmarks/P2-moe-tp2.md` §2，删掉 HANDOFF §6 里"跨进程未直接测量"的说明。
+| 候选 | 进入条件 |
+|---|---|
+| 改默认 attention 后端 | 第 2 发决策 `adopt_triton_paged` |
+| 改默认 MoE 后端 | 第 3 发决策 `adopt_*`（token 全等 + ≥8% + TPOT 不退化 + CV） |
+| 上游 MoE 的 shape-driven autotune（`get_moe_configs` 风格） | 需要一次独立加载做配置 sweep；只有 sweep 后 ≥8% 才值得再谈默认 |
+| route/pack 融合 | 先用低开销计时复核 44.9% 是否被 event 插桩放大 |
+| graph capture 重启 | 需要一个可捕获的 MoE（或 MUSA runtime 修复）；MCCL 已确认可捕获 |
+| radix tree / 投机解码 / 多实例 | 与当前主线无关，别做 |
 
-### 8.6 收尾约定
+---
 
-- 新数字**必须**用 `scripts/render_benchmark.py` 生成表格（别手抄），原始 JSON/JSONL 放 `benchmarks/data/`（已 gitignore）。
-- 同步更新：`docs/roadmap.md` 勾选、`README.md` 的进度表、`benchmarks/README.md` 的文件索引。
-- 提交分三类（可参考本轮）：① 模型/正确性 ② 引擎/服务/工具 ③ 文档/结果。**不 push**，除非用户明确要求。
-- 提交前至少跑：`python3 -m compileall -q nanovllm tests scripts`；有 GPU 就再跑 §4 的 tiny 门（`p2_grouped_mm` / `p3_scheduler` / `p4_api` / `p4_async_engine` / `p4_benchmark_client`）。
-- 收工前清理服务器：`pkill -TERM -f "api_serve[r]"`、`pkill -9 -f "[s]pawn_main"`、`rm -f /dev/shm/nanovllm`、确认 `mthreads-gmi` 两卡 0MiB。
+## 10. 交接自检清单（动手前逐条打勾）
+
+- [ ] 能 `ssh` 上服务器，`cd /root/moe-server-s4000` 成功
+- [ ] `git log --oneline -3` 能看到本轮提交；本地与远端 md5 一致
+- [ ] 两卡 0MiB、无残留 `spawn_main`/`api_server`
+- [ ] §8 的 CPU 门全绿
+- [ ] 读过 §5 禁止事项
+- [ ] 知道本次要花几发加载、每发结束**先落盘提交再做下一发**

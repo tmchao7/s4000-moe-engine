@@ -50,10 +50,12 @@
 | P2 优化 | **完成** | packed experts + `torch._grouped_mm` 比 loop 后端快 **3.0–3.2×**（b16–64），TPOT p95 降至 0.31× |
 | P3 调度 | 完成 | FCFS vs stall-free（decode-first mixed prefill）在线对比，见 [benchmarks/P3-scheduler.md](benchmarks/P3-scheduler.md) |
 | P4 服务化 | 完成 | OpenAI 兼容 API（SSE 流式 / 取消 / `/metrics`）+ 开放环压测，见 [benchmarks/P4-serving.md](benchmarks/P4-serving.md) |
+| P5 指标与内核 | **进行中** | schema v2 + Prometheus + 真实 30B profiling；attention 占 forward 最高 58.6%（paged attention 第一优先）；上游 MoE 复用评估为**负结果**；graph capture 被 MUSA 阻塞 |
+| P5 方法论 | 完成 | 指标口径与工业界逐项对照（[metrics-audit](docs/P5-metrics-audit.md)）、能力矩阵（[engine-vs-vllm-sglang](docs/engine-vs-vllm-sglang.md)）、MoE 调研与实测（[moe-survey](docs/P5-moe-optimization-survey.md)）、[graph 结论](docs/P6-graph-capture.md) |
 
-正确性上，tiny 模型 TP1/TP2 × loop/grouped 四路逐 token 一致；30B 四组中英文 prompt 输出连贯，且 loop 与 grouped **4/4 条 prompt 逐 token 相同**、同一后端多次重复与首次调用完全一致（为此修掉了 grouped-MM 原子累加导致的贪心不可复现，详见 `benchmarks/P2-moe-tp2.md`）。
+正确性上，tiny 模型 TP1/TP2 × loop/grouped/fused 四路逐 token 一致；30B 四组中英文 prompt 输出连贯，loop 与 grouped **4/4 条 prompt 逐 token 相同**（为此修掉了 grouped-MM 原子累加导致的贪心不可复现，详见 `benchmarks/P2-moe-tp2.md`）。P5 进一步测到 **MUSA SDPA 在 b32/c512 自身不可复现**，因此跨后端比较采用"候选确定性 + ≥99% token 一致"的冻结门（见 `scripts/p5_decide.py`）。
 
-详细数字与结论见 [benchmarks/](benchmarks/)：`P2-moe-tp2.md`（吞吐/显存/后端消融）、`P3-scheduler.md`（调度与前缀缓存）、`P4-serving.md`（在线压测）。
+详细数字与结论见 [benchmarks/](benchmarks/)：`P2-moe-tp2.md`（吞吐/显存/后端消融）、`P3-scheduler.md`（调度）、`P4-serving.md`（在线机制验证）、`P5-profiling.md`（指标校准与真实 30B profiling）。
 
 ## 快速开始
 

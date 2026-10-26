@@ -83,19 +83,58 @@ TP2 通信量：每层 2 次 allreduce（attention 后 + MoE 后）。PCIe Gen5 
 
 ## 6. 可观测性与基准方法
 
-**引擎侧**：`LLMEngine.metrics()` 暴露累计 step 数、prefill/decode token 数、调度/前向累计耗时、各 mode（prefill/decode/mixed）step 数；`Scheduler.metrics()` 暴露等待/运行队列长度、抢占次数、KV 块容量/占用/前缀命中 token 数、块分配与回收次数。`--metrics-path` 可按 step 输出 JSONL（mode、批内序列数、query/context 长度、schedule/forward 耗时），用于拆解瓶颈。
+**引擎侧**：`LLMEngine.metrics()` 暴露累计 step 数、prefill/decode token 数、调度/前向累计耗时、各 mode（prefill/decode/mixed）step 数；`Scheduler.metrics()` 暴露等待/运行队列长度、抢占次数、KV 块容量/占用/前缀命中 token 数、块分配与回收次数。服务端以 Prometheus counter/gauge/histogram 暴露请求 queue/TTFT/TPOT/E2E 和 step schedule/forward；`--metrics-path` 仍可按 step 输出原始 JSONL。
 
 **基准口径**（对齐社区通行做法，便于横向比较）：
 
-- **离线批处理**：固定 prompt/output 长度、每点先 warmup 再测 3 次，报告吞吐中位数 + 变异系数（CV）+ TTFT/TPOT p95 中位数。对应 vLLM `benchmark_serving` 的"固定请求集 + 分位数"口径。
-- **在线开放环**：客户端按泊松/等间隔注入请求（`--max-qps` × 负载比例），以免闭环压测掩盖排队行为；报告达成 QPS、成功率、TTFT p50/p95、E2E p95，并从 `/metrics` 抓取该负载窗内的 mixed step 数作为调度行为证据。
-- **指标定义**：TTFT = 请求到达到首个输出 token；TPOT = 相邻输出 token 间隔（取 p95）。与 Databricks LLM 推理性能工程实践、vLLM 文档一致。
+- **离线批处理**：固定 prompt/output 长度、每点先 warmup 再测 3 次，报告吞吐中位数、`sample std / mean` CV、TTFT/请求级 TPOT/token-gap ITL。schema v1 原始结果不回写，schema v2 才使用校准口径。
+- **在线开放环**：客户端按 Poisson/等间隔注入请求，必须收到 `[DONE]` 和真实 usage 才记成功；报告 request/input/output/total throughput、TTFT/TPOT/ITL/E2E、最大并发和 SLO goodput，并抓取同窗口引擎计数。
+- **指标定义**：TTFT 是到达至首个非空流式输出；请求级 `TPOT=(E2E-TTFT)/(output_tokens-1)`；ITL 是相邻非空流式输出的时间间隔，两者分别统计，不能混名。
 
 参考：nano-vllm（上游引擎结构）、PagedAttention/vLLM（paged KV 与前缀复用）、Orca（iteration-level scheduling）、Sarathi-Serve（stall-free chunked prefill）、vLLM `benchmark_serving`（开放环压测与分位数口径）。
 
 ## 7. 已知局限
 
-- 注意力仍是 SDPA + gather，未接 Triton-mtgpu paged attention kernel；decode 路径每步对所有序列做一次 block gather。
-- 未启用 CUDAGraph（`enforce_eager`），每步有 Python 侧调度与张量构造开销。
+- SDPA + gather 保留为兼容后端；P5 新增直接读取 paged KV 的 MUSA Triton decode 后端，是否设为默认只由真实 30B A/B 决定。
+- 未启用 CUDAGraph（`enforce_eager`），每步有 Python 侧调度与张量构造开销。**P6 已实测阻塞**：MUSA 上 `torch._grouped_mm` 与 Triton kernel 都不可被 graph 捕获（MCCL all-reduce 可捕获），详见 `docs/P6-graph-capture.md`。
 - grouped-MM 的 `argsort`/`bincount`/两次 `_grouped_mm` 调用在小 batch 下固定开销占比高（b1 加速比低于 b16/b32）。
 - 在线服务为单实例、单模型、无 tokenizer 批处理；不做多副本与负载均衡。
+
+## 8. P5/P6 优化路线与边界（证据驱动，先冻结阈值再测量）
+
+### 8.1 观测结论（真实 30B，`benchmarks/P5-profiling.md`）
+
+decode 阶段、48 层累计：长上下文 batch 32 时 attention 的 gather+mask 与 SDPA 合计占 forward **58.56%**；MoE 计算最高 **53.48%**（其中 route+combine 最高 44.93%，该数字可能被短段 event 开销放大）；EP all-reduce 最高 **5.45%**；两 rank 路由不平衡最高 **5.19%**。按预先冻结的门槛（30% / 35% 或 10% / 20% / 10%）自动得到：
+
+| 路线 | 门槛 | 实测 | 结论 |
+|---|---:|---:|---|
+| paged attention | attention ≥30% | 58.56% | 触发，第一优先 |
+| MoE fusion | MoE ≥35% 或 route/combine ≥10% | 53.48% / 44.93% | 触发，第二优先 |
+| collective overlap | all-reduce ≥20% | 5.45% | **否决** |
+| profiled placement | rank 不平衡 >10% | 5.19% | **否决** |
+
+### 8.2 Attention 后端契约
+
+- **prefill 始终用 SDPA**；只有 decode 可在 `sdpa` / `triton_paged` 之间切换（`attention_backend`）。
+- Triton paged kernel 的约束：`head_dim=128`、`page_size=256`、GQA 头数可整除；循环上界用**运行时 context_len**（不是 constexpr），因此一份编译服务所有上下文长度，也不会按桶重 JIT。
+- 数值：q·k 与 softmax 走 fp32；是否设为默认由 `scripts/p5_decide.py --mode attention` 的冻结门决定（token 全等 + 长上下文 b16/b32 p95 TPOT 比值 ≤0.90 + 吞吐比 ≥1.00 + CV ≤5%）。
+
+### 8.3 MoE 融合边界
+
+- 本项目的 MoE 是 **EP2 + hidden replicated + 一次 all-reduce**：每 rank 只持有 64 个本地专家，非本地专家贡献为 0。
+- 允许的实验后端：`loop`（数值参考）、`grouped_mm`（默认）、`fused_grouped_mm`（手写 SiLU+combine 融合）、`vllm_fused`（直接复用安装版 vllm-musa 的 Triton `fused_experts`，opt-in）。
+- **不声称**移植 MegaMoE：S4000 无 FP8 算力/SM90 TMA；只借"dispatch→GEMM→act→combine"的融合划分。MoonEP（动态冗余专家）与 UniEP（集群级 EP）依赖多卡 all-to-all，与本项目拓扑不匹配，且实测通信/不平衡都远低于门槛（见 8.1）。
+- 实测（`docs/P5-moe-optimization-survey.md`）：上游 Triton fused MoE 与 grouped_mm **token 24/24 一致**（bf16 tiny），但默认配置下比 grouped_mm 慢（1024 token 时 262 ms/层）；vllm-musa 的厂商 fast path（mp22）在 1024 token 触发 illegal memory access，故集成时强制走 generic Triton 路径并保持 opt-in。
+
+### 8.4 Graph capture 边界（P6）
+
+- `torch.musa.MUSAGraph` 与 CUDA Graph 等价；仓库已有捕获骨架，但当前 decode 路径不可捕获（`grouped_mm` / Triton kernel 均报 "operation not permitted when stream is capturing"）。
+- **MCCL all-reduce 可捕获**（两 rank 数值一致），这是未来重启 P6 的关键前提。
+- 重启条件：可捕获的 MoE（或 runtime 修复）+ 形状静态的 attention + 桶裁剪；验收门已冻结在 `scripts/p5_decide.py --mode graph`。
+
+### 8.5 优先级与进入条件
+
+1. **attention A/B**（已实现，待加载）：只看冻结门。
+2. **MoE 融合**：只有在提供 `MTT_S4000` 的 autotune 配置（shape-driven，参考 vLLM `get_moe_configs`）后才值得再花加载；否则保持 grouped_mm。
+3. **route/pack 融合**：需先用低开销计时复核 44.9% 这个数字（event 插桩可能放大短段开销）。
+4. **graph capture**：等 MoE 可捕获后再做，否则收益被 eager MoE 抵消。

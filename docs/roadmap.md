@@ -46,11 +46,29 @@
 - [x] 修复 transformers 5.x `apply_chat_template` 返回 `BatchEncoding` 导致 API 无法接真实 tokenizer 的问题（并对该分支补了契约测试）。
 - [x] 真实 30B API batch 32 开放环压测与最终报告数字，见 [benchmarks/P4-serving.md](../benchmarks/P4-serving.md)。
 
-## 长期打磨（不设期限）
+## P5 指标校准、profiling 与内核深挖（进行中）
 
-- Triton-mtgpu paged attention / fused MoE kernel
+**目标**：先把容量评估校准到 vLLM/SGLang/GenAI-Perf 风格口径，再由真实 30B profiling 决定优化方向，不凭经验盲选算子。
+
+- [x] benchmark schema v2：请求级 TPOT、独立 ITL、sample CV、四类 throughput、SLO goodput、准确 token usage、`[DONE]` 校验。详见 [docs/P5-metrics-audit.md](P5-metrics-audit.md)。
+- [x] Prometheus counter/gauge/histogram、流式 usage、增量 detokenization、有界队列与 HTTP 429。
+- [x] opt-in MUSA Event 分段 profiling；第一次 30B 加载通过冻结参考门并完成 batch/context 矩阵。
+- [x] 自动决策：paged attention 第一优先级；MoE fusion 第二优先级；通信重叠和 profiled placement 未过门，不投入。
+- [x] MUSA Triton paged decode kernel 与 tiny poison-tail 数值测试；默认仍为 SDPA。
+- [x] 上游 MoE 复用评估：直接调用安装版 vllm-musa 的 Triton `fused_experts`（token 24/24 与 grouped_mm 一致），但默认配置更慢、厂商 mp22 fast path 在 1024 token illegal memory access → 保持 opt-in。详见 [docs/P5-moe-optimization-survey.md](P5-moe-optimization-survey.md)。
+- [x] P6 graph capture 可行性：MCCL all-reduce 可捕获，但 `torch._grouped_mm` 与 Triton kernel 不可捕获 → **本轮取消**，`enforce_eager` 保持。详见 [docs/P6-graph-capture.md](P6-graph-capture.md)。
+- [ ] 第 2 发 30B 加载：SDPA vs Triton paged 同进程 A/B（进行中；已发现 SDPA 在 b32/c512 自身不可复现，故门改为"候选确定性 + ≥99% token 一致"）。
+- [ ] 第 3 发（可选）：MoE 后端 A/B；上游 kernel 只在有 `MTT_S4000` autotune 配置后才值得再投入。
+- [ ] 第 4 发：最终离线 schema-v2 矩阵与 prefix cache 冷/热。
+- [ ] 第 5 发：最终 OpenAI API Poisson 容量/goodput 曲线。
+
+详见 [benchmarks/P5-profiling.md](../benchmarks/P5-profiling.md) 和 [docs/HANDOFF.md](HANDOFF.md)。
+
+## P5 之后的长期打磨（不设期限）
+
+- route/pack 完整融合、shape-driven autotune（只有 autotune 后仍有 ≥8% 证据才继续）
+- graph capture 重启（需可捕获的 MoE 或 MUSA runtime 修复；MCCL 已确认可捕获）
 - W4/AWQ 权重加载（GLM-4.5-Air 106B stretch goal）
-- torch_musa graph capture / torch.compile
 - 投递目标：2026 实习（推理引擎 / infra 方向）
 
 ## 风险清单
