@@ -226,6 +226,12 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--moe-backend", choices=("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused"), default="grouped_mm")
+    parser.add_argument(
+        "--decode-moe-backend",
+        choices=("loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused"),
+        default=None,
+        help="decode-only MoE backend (e.g. bmm_dense); default = same as --moe-backend",
+    )
     parser.add_argument("--attention-backend", choices=("sdpa", "triton_paged"), default="sdpa")
     parser.add_argument("--expert-placement", choices=("linear", "round_robin", "profiled"), default="linear")
     parser.add_argument("--expert-map-path")
@@ -242,6 +248,7 @@ def main():
         tensor_parallel_size=2,
         expert_parallel_size=2,
         moe_backend=args.moe_backend,
+        decode_moe_backend=args.decode_moe_backend,
         attention_backend=args.attention_backend,
         expert_placement=args.expert_placement,
         expert_map_path=args.expert_map_path,

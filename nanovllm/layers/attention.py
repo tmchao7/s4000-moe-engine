@@ -3,7 +3,6 @@ import torch.nn.functional as F
 from contextlib import nullcontext
 from torch import nn
 
-from nanovllm.utils.compat import is_capturing
 from nanovllm.utils.context import get_context
 
 
@@ -18,16 +17,17 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     flat_v = v_cache.view(-1, D)
     key = key.reshape(N, D)
     value = value.reshape(N, D)
-    # ``(slot_mapping < 0).any()`` turns a device value into a Python bool, i.e.
-    # a stream sync, which a capturing stream rejects.  While a graph is being
-    # recorded take the branch-free masked path instead.
-    if is_capturing() or (slot_mapping < 0).any():
-        valid = slot_mapping >= 0
-        flat_k[slot_mapping[valid]] = key[valid]
-        flat_v[slot_mapping[valid]] = value[valid]
-    else:
-        flat_k[slot_mapping] = key
-        flat_v[slot_mapping] = value
+    # Eager prefill and eager decode pass exactly one slot per token with no
+    # padding; the only -1s live in the captured graph's static buffer, and the
+    # captured write covers only the first ``N`` entries (the view recorded at
+    # capture time), so a replay never reads them.  A boolean-mask fallback
+    # (``slot_mapping[valid]``) is *not* capture-safe: the mask index needs a
+    # device->host sync to size its output, which the capturing stream rejects.
+    # ``(slot_mapping < 0).any()`` was also one host sync per layer (48 per
+    # decode step).  Both are gone: a plain integer index_put is correct here
+    # and capturable.
+    flat_k[slot_mapping] = key
+    flat_v[slot_mapping] = value
 
 
 def _gather_kv(cache, block_table, valid_len, block_size):

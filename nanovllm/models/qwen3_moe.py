@@ -16,6 +16,7 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.models.qwen3 import Qwen3Attention
 from nanovllm.utils.compat import is_capturing
+from nanovllm.utils.context import get_context
 
 
 class _ExpertView:
@@ -72,6 +73,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
         self.moe_backend = runtime_config.moe_backend
+        # Decode may use a different backend than prefill: bmm_dense is faster
+        # and capturable at the 1-64 token decode sizes, while its dense padding
+        # is prohibitive for a thousands-token prefill chunk.  This is a
+        # per-step choice (not graph-only), so it also applies when eager.
+        self.decode_moe_backend = (
+            runtime_config.decode_moe_backend or runtime_config.moe_backend
+        )
         self.num_experts = config.num_experts
         self.collect_expert_stats = runtime_config.collect_expert_stats
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
@@ -94,6 +102,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             global_to_local[expert_id] = local_id
         self.register_buffer("global_to_local", global_to_local, persistent=False)
         self.register_buffer(
+            "global_to_local_i32",
+            global_to_local.to(torch.int32),
+            persistent=False,
+        )
+        self.register_buffer(
             "expert_counts",
             torch.zeros(config.num_experts, dtype=torch.int64),
             persistent=False,
@@ -115,7 +128,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.act_fn = SiluAndMul()
         self.experts = _ExpertViews(self)
         self._loaded_expert_parts = set()
-        self._vllm_weights = None
         self.profiler = None
 
     def _profile(self, name):
@@ -199,29 +211,37 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_tokens = hidden_states.size(0)
         out = torch.zeros_like(hidden_states)
         with self._profile("moe.local_map"):
-            local_ids = self.global_to_local[topk_ids].reshape(-1)
-            valid = local_ids >= 0
-        if not is_capturing() and not bool(valid.any()):
-            return out
+            local_raw = self.global_to_local[topk_ids].reshape(-1)
+            # Non-local experts are folded onto expert 0 with weight 0 instead of
+            # being filtered out.  ``local_raw[valid]`` (boolean indexing) and
+            # ``bool(valid.any())`` are host syncs; 48 layers of those cost more
+            # than the few extra rows expert 0 computes, and removing them is
+            # also what makes this route/pack section capture-safe.
+            owned = local_raw >= 0
+            local_ids = local_raw.clamp(min=0)
         with self._profile("moe.route_pack"):
-            flat_token = torch.arange(num_tokens, device=hidden_states.device).unsqueeze(1).expand_as(topk_ids).reshape(-1)
-            flat_slot = torch.arange(num_tokens * self.top_k, device=hidden_states.device)
-            weights = topk_weights.reshape(-1)
-            local_ids = local_ids[valid]
-            flat_token = flat_token[valid]
-            flat_slot = flat_slot[valid]
-            weights = weights[valid]
+            device = hidden_states.device
+            flat_token = torch.arange(num_tokens, device=device).unsqueeze(1).expand_as(topk_ids).reshape(-1)
+            flat_slot = torch.arange(num_tokens * self.top_k, device=device)
+            weights = topk_weights.reshape(-1) * owned.to(topk_weights.dtype)
             order = torch.argsort(local_ids)
             local_ids = local_ids[order]
             flat_token = flat_token[order]
             flat_slot = flat_slot[order]
             weights = weights[order]
             tokens = hidden_states.index_select(0, flat_token)
-            counts = torch.bincount(local_ids, minlength=self.experts_per_rank)
+            counts = torch.zeros(
+                self.experts_per_rank, dtype=torch.int32, device=device
+            )
+            counts.index_add_(
+                0, local_ids, torch.ones_like(local_ids, dtype=torch.int32)
+            )
             offsets = counts.cumsum(0).to(torch.int32)
         if self.profiler is not None:
+            # Profiling is opt-in and already perturbs short segments; this is
+            # the only host sync left in the route, and only on that path.
             self.profiler.observe(
-                "moe.local_pairs", flat_token.size(0), layer=self.layer_id,
+                "moe.local_pairs", int(owned.sum()), layer=self.layer_id,
                 tokens=num_tokens,
             )
         with self._profile("moe.grouped_mm_1"):
@@ -252,51 +272,90 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             dense.view(num_tokens * self.top_k, -1)[flat_slot] = contribution
             return dense.sum(dim=1)
 
+    def _forward_bmm_dense(self, hidden_states, topk_ids, topk_weights):
+        """Exact dense-expert bmm over the packed ``[E, in, out]`` weights.
+
+        Every local expert is padded to ``S = tokens*top_k`` slots (the exact
+        worst case: one expert can receive every slot), so no token is dropped
+        and no host-side capacity check is needed.  The padding costs 64x the
+        useful rows, but ``torch.bmm`` runs at GEMM efficiency while
+        ``torch._grouped_mm`` is fixed-overhead bound at decode sizes: measured
+        on the production shapes this is 1.3-1.95x faster than grouped_mm
+        (scripts/p6_moe_microbench.py) and, unlike ``_grouped_mm``, it is
+        capturable, so decode can run from a MUSA graph.
+
+        Weights are consumed in their native layout -- no transposed copy.
+        """
+        num_tokens = hidden_states.size(0)
+        slots = num_tokens * self.top_k
+        device = hidden_states.device
+        with self._profile("moe.local_map"):
+            local_raw = self.global_to_local[topk_ids].reshape(-1)
+            owned = local_raw >= 0
+            local_ids = local_raw.clamp(min=0)
+        with self._profile("moe.route_pack"):
+            flat_token = torch.arange(num_tokens, device=device).unsqueeze(1).expand_as(topk_ids).reshape(-1)
+            flat_slot = torch.arange(slots, device=device)
+            flat_weights = topk_weights.reshape(-1) * owned.to(topk_weights.dtype)
+            order = torch.argsort(local_ids)
+            sorted_ids = local_ids[order]
+            sorted_token = flat_token[order]
+            sorted_slot = flat_slot[order]
+            sorted_weights = flat_weights[order]
+            counts = torch.zeros(
+                self.experts_per_rank, dtype=torch.int32, device=device
+            )
+            counts.index_add_(
+                0, sorted_ids, torch.ones_like(sorted_ids, dtype=torch.int32)
+            )
+            starts = counts.cumsum(0).to(torch.int64) - counts.to(torch.int64)
+            ranks = torch.arange(slots, device=device) - starts[sorted_ids]
+        with self._profile("moe.bmm_1"):
+            x_slots = hidden_states.index_select(0, sorted_token)
+            x_pad = x_slots.new_zeros(self.experts_per_rank, slots, self.hidden_size)
+            x_pad[sorted_ids, ranks] = x_slots
+            gate_up = torch.bmm(x_pad, self.gate_up_proj)
+        with self._profile("moe.activation"):
+            activated = self.act_fn(gate_up)
+        with self._profile("moe.bmm_2"):
+            expert_out = torch.bmm(activated, self.down_proj)
+        with self._profile("moe.weighted_combine"):
+            contribution = expert_out[sorted_ids, ranks] * sorted_weights.unsqueeze(-1)
+            dense = contribution.new_zeros(num_tokens, self.top_k, self.hidden_size)
+            dense.view(slots, -1)[sorted_slot] = contribution
+            return dense.sum(dim=1)
+
     def _forward_vllm_fused(self, hidden_states, topk_ids, topk_weights):
         """Reuse the vllm-musa Triton fused MoE instead of re-implementing it.
 
-        ``fused_experts`` is a tensor-in/tensor-out function that already runs
-        on MTT S4000 (``use_mp22_fused_moe``): it sorts/aligns tokens per
-        expert, fuses gather + grouped GEMM + SwiGLU + down GEMM + weighted
-        combine, and accepts an ``expert_map`` for expert parallelism.
+        The vendor kernel wants ``[E, out, in]`` weights and asserts
+        ``stride(-1) == 1``, but our packed storage is ``[E, in, out]`` (what
+        ``torch._grouped_mm`` consumes).  Transposing into a contiguous copy
+        costs 576 MiB per layer -- 27 GiB for the 30B, which is what OOM'd every
+        P6 capture attempt.  ``vendor_moe.fused_experts_zero_copy`` passes the
+        transposed *view* instead and removes only those two asserts in memory;
+        the Triton kernel reads strides explicitly and is numerically identical
+        (tests/p6_vendor_zero_copy.py, including graph replay).
 
-        It requires contiguous ``[E, out, in]`` weights and int32 ids, so the
-        packed ``[E, in, out]`` storage is transposed into a contiguous copy
-        once (~576 MiB per rank) and cached.  The EP contract is unchanged:
-        only local experts contribute, then ``dist.all_reduce`` sums the ranks.
+        The MUSA vendor fast path (S4000_ops: gemv/mutlass) aborts with an
+        illegal memory access at our prefill sizes (>=1024 tokens), so the
+        generic Triton kernel is forced.
         """
         if hidden_states.dtype not in (torch.bfloat16, torch.float16):
             raise RuntimeError(
                 f"vllm_fused requires bf16/fp16 activations, got {hidden_states.dtype}"
             )
-        import vllm.model_executor.layers.fused_moe.fused_moe as vllm_fused_moe
-        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+        from nanovllm.kernels.vendor_moe import fused_experts_zero_copy
 
-        # The MUSA vendor fast path (S4000_ops: gemv/mutlass) aborts with an
-        # illegal memory access at our prefill sizes (>=1024 tokens), so force
-        # the generic Triton kernel.  Measured on MTT S4000: the Triton path is
-        # correct for every shape but 3-25x slower than native grouped_mm with
-        # the default (untuned) config, which is why this backend stays opt-in.
-        vllm_fused_moe.use_mp22_fused_moe = False
-        fused_experts = vllm_fused_moe.fused_experts
-
-        if self._vllm_weights is None:
-            self._vllm_weights = (
-                self.gate_up_proj.transpose(1, 2).contiguous(),
-                self.down_proj.transpose(1, 2).contiguous(),
-                self.global_to_local.to(torch.int32),
-            )
-        w1, w2, expert_map = self._vllm_weights
         with self._profile("moe.vllm_fused"):
-            return fused_experts(
+            return fused_experts_zero_copy(
                 hidden_states,
-                w1,
-                w2,
-                topk_weights.float(),
-                topk_ids.int(),
-                activation=MoEActivation.SILU,
+                self.gate_up_proj,
+                self.down_proj,
+                topk_weights,
+                topk_ids,
                 global_num_experts=self.num_experts,
-                expert_map=expert_map,
+                expert_map=self.global_to_local_i32,
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -312,12 +371,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights.to(hidden_states.dtype)
 
-        if self.moe_backend == "vllm_fused":
+        backend = self.moe_backend if get_context().is_prefill else self.decode_moe_backend
+        if backend == "vllm_fused":
             out = self._forward_vllm_fused(hidden_states, topk_ids, topk_weights)
-        elif self.moe_backend in ("grouped_mm", "fused_grouped_mm"):
+        elif backend == "bmm_dense":
+            out = self._forward_bmm_dense(hidden_states, topk_ids, topk_weights)
+        elif backend in ("grouped_mm", "fused_grouped_mm"):
             out = self._forward_grouped_mm(
                 hidden_states, topk_ids, topk_weights,
-                fused=self.moe_backend == "fused_grouped_mm",
+                fused=backend == "fused_grouped_mm",
             )
         else:
             out = self._forward_loop(hidden_states, topk_ids, topk_weights)

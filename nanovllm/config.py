@@ -20,13 +20,15 @@ class Config:
     distributed_init_method: str = ""
     shm_name: str = ""
     expert_parallel_size: int = 0
-    moe_backend: Literal["loop", "grouped_mm", "fused_grouped_mm", "vllm_fused"] = "grouped_mm"
-    # MoE backend baked into the captured decode graphs.  ``None`` = use
-    # ``moe_backend`` everywhere.  Needed when the fast backend is not
-    # graph-capturable: the decode graphs embed the capturable one, while eager
-    # prefill (and decode above the largest bucket) keep the fast one.
+    moe_backend: Literal[
+        "loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused"
+    ] = "grouped_mm"
+    # MoE backend for *decode* steps, independent of ``moe_backend`` (prefill).
+    # ``None`` = use ``moe_backend`` everywhere.  Decode-only is needed when the
+    # best decode kernel is capturable but poor at prefill sizes (bmm_dense),
+    # or when the decode graph must embed a different kernel than eager prefill.
     decode_moe_backend: Literal[
-        "loop", "grouped_mm", "fused_grouped_mm", "vllm_fused"
+        "loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused"
     ] | None = None
     attention_backend: Literal["sdpa", "triton_paged"] = "sdpa"
     expert_placement: Literal["linear", "round_robin", "profiled"] = "linear"
@@ -48,9 +50,11 @@ class Config:
             "single-node hybrid TP+EP currently requires expert_parallel_size "
             "to equal tensor_parallel_size"
         )
-        assert self.moe_backend in ("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused")
+        assert self.moe_backend in (
+            "loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused"
+        )
         assert self.decode_moe_backend in (
-            None, "loop", "grouped_mm", "fused_grouped_mm", "vllm_fused",
+            None, "loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused",
         )
         assert self.attention_backend in ("sdpa", "triton_paged")
         assert self.expert_placement in ("linear", "round_robin", "profiled")

@@ -40,7 +40,8 @@ def prompts(batch, prompt_len, vocab_size, seed, shared_prefix_len=0):
     ]
 
 
-def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repeats, backends):
+def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repeats, backends,
+                     decode_backend=None, soft=False):
     """Check greedy reproducibility before spending GPU time on the sweep.
 
     Design (measured on 30B, see docs/HANDOFF.md):
@@ -51,6 +52,10 @@ def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repea
     * Steady-state reproducibility, the committed reference, and cross-backend
       token identity are hard gates.  A performance run with different output
       is not comparable to the frozen correct baseline.
+    * ``decode_backend`` verifies a decode-only backend switch (e.g. bmm_dense).
+      Its accumulation order differs, so the frozen reference and cross-backend
+      identity become **soft** (reported, not enforced) unless ``soft=False``;
+      steady-state self-determinism stays a hard gate in both modes.
     """
     reference = None
     if reference_path:
@@ -60,11 +65,13 @@ def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repea
         "prompts": VERIFY_PROMPTS,
         "reference": reference_path,
         "repeats": repeats,
+        "decode_backend": decode_backend,
+        "soft": soft,
         "backends": {},
     }
     failures = []
     for backend in backends:
-        llm.model_runner.call("set_moe_backend", backend)
+        llm.model_runner.call("set_moe_backend", backend, decode_backend)
         params = sampling_params_cls(temperature=0, max_tokens=max_tokens)
         warmup_outputs = llm.generate(VERIFY_PROMPTS, params, use_tqdm=False)
         warmup = [list(output["token_ids"]) for output in warmup_outputs]
@@ -95,7 +102,7 @@ def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repea
                         f"actual={actual} expected={want}",
                         flush=True,
                     )
-            if not all(entry["reference_matches"]):
+            if not all(entry["reference_matches"]) and not soft:
                 failures.append(f"{backend}: committed reference mismatch")
         verification["backends"][backend] = entry
         print(
@@ -148,6 +155,11 @@ def main():
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--moe-backends", default="loop,grouped_mm")
+    parser.add_argument(
+        "--decode-moe-backends", default="",
+        help="comma list of decode-only MoE backends (e.g. grouped_mm,bmm_dense); "
+        "empty means decode uses the same backend as prefill",
+    )
     parser.add_argument("--attention-backends", default="sdpa", help="comma list of sdpa|triton_paged")
     parser.add_argument("--expert-placement", choices=("linear", "round_robin", "profiled"), default="linear")
     parser.add_argument("--expert-map-path")
@@ -198,6 +210,14 @@ def main():
     batches = [int(value) for value in args.batches.split(",")]
     backends = args.moe_backends.split(",")
     assert backends and all(backend in ("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused") for backend in backends)
+    decode_moe_backends = [value.strip() for value in args.decode_moe_backends.split(",") if value.strip()]
+    if decode_moe_backends:
+        assert all(
+            value in ("loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused")
+            for value in decode_moe_backends
+        ), decode_moe_backends
+    else:
+        decode_moe_backends = [None]
     attention_backends = [value.strip() for value in args.attention_backends.split(",") if value.strip()]
     assert attention_backends and all(value in ("sdpa", "triton_paged") for value in attention_backends)
     llm = LLM(
@@ -240,9 +260,23 @@ def main():
                 llm, SamplingParams, reference_path, args.verify_max_tokens,
                 args.verify_repeats, verify_backends,
             )
-        def measure(attention_backend, backend, batch, prompt_len, shared_prefix_len, cache_mode, phase):
+            # Soft gates for the decode-only stacks under test: their bf16
+            # accumulation order differs from the committed reference, so
+            # reference identity is reported but only self-determinism is
+            # enforced (see run_verification).
+            verification["decode_stacks"] = {}
+            for decode_backend in decode_moe_backends:
+                if decode_backend is None:
+                    continue
+                verification["decode_stacks"][decode_backend] = run_verification(
+                    llm, SamplingParams, reference_path, args.verify_max_tokens,
+                    args.verify_repeats, ["grouped_mm"],
+                    decode_backend=decode_backend, soft=True,
+                )
+        def measure(attention_backend, backend, batch, prompt_len, shared_prefix_len, cache_mode, phase,
+                    decode_moe_backend=None):
             llm.model_runner.call("set_attention_backend", attention_backend)
-            llm.model_runner.call("set_moe_backend", backend)
+            llm.model_runner.call("set_moe_backend", backend, decode_moe_backend)
             batch_prompts = prompts(
                 batch, prompt_len, vocab_size, seed=batch,
                 shared_prefix_len=shared_prefix_len,
@@ -267,6 +301,7 @@ def main():
                     "phase": phase,
                     "attention_backend": attention_backend,
                     "backend": backend,
+                    "decode_moe_backend": decode_moe_backend,
                     "batch": batch,
                     "repeat": repeat,
                     "prompt_len": prompt_len,
@@ -302,24 +337,28 @@ def main():
         for attention_backend in attention_backends:
             for cache_mode in cache_modes:
                 for backend in backends:
-                    for batch in batches:
-                        measure(
-                            attention_backend, backend, batch,
-                            args.prompt_len, args.shared_prefix_len, cache_mode, "matrix",
-                        )
+                    for decode_moe_backend in decode_moe_backends:
+                        for batch in batches:
+                            measure(
+                                attention_backend, backend, batch,
+                                args.prompt_len, args.shared_prefix_len, cache_mode, "matrix",
+                                decode_moe_backend=decode_moe_backend,
+                            )
 
         # Extra phase in the same model load: prefix-cache cold/hot probe with a
         # long shared prefix (>= 256 tokens, otherwise no full block is reused).
         if probe_batches:
             for attention_backend in attention_backends:
                 for backend in backends:
-                    for batch in probe_batches:
-                        for cache_mode in probe_cache_modes:
-                            measure(
-                                attention_backend, backend, batch,
-                                args.probe_prompt_len, args.probe_shared_prefix_len,
-                                cache_mode, "probe",
-                            )
+                    for decode_moe_backend in decode_moe_backends:
+                        for batch in probe_batches:
+                            for cache_mode in probe_cache_modes:
+                                measure(
+                                    attention_backend, backend, batch,
+                                    args.probe_prompt_len, args.probe_shared_prefix_len,
+                                    cache_mode, "probe",
+                                    decode_moe_backend=decode_moe_backend,
+                                )
     finally:
         jsonl_handle.close()
         llm.exit()
@@ -329,37 +368,41 @@ def main():
         for attention_backend in attention_backends:
             for cache_mode in cache_modes if phase == "matrix" else probe_cache_modes:
                 for backend in backends:
-                    for batch in batches if phase == "matrix" else probe_batches:
-                        rows = [
-                            record for record in records
-                            if record["phase"] == phase
-                            and record["attention_backend"] == attention_backend
-                            and record["cache_mode"] == cache_mode
-                            and record["backend"] == backend
-                            and record["batch"] == batch
-                        ]
-                        if not rows:
-                            continue
-                        throughput = [row["output_tokens_per_s"] for row in rows]
-                        median = statistics.median(throughput)
-                        summary.append({
-                            "phase": phase,
-                            "attention_backend": attention_backend,
-                            "backend": backend,
-                            "batch": batch,
-                            "cache_mode": cache_mode,
-                            "prompt_len": rows[0]["prompt_len"],
-                            "shared_prefix_len": rows[0]["shared_prefix_len"],
-                            "throughput_median": median,
-                            "throughput_cv": coefficient_of_variation(throughput),
-                            "ttft_p95_median_s": statistics.median(row["ttft_p95_s"] for row in rows),
-                            "tpot_p95_median_s": statistics.median(row["tpot_p95_s"] for row in rows),
-                            "itl_p95_median_s": statistics.median(row["itl_p95_s"] for row in rows),
-                        })
+                    for decode_moe_backend in decode_moe_backends:
+                        for batch in batches if phase == "matrix" else probe_batches:
+                            rows = [
+                                record for record in records
+                                if record["phase"] == phase
+                                and record["attention_backend"] == attention_backend
+                                and record["cache_mode"] == cache_mode
+                                and record["backend"] == backend
+                                and record["decode_moe_backend"] == decode_moe_backend
+                                and record["batch"] == batch
+                            ]
+                            if not rows:
+                                continue
+                            throughput = [row["output_tokens_per_s"] for row in rows]
+                            median = statistics.median(throughput)
+                            summary.append({
+                                "phase": phase,
+                                "attention_backend": attention_backend,
+                                "backend": backend,
+                                "decode_moe_backend": decode_moe_backend,
+                                "batch": batch,
+                                "cache_mode": cache_mode,
+                                "prompt_len": rows[0]["prompt_len"],
+                                "shared_prefix_len": rows[0]["shared_prefix_len"],
+                                "throughput_median": median,
+                                "throughput_cv": coefficient_of_variation(throughput),
+                                "ttft_p95_median_s": statistics.median(row["ttft_p95_s"] for row in rows),
+                                "tpot_p95_median_s": statistics.median(row["tpot_p95_s"] for row in rows),
+                                "itl_p95_median_s": statistics.median(row["itl_p95_s"] for row in rows),
+                            })
     payload = {
         "schema_version": 2,
         "model": args.model,
         "moe_backends": backends,
+        "decode_moe_backends": decode_moe_backends,
         "attention_backends": attention_backends,
         "expert_placement": args.expert_placement,
         "scheduler_policy": args.scheduler_policy,

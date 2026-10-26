@@ -122,13 +122,34 @@ class ModelRunner:
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
-        return method(*args)
+        result = method(*args)
+        if self.world_size > 1 and method_name != "exit":
+            # The shm command channel is a single buffer with no ack: rank 0
+            # writes the next command as soon as it returns from the local call,
+            # so rank 1 can still be unpickling the previous one.  This showed
+            # up as "_pickle.UnpicklingError: pickle data was truncated" when
+            # the A/B harness called set_enforce_eager / set_moe_backend /
+            # set_attention_backend back to back, and as rank 1 executing a
+            # different step than rank 0 (the historical b32 non-reproducibility
+            # and b64 "MUSA unknown error" crashes).  One barrier per command
+            # (~0.08 ms) makes the channel safe; ``exit`` is excluded because
+            # it destroys the process group itself.
+            dist.barrier()
+        return result
 
-    def set_moe_backend(self, backend: str):
-        assert backend in ("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused")
+    def set_moe_backend(self, backend: str, decode_backend: str | None = None):
+        """Set the MoE backend; ``decode_backend`` defaults to the same one."""
+        assert backend in (
+            "loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused"
+        )
+        if decode_backend is not None:
+            assert decode_backend in (
+                "loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused"
+            )
         for module in self.model.modules():
             if hasattr(module, "moe_backend"):
                 module.moe_backend = backend
+                module.decode_moe_backend = decode_backend or backend
 
     def set_attention_backend(self, backend: str):
         assert backend in ("sdpa", "triton_paged")
@@ -326,9 +347,14 @@ class ModelRunner:
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
+            # Padding rows (``bs:`` up to the bucket) still execute inside the
+            # graph.  Fill their slots with 0, not -1: the captured index_put
+            # writes every row of the bucket, and a -1 slot would index the
+            # *last* KV element.  context_lens=1 keeps those rows on a valid
+            # one-token attention instead of a 0/0 division.
+            graph_vars["slot_mapping"].fill_(0)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
+            graph_vars["context_lens"].fill_(1)
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
@@ -354,8 +380,18 @@ class ModelRunner:
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        # Capture with a *real* decode context, not all zeros: zero context_lens
+        # hand SDPA an all-False mask, and zero slot_mapping makes every token
+        # write slot 0.  Both are degenerate and one of them left the MUSA
+        # stream in an error state before capture even started ("operation not
+        # permitted" at capture_begin's synchronize).  Distinct slots and a
+        # one-block context exercise the normal path; replay overwrites them.
+        slot_mapping = torch.arange(max_bs, dtype=torch.int32)
+        context_lens = torch.full(
+            (max_bs,),
+            min(self.block_size, config.max_model_len),
+            dtype=torch.int32,
+        )
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
@@ -373,13 +409,20 @@ class ModelRunner:
             self.set_moe_backend(capture_backend)
         self.captured_moe_backend = capture_backend
         memory_before = self.memory_report()
-
         # Ascending: capture the small buckets first, so a bucket that runs out of
         # memory leaves the small buckets usable instead of losing the whole
         # capture.  (Measured: the graph pool itself is cheap -- ``MUSAGraph()``
         # and a tiny capture cost <0.1 GiB; the ~15.6 GiB seen on the 30B work up
         # is spent *inside* the vendor MoE call, see docs/HANDOFF-P6-next.md T1.)
         for bs in self.graph_bs:
+            # MCCL collectives must be recorded by every rank at the same point
+            # in the capture.  Without these barriers rank 0 can start capturing
+            # while rank 1 is still in its eager warmup, and the capturing
+            # stream fails with "operation not permitted" (TP2 reproduced it;
+            # TP1 captures fine).  The standalone MCCL probe brackets capture
+            # with barriers for the same reason.
+            if self.world_size > 1:
+                dist.barrier()
             graph = Graph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
@@ -389,8 +432,19 @@ class ModelRunner:
                 f"allocated={report['allocated_gib']:.2f} reserved={report['reserved_gib']:.2f} GiB",
                 flush=True,
             )
+            if self.world_size > 1:
+                dist.barrier()
+                # A barrier only guarantees both ranks *entered* it.  Flush the
+                # device too, so neither rank records the first collective
+                # while the other is still draining its barrier: that race made
+                # TP2 capture fail intermittently with "operation not
+                # permitted" (three attempts: fail, fail, pass with an added
+                # print that slowed the host down).
+                self.acc.synchronize()
             with graph_ctx(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            if self.world_size > 1:
+                dist.barrier()
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
@@ -405,7 +459,7 @@ class ModelRunner:
             reset_context()
 
         if capture_backend != eager_backend:
-            self.set_moe_backend(eager_backend)
+            self.set_moe_backend(eager_backend, capture_backend)
         memory_after = self.memory_report()
         allocated_before = memory_before.get("allocated_gib") or 0.0
         allocated_after = memory_after.get("allocated_gib") or 0.0

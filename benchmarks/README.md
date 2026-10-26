@@ -17,6 +17,8 @@
 - `p5-attention-ab-decision.json` — 冻结的 attention 采纳门（token 全等 / TPOT ≤0.90 / 吞吐 ≥1.00 / CV ≤5%）
 - `P5-final-matrix.md` — schema-v2 终局矩阵 + 前缀缓存冷/热探针（第 4 发加载）
 - `P5-serving-v2.md` — OpenAI 接口的 Poisson 开放环容量/goodput（第 5 发加载）
+- `P6-serving-v3.md` — decode=bmm_dense 后的在线容量复测（与 v2 同表，四档全 100% SLO）
+- `P6-nightly.md` — P6 夜间迭代总表（bmm_dense 采用 / b32-b64 治好 / attention keep_sdpa / 图 8B 修复 30B 未修）
 - `p5-moe-ab-decision.json` — MoE 后端的采纳门（token 全等 / 吞吐 ≥1.08 / TPOT ≤1.00 / CV ≤5%）
 - `data/` — 原始 JSON/JSONL 与渲染出的 PNG（不入库）
 

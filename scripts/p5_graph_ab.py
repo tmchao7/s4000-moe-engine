@@ -32,7 +32,7 @@ from p2_benchmark import git_commit, prompts  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-CONFIGS = ("eager_default", "eager_candidate", "graph_candidate")
+CONFIGS = ("graph_candidate", "eager_candidate", "eager_default")
 
 
 def summarize(records, config, batch):
@@ -138,13 +138,19 @@ def main():
     tokens = {}
 
     def configure(config):
+        print(f"[graph-ab] configure {config}", flush=True)
         if config == "eager_default":
             runner.call("set_enforce_eager", True)
-            runner.call("set_moe_backend", "grouped_mm")
+            runner.call("set_moe_backend", "grouped_mm", "grouped_mm")
             runner.call("set_attention_backend", "sdpa")
         elif config == "eager_candidate":
             runner.call("set_enforce_eager", True)
-            runner.call("set_moe_backend", args.decode_moe_backend)
+            # Prefill stays on the fast grouped_mm path; only decode uses the
+            # capturable backend (bmm_dense's dense padding is prohibitive for
+            # a thousands-token prefill chunk).
+            runner.call(
+                "set_moe_backend", args.prefill_moe_backend, args.decode_moe_backend
+            )
             runner.call("set_attention_backend", args.attention_backend)
         else:
             # replay path; the captured graphs already embed the candidate kernels
@@ -152,6 +158,7 @@ def main():
 
     def generate(config, batch):
         configure(config)
+        print(f"[graph-ab] start {config} batch={batch}", flush=True)
         batch_prompts = prompts(batch, args.prompt_len, vocab_size, seed=batch)
         llm.scheduler.block_manager.clear_prefix_cache()
         llm.generate(batch_prompts, params, use_tqdm=False)  # unreported warmup
@@ -198,17 +205,34 @@ def main():
             )
         return runs
 
-    # Correctness: greedy tokens of every config on the same prompts.  The gate
-    # asks whether *graph replay* changes numbers vs the same kernels eager;
-    # cross-kernel agreement (candidate vs default) is reported separately.
+    # Correctness + throughput ordering: every graph replay must happen before
+    # the first eager decode step.  Eager decode on the MCCL communicator makes
+    # a later graph replay hang (reproduced on 8B TP2; tiny and a pure-allreduce
+    # probe are fine), and production never does eager decode: decode always
+    # replays the graphs, only prefill is eager.  Graph is therefore measured
+    # first, eager configs afterwards; the gate compares the same kernels.
     verify_prompts = prompts(4, args.prompt_len, vocab_size, seed=999)
     verify_params = SamplingParams(temperature=0, max_tokens=args.verify_tokens, ignore_eos=True)
-    for config in CONFIGS:
+
+    def verify(config):
         configure(config)
+        print(f"[graph-ab] verify {config}", flush=True)
         llm.scheduler.block_manager.clear_prefix_cache()
         llm.generate(verify_prompts, verify_params, use_tqdm=False)  # warmup
         outputs = llm.generate(verify_prompts, verify_params, use_tqdm=False)
-        tokens[config] = [list(output["token_ids"]) for output in outputs]
+        return [list(output["token_ids"]) for output in outputs]
+
+    tokens["graph_candidate"] = verify("graph_candidate")
+
+    summary = []
+    summary_default = []
+    for config in CONFIGS:
+        for batch in batches:
+            generate(config, batch)
+
+    # Eager token identity last: it is the only remaining use of eager decode.
+    tokens["eager_candidate"] = verify("eager_candidate")
+    tokens["eager_default"] = verify("eager_default")
     payload["verify_tokens"] = tokens
     for config in CONFIGS:
         payload.setdefault("configs", {})[config] = {
@@ -230,11 +254,7 @@ def main():
         "tokens_per_prompt": shared,
     }
 
-    summary = []
-    summary_default = []
     for batch in batches:
-        for config in CONFIGS:
-            generate(config, batch)
         for config in CONFIGS:
             row = summarize(records, config, batch)
             if row is None:
