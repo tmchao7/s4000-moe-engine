@@ -145,7 +145,7 @@ prefill 大批需求 ─────► E2
 |---|---|
 | 现在要做什么、按什么顺序 | **本文档** |
 | 哪些问题没解决、卡在哪 | [`docs/ISSUES.md`](./ISSUES.md) |
-| 当前栈、成绩单、仓库/服务器状态、SOP | [`docs/HANDOFF-P6c.md`](./HANDOFF-P6c.md) |
+| 当前栈、成绩单、仓库/服务器状态、SOP | [`docs/HANDOFF-P6d.md`](./HANDOFF-P6d.md)（最新）／[`HANDOFF-P6c.md`](./HANDOFF-P6c.md)（上一版） |
 | 每个实验的门与结果（时间线） | [`docs/NIGHTLY-LOG.md`](./NIGHTLY-LOG.md) |
 | 成绩总表与证据 sha256 | [`benchmarks/P6-nightly.md`](../benchmarks/P6-nightly.md) |
 | 投机解码为什么值得做、怎么实现 | [`docs/P7-speculative-decoding-survey.md`](./P7-speculative-decoding-survey.md)、[`docs/P7-implementation-plan.md`](./P7-implementation-plan.md) |
