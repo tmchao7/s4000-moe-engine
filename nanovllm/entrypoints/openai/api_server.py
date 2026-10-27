@@ -1,6 +1,8 @@
 """Minimal OpenAI-compatible chat completion server."""
 import argparse
+import faulthandler
 import json
+import os
 import time
 import uuid
 
@@ -232,14 +234,25 @@ def main():
         default=None,
         help="decode-only MoE backend (e.g. bmm_dense); default = same as --moe-backend",
     )
-    parser.add_argument("--attention-backend", choices=("sdpa", "triton_paged"), default="sdpa")
+    parser.add_argument("--attention-backend", choices=("sdpa", "triton_paged"), default="triton_paged")
     parser.add_argument("--expert-placement", choices=("linear", "round_robin", "profiled"), default="linear")
     parser.add_argument("--expert-map-path")
     parser.add_argument("--scheduler-policy", choices=("fcfs", "stall_free", "stall_free_lpm"), default="stall_free")
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
     parser.add_argument("--metrics-path")
     parser.add_argument("--max-queue-size", type=int, default=1024)
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=4096,
+        help="context limit; also bounds warmup and the KV block table width",
+    )
     args = parser.parse_args()
+
+    if os.environ.get("NANOVLLM_TRACE_INIT") == "1":
+        # Startup is silent between weight load and KV allocation; a hung rank
+        # otherwise leaves no stack to look at.
+        faulthandler.dump_traceback_later(180, repeat=True)
 
     import uvicorn
 
@@ -256,8 +269,18 @@ def main():
         prefill_chunk_size=args.prefill_chunk_size,
         metrics_path=args.metrics_path,
         max_queue_size=args.max_queue_size,
+        max_model_len=args.max_model_len,
         enforce_eager=True,
     )
+    flip_backend = os.environ.get("NANOVLLM_ATTENTION_FLIP_AFTER_INIT")
+    if flip_backend:
+        # Diagnostic path: start on the known-good backend and switch once the
+        # engine is fully initialised.  Same broadcast the A/B harness uses, so
+        # the numerics are the ones verified in L1-L4.
+        assert flip_backend in ("sdpa", "triton_paged"), flip_backend
+        print(f"[init] flipping attention backend to {flip_backend} after init", flush=True)
+        engine.engine.model_runner.call("set_attention_backend", flip_backend)
+        print("[init] attention backend flip done", flush=True)
     model_name = args.served_model_name or args.model.rstrip("/").rsplit("/", 1)[-1]
     uvicorn.run(create_app(engine, model_name), host=args.host, port=args.port)
 

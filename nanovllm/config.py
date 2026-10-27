@@ -30,7 +30,7 @@ class Config:
     decode_moe_backend: Literal[
         "loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused"
     ] | None = None
-    attention_backend: Literal["sdpa", "triton_paged"] = "sdpa"
+    attention_backend: Literal["sdpa", "triton_paged"] = "triton_paged"
     expert_placement: Literal["linear", "round_robin", "profiled"] = "linear"
     expert_map_path: str | None = None
     scheduler_policy: Literal["fcfs", "stall_free", "stall_free_lpm"] = "fcfs"

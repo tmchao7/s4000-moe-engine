@@ -101,6 +101,32 @@ def build_prompt(prompt_word, prompt_words, prompt_mode, seed, request_id):
     raise ValueError(f"unsupported prompt mode: {prompt_mode}")
 
 
+def calibrate_prompt_words(tokenizer, prompt_word, prompt_mode, seed, target_tokens,
+                           max_iterations=8):
+    """Find a word count whose chat-templated prompt lands near ``target_tokens``.
+
+    Words are a poor proxy for tokens: 1024 unique words once tokenised to
+    18,354 tokens (I8).  Scale words by the measured ratio until the templated
+    count is within 1% (or 8 tokens) of the target.
+    """
+    def templated_tokens(words):
+        text = build_prompt(prompt_word, words, prompt_mode, seed, 0)
+        return _prompt_token_count(tokenizer, [{"role": "user", "content": text}])
+
+    words = max(8, target_tokens // 4)
+    best = None
+    for _ in range(max_iterations):
+        tokens = templated_tokens(words)
+        if tokens is None:
+            raise RuntimeError("tokenizer returned no ids during calibration")
+        if best is None or abs(tokens - target_tokens) < abs(best[1] - target_tokens):
+            best = (words, tokens)
+        if abs(tokens - target_tokens) <= max(8, target_tokens // 100):
+            break
+        words = max(1, round(words * target_tokens / max(tokens, 1)))
+    return best
+
+
 async def one_request(
     client, url, model, prompt, max_tokens, request_id, due, tracker,
     tokenizer=None,
@@ -276,6 +302,15 @@ def summarize(rows, max_concurrency, metrics_delta, args, fraction):
         "total_tokens_per_s": (input_tokens + output_tokens) / duration,
         "success_rate": len(good) / len(rows),
         "goodput_per_s": goodput(good, duration, args.slo_ttft_ms / 1000, args.slo_tpot_ms / 1000),
+        "slo_success_rate": sum(
+            1
+            for row in rows
+            if row["ok"]
+            and row["ttft_s"] is not None
+            and row["tpot_s"] is not None
+            and row["ttft_s"] <= args.slo_ttft_ms / 1000
+            and row["tpot_s"] <= args.slo_tpot_ms / 1000
+        ) / len(rows),
         "slo_ttft_ms": args.slo_ttft_ms,
         "slo_tpot_ms": args.slo_tpot_ms,
         "max_concurrency": max_concurrency,
@@ -308,9 +343,23 @@ async def async_main(args):
     if args.tokenizer:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
+    prompt_words = args.prompt_words
+    calibration = None
+    if args.prompt_tokens:
+        if tokenizer is None:
+            raise SystemExit("--prompt-tokens requires --tokenizer")
+        prompt_words, measured = calibrate_prompt_words(
+            tokenizer, args.prompt_word, args.prompt_mode, args.seed, args.prompt_tokens
+        )
+        calibration = {
+            "target_tokens": args.prompt_tokens,
+            "prompt_words": prompt_words,
+            "measured_tokens": measured,
+        }
+        print(f"[online] prompt calibration={calibration}", flush=True)
     def prompt_for_request(request_id):
         return build_prompt(
-            args.prompt_word, args.prompt_words, args.prompt_mode, args.seed, request_id
+            args.prompt_word, prompt_words, args.prompt_mode, args.seed, request_id
         )
     limits = httpx.Limits(
         max_connections=args.requests + args.warmup_requests,
@@ -351,7 +400,9 @@ async def async_main(args):
         "arrival_pattern": args.arrival_pattern,
         "seed": args.seed,
         "prompt_mode": args.prompt_mode,
-        "prompt_words": args.prompt_words,
+        "prompt_words": prompt_words,
+        "prompt_tokens_target": args.prompt_tokens or None,
+        "prompt_calibration": calibration,
         "warmup_requests": args.warmup_requests,
         "prompt_tokens": _prompt_token_count(
             tokenizer, [{"role": "user", "content": prompt_for_request(0)}]
@@ -398,6 +449,12 @@ def main():
     parser.add_argument("--warmup-requests", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--prompt-words", type=int, default=128)
+    parser.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=0,
+        help="target chat-templated prompt length in tokens (0 = use --prompt-words verbatim)",
+    )
     parser.add_argument("--prompt-word", default="benchmark")
     parser.add_argument(
         "--prompt-mode", choices=("shared", "unique"), default="shared",

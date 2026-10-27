@@ -1,4 +1,6 @@
+import os
 import pickle
+import time
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -22,6 +24,22 @@ def _model_cls(hf_config):
     return Qwen3ForCausalLM
 
 
+_TRACE_INIT = os.environ.get("NANOVLLM_TRACE_INIT") == "1"
+
+
+def _trace_init(rank, stage, started=None):
+    """Print init milestones when NANOVLLM_TRACE_INIT=1.
+
+    Startup is silent from ``load_model`` through ``allocate_kv_cache``; when it
+    hangs there is no way to tell which stage is stuck.  Both ranks write to the
+    inherited stdout, so one server log shows the interleaving.
+    """
+    if not _TRACE_INIT:
+        return
+    elapsed = "" if started is None else f" dt={time.perf_counter() - started:.2f}s"
+    print(f"[init] rank{rank} {stage} t={time.time():.3f}{elapsed}", flush=True)
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -35,12 +53,14 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        _trace_init(rank, "start")
         dist.init_process_group(
             DIST_BACKEND,
             config.distributed_init_method,
             world_size=self.world_size,
             rank=rank,
         )
+        _trace_init(rank, "dist_ready")
         self.acc.set_device(rank)
         default_dtype = torch.get_default_dtype()
         model_dtype = hf_config.dtype
@@ -63,10 +83,17 @@ class ModelRunner:
                 module.attention_backend = config.attention_backend
                 module.layer_id = attention_layer_id
                 attention_layer_id += 1
+        _trace_init(rank, "model_built")
+        stage_started = time.perf_counter()
         load_model(self.model, config.model)
+        _trace_init(rank, "weights_loaded", stage_started)
         self.sampler = Sampler()
+        stage_started = time.perf_counter()
         self.warmup_model()
+        _trace_init(rank, "warmup_done", stage_started)
+        stage_started = time.perf_counter()
         self.allocate_kv_cache()
+        _trace_init(rank, "kv_allocated", stage_started)
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -78,9 +105,11 @@ class ModelRunner:
             if rank == 0:
                 self.shm = SharedMemory(name=config.shm_name, create=True, size=2**20)
                 dist.barrier()
+                _trace_init(rank, "handshake_done")
             else:
                 dist.barrier()
                 self.shm = SharedMemory(name=config.shm_name)
+                _trace_init(rank, "handshake_done")
                 self.loop()
 
     def exit(self):

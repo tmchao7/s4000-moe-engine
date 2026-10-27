@@ -1,0 +1,54 @@
+[
+ {
+  "prompt": "\u7b80\u5355\u4ecb\u7ecd\u4e00\u4e0b MoE\uff08Mixture of Experts\uff09\u67b6\u6784\u7684\u6838\u5fc3\u601d\u60f3\u3002",
+  "token_ids": [
+   6050,
+   36,
+   9909,
+   44,
+   12735,
+   315,
+   50759,
+   3837
+  ]
+ },
+ {
+  "prompt": "What is paged attention in LLM inference? Answer in two sentences.",
+  "token_ids": [
+   393,
+   3279,
+   6529,
+   374,
+   264,
+   4938,
+   6240,
+   14762
+  ]
+ },
+ {
+  "prompt": "1 \u5230 100 \u7684\u6574\u6570\u4e2d\u6240\u6709\u8d28\u6570\u4e4b\u548c\u662f\u591a\u5c11\uff1f\u7ed9\u51fa\u7b54\u6848\u5373\u53ef\u3002",
+  "token_ids": [
+   220,
+   16,
+   15,
+   21,
+   15,
+   271,
+   104136,
+   5122
+  ]
+ },
+ {
+  "prompt": "\u8bf7\u7528 Python \u5199\u4e00\u4e2a\u5feb\u901f\u6392\u5e8f\uff0c\u9644\u6ce8\u91ca\u3002",
+  "token_ids": [
+   103942,
+   73670,
+   6313,
+   100431,
+   101909,
+   106646,
+   100700,
+   25074
+  ]
+ }
+]
