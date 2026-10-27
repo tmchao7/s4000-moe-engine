@@ -8,7 +8,7 @@
 
 ## 0. 起点：当前栈与已达成
 
-**生产栈**：`attention=sdpa`、`moe_backend=grouped_mm`（prefill）、`decode_moe_backend=bmm_dense`、`enforce_eager=True`、`scheduler=stall_free`（在线）/`fcfs`（离线）、TP2/EP2。
+**生产栈**：`attention=triton_paged`（v4 起默认）、`moe_backend=grouped_mm`（prefill）、`decode_moe_backend=bmm_dense`、`enforce_eager=True`、`scheduler=stall_free`（在线）/`fcfs`（离线）、TP2/EP2。
 
 | 已达成 | 数字 | 证据 |
 |---|---|---|
@@ -16,9 +16,10 @@
 | 稳定性 | b32 ×10 三栈零分歧；b64 3/3 无崩溃（shm 竞态根因闭环） | `P6-nightly.md` §2 |
 | 在线容量 | 四档全 100% SLO；100% 档 goodput **15.4×**；软边界 0.87–0.96、硬饱和 0.94 req/s / 60 tok/s | `benchmarks/P6-serving-v3.md`、`P6-i5-i6-i7.md` §3 |
 | 前缀缓存 | TTFT p95 **-25.6%**（hot vs cold） | `P6-i5-i6-i7.md` §2 |
-| 已冻结 | I4 保持 SDPA；I1/I2 图 0/5，`enforce_eager=True` | `docs/P6-I4-attention-logits.md`、`benchmarks/data/p6b/p6_graph_isolation.json` |
+| 已转正 | I4 paged 过 L1–L5，默认已切；在线 TPOT p95 −12~18% | `benchmarks/P6-serving-v4.md` |
+| 已冻结 | I1/I2 图 0/5，`enforce_eager=True` | `benchmarks/data/p6b/p6_graph_isolation.json` |
 
-**下一个未知数**：投机解码值不值（S1 Phase 0）——这是当前唯一还没被证伪的性能方向。
+**下一个未知数**（P8 规划）：① I19 是 launch-bound 还是单 kernel 慢；② 图 replay 的 padding-slot 根因假设是否成立；③ `bmm_dense` 容量收缩能否把 decode MoE 层砍半。计划见 [`docs/P8-24h-plan.md`](./P8-24h-plan.md)。
 
 ---
 
@@ -65,7 +66,7 @@
 |---|---|---|
 | I1/I2 图路径 | 控制组 0/5，`enforce_eager=True` | 拿到厂商 runtime 限制/诊断，或单一可验证代码根因；**在此之前禁止 30B graph A/B、禁止猜测性 patch** |
 | I3 tiny 捕获间歇 | 未复现未关闭 | 作为图实验固定前置统计项 |
-| I4 paged（L1–L4 ✅ / L5 ❌） | 已过数值/质量/确定性门，决策 JSON = adopt_triton_paged；**默认仍 sdpa**（L5 未完成） | 补跑 L5 + 排查 paged 启动挂住 → 之后切默认 |
+| I4 paged（L1–L5 ✅） | **已转正**：四档 100% SLO，TPOT p95 −12~18%，默认已切 `triton_paged` | —（E1 autotune 解闸，下一轮） |
 | E3–E6 | 厂商侧 | 报修/问诊断（附已有证据 JSON） |
 | I14 BISECT 补丁 | 暂留 | 随 I1 结论决定去留 |
 
@@ -143,6 +144,11 @@ prefill 大批需求 ─────► E2
 
 | 想知道 | 读 |
 |---|---|
+| **P8 一昼夜怎么跑** | [`docs/P8-24h-plan.md`](./P8-24h-plan.md) |
+| **P8 架构现状与差距** | [`docs/P8-architecture-review.md`](./P8-architecture-review.md) |
+| **P8 MoE 融合/容量收缩/负载均衡** | [`docs/P8-moe-fusion-and-balance.md`](./P8-moe-fusion-and-balance.md) |
+| **P8 指标 v3 规范** | [`docs/P8-benchmark-spec.md`](./P8-benchmark-spec.md) |
+| **P8 执行提示词** | [`docs/PROMPT-P8.md`](./PROMPT-P8.md) |
 | 现在要做什么、按什么顺序 | **本文档** |
 | 哪些问题没解决、卡在哪 | [`docs/ISSUES.md`](./ISSUES.md) |
 | 当前栈、成绩单、仓库/服务器状态、SOP | [`docs/HANDOFF-P6d.md`](./HANDOFF-P6d.md)（最新）／[`HANDOFF-P6c.md`](./HANDOFF-P6c.md)（上一版） |
