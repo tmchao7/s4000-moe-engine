@@ -3,7 +3,7 @@
 > 写于 2026-10-27 上午（夜间迭代 `96317e9` + 台账回填 `1c7c42b` 之后的自检）。
 > 方法：不凭记忆，逐份扫描本轮全部落盘证据（`docs/NIGHTLY-LOG.md`、`benchmarks/P6-nightly.md`、`benchmarks/data/p6b/` 下 13+ 份 JSON/日志、`docs/HANDOFF-P6c.md`）+ 本轮触过但没跑完的计划项，逐条登记现状、证据、影响、下一步。
 > 用途：给下一轮迭代的优先级输入；给用户的「没做到什么」清单。**凡是门没过的、没验证到的、解释不了的都在这里，一个不藏。**
-> **状态速览（2026-10-27）**：18 项中 ✅ 已修 4（I10/I11/I13/I15，commit `91e3fd3`），未结 14（🔴 I1、🟡 I2–I8、🟢 I9/I12/I14、⚪ I16–I18）。逐项状态快照表见 `docs/HANDOFF-P6c.md` §1；下文各节标题带 ✅ 的为已修项。
+> **状态速览（2026-10-27，I4 诊断后）**：18 项中 ✅ 已修 4（I10/I11/I13/I15，commit `91e3fd3`），I4 已定位但未转正（commit `41ab19b`），其余未结 13（🔴 I1、🟡 I2/I3/I5–I8、🟢 I9/I12/I14、⚪ I16–I18）。逐项状态快照表见 `docs/HANDOFF-P6c.md` §1；下文各节标题带 ✅ 的为已修项。
 
 状态图例：🔴 阻塞主路径　🟡 冻住的收益/覆盖缺口　🟢 工程债/低风险　⚪ 厂商侧（我们不可修）
 
@@ -33,13 +33,13 @@
 
 ## B. 被冻结门挡住的性能收益
 
-### I4 🟡 triton_paged keep_sdpa：+48~59% 吞吐在桌上拿不走
+### I4 🟡 已定位、未转正：triton_paged 仍 keep_sdpa（+48~59% 吞吐在桌上）
 - **现状**：冻结门（`p5_decide.py --mode attention`，阈值未动）性能项全过（TPOT ratio 0.594–0.618 ≤ 0.90、吞吐比 1.48–1.59、CV ≤0.013、candidate 自身确定），但 **b32/c2048 请求级一致率 0.875 < 0.99**（12/96 个 repeat×请求 vs sdpa 参考分歧）；c512 也只有 0.938/0.969。
-- **关键事实**：今晚所有点所有后端自身都确定（含历史不稳定的 sdpa b32）→ 分歧是 paged kernel 的**可复现数值差异**，不是运行噪声。
-- **根因未定位**：怀疑页边界/掩码路径（paged 分块 vs sdpa 全长），未做 logits diff 上界分析。
-- **证据**：`benchmarks/data/p6b/p6_attention_ab.json` + `p6-attention-ab-decision.json`；摘要见 `benchmarks/P6-nightly.md` §2。
+- **定位结果（10-27）**：新增的 TP2 同状态 logits probe（每步 SDPA→还原 KV→Triton→恢复 SDPA KV，后续始终 teacher-forced）在 16/32 × 512/2048、32 output、3 repeats 下得到 **19/8,928** top-1 step 翻转；全体有限。直接 paged kernel 的扩展页边界/poison-tail 参考误差只有 `1.2207e-4 < 2e-3`；首层输出最大差 `2.4414e-4`，但 bf16 48 层后放大到 logits `6.09375`、layer 36 `8.7217`。翻转处 baseline top-2 margin 均为 0–0.3125。
+- **结论**：这排除了页表、mask、tail 地址错误；是 SDPA 与在线 softmax 累加顺序的可复现数值路径差异，无法靠一个有证据的局部 patch 消除。详情：`docs/P6-I4-attention-logits.md`。
+- **证据**：既有 `p6_attention_ab.json` / `p6-attention-ab-decision.json` + 新增 `benchmarks/data/p6b/p6_attention_logits_i4.json`（`f9b686bcb46e768d6…`）/ `.jsonl`（`46a06091ae7df233…`）。
 - **影响**：c2048 场景 TPOT 可再降 31–41%（离线实测），在线 100% 档容量可能再上一个台阶；目前全部冻结。
-- **下一步**（二选一，都不动门）：① 工程路——审 triton_paged kernel 的页边界/掩码/累加顺序，消差异后重测；② 决策路——给出 bf16 logits diff 上界 + 下游任务影响评估，证明「少数请求输出不同」可接受，由用户拍板转正。
+- **下一步**：不再做无依据的内核试错，也不启动第二次 30B A/B；保持 SDPA。只有产品方明确接受稳定但不同的 greedy 输出、并授权新的正确性契约时，才另立门禁评估转正。
 
 ## C. 验证缺口（本轮没铺到的角落）
 

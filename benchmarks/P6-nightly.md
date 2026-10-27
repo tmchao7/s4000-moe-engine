@@ -85,7 +85,7 @@
 - 下一轮可试（未测）：分段捕获（MoE eager）、图内去 MCCL、厂商 MUSAGraph 限制清单。**图方向已按时间盒关闭，`enforce_eager=True` 维持默认。**
 - BISECT-1/2 补丁保留在 `model_runner.py`（标注 `# BISECT-1/2`）：8B 有实证收益，eager 默认路径不受影响。
 
-## 6. 明早该做什么（优先级序）
+## 6. 明早该做什么（夜间原排序；I4 结果见 §8）
 
 1. **合并/提交本轮代码**（bmm_dense 已是事实上最优 decode 栈；`decode_moe_backend` 透传已进 api_server/p2_benchmark）。
 2. **triton_paged 的 c2048 分歧定位**：b32/c2048 上 paged vs sdpa 有 4/32 请求可复现分歧；审查 paged kernel 的页边界/掩码逻辑，或做 bf16 下的 logits diff 上界。通过后重跑 decide --mode attention（门不动）。
@@ -106,3 +106,11 @@
 | p6_graph_5x.log / p6_graph_bisect1.log / p6_graph_bisect2.log / p6_graph_3gen_bisect12.log | P3 复现率与修复证据 | 见文件 |
 | p5_graph_ab.log | 30B 图 A/B（捕获成功 + replay 失败现场） | 见文件 |
 | P6-serving-v3.md / P6-nightly.md | 报告 | d1d65309ed07e7a9 / （本文件） |
+| p6_attention_logits_i4.json / .jsonl | I4 同状态 logits / layer 诊断 | f9b686bcb46e768d6 / 46a06091ae7df233 |
+
+## 8. I4：Triton paged attention logits 定位（后续一发 30B；未转正）
+
+- 代码 `41ab19b` 在 TP2 内部对同一个 decode 状态做 SDPA→Triton 成对前向，并恢复 SDPA KV 继续 teacher-forced 轨迹；每一步记录完整 vocab logits 上界、top-1/2 margin 与逐层 attention 输出差。
+- 低层页边界矩阵（255/256/257、511/512/513、2047/2048/2049、混合长度/乱序页/poison tail）通过，`max_abs=1.2207e-4 < 2e-3`；没有 mask/tail/page 地址错误。
+- 12 个 30B run 共 8,928 request-step，19 个 top-1 翻转；首层最大差仅 `2.4414e-4`，但在 bf16 深层放大到 logits `6.09375`、layer 36 `8.7217`。翻转均是 baseline top-2 margin `≤0.3125` 的近平局。
+- **决策**：这是数值路径而不是可证明的局部 bug；`p5_decide.py` 不改、默认继续 `sdpa`、不跑第二次 30B 验证。完整备忘录见 `docs/P6-I4-attention-logits.md`。

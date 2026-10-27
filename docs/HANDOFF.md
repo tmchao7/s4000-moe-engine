@@ -8,6 +8,8 @@
 > **2026-10-26 22:55 追加（会话 #6 收手交接，最新）**：**先读 `docs/HANDOFF-P6b.md`，它推翻上面 20:25 的 T1 结论**。15.6 GiB 是 `qwen3_moe.py` 的惰性权重转置副本（576 MiB/层），不是厂商 workspace；零拷贝厂商 MoE 已验证但默认配置慢 2.3–6.3×，**decode 改用新的 `bmm_dense`（1.3–1.95× 于 grouped_mm，且可捕获）**；30B 图捕获成功（6 桶，+0.34 GiB）但 **replay 在模型规模上间歇性挂死**（唯一未解）；另修掉 shm 命令通道竞态（很可能就是历史 b32/b64 不稳定根因）。夜间迭代主线是 eager 的 `bmm_dense + triton_paged`，图只做时间盒诊断。
 >
 > **2026-10-27 追加（自检+快修后定稿，最新）**：**先读 `docs/HANDOFF-P6c.md`（交接定稿：当前栈、成绩单、18 项问题逐项状态表、SOP、红线）**。核心事实：`decode_moe_backend=bmm_dense` 过全部 30B 门并落地（离线 b32 110.6/133 tok/s，+59%/+92%）；b32/b64 不稳定被 shm 修复治好（证实）；在线容量 v3 四档全 100% SLO（100% 档 goodput 15.4×）、真实天花板 0.94 req/s / 60 tok/s（容量 2.1× v2）；triton_paged 冻结门判 keep_sdpa（0.875<0.99，可复现数值差异）；图 replay 8B 已修（barrier+私有池，5/5 绿）但 30B 未修。问题台账：`docs/P6-open-issues.md`（18 项，4 项已修），逐实验过程 `docs/NIGHTLY-LOG.md`。代码 HEAD `91e3fd3`，未 push。
+>
+> **2026-10-27 追加（I4 logits 定位，最新）**：I4 的 TP2 同状态 logits 诊断已完成（代码 `41ab19b`）：扩展页边界/poison-tail 参考全绿，首层差仅 `2.44e-4`，但 bf16 深层放大到最大 logits 差 6.09，并在 8,928 个 request-step 中出现 19 个近平局 top-1 翻转。故**不是页表/mask bug，不做无依据内核试错，不改冻结门，默认继续 SDPA**；详情先读 `docs/P6-I4-attention-logits.md`，再读 `HANDOFF-P6c.md`。
 
 ---
 
