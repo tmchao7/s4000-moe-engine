@@ -1,7 +1,7 @@
 # P7 调研报告 — 30B MoE 引擎引入投机解码的可行性 + 厂商生态（autotune 等）手搓边界
 
 > 日期：2026-10-27　状态：**调研完成；Phase 0 实测待 GPU（用户 I8 实验占用中，已排队自动接力）**
-> 配套：`docs/P7-implementation-plan.md`（实施计划，含逐点代码方案、算法精确描述、测试门、排期、参考实现）。
+> 配套：[`docs/P7-implementation-plan.md`](./P7-implementation-plan.md)（实施计划：逐点代码方案、算法、测试门、参考实现）；问题条目见 [`docs/ISSUES.md`](./ISSUES.md) **S1–S6**；排期见 [`docs/PLAN.md`](./PLAN.md) **Track B**。
 > 一句话结论：**值得做，定位是"低并发延迟优化"（单流 165 ms/token 是本机最疼的数字），草稿模型选 Qwen3-0.6B、1.7B 做 A/B、4B 排除；立项门槛走 Phase 0 实测（冻结门 k=3 加速 ≥1.3×）。autotune 能手搓两处（我们的 paged kernel、vLLM fused_moe 配置），其余三处属于厂商 runtime。**
 
 ---

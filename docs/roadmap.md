@@ -1,5 +1,6 @@
-# Roadmap
+# Roadmap（历史路线 P0–P5）
 
+> **注意：本文档是历史路线记录，现行计划与排期见 [`docs/PLAN.md`](./PLAN.md)，问题台账见 [`docs/ISSUES.md`](./ISSUES.md)。**
 > 每阶段有明确验收标准；时间按课余 ~10h/周估算，合计约 10–12 周。
 
 ## P0 基线（已完成）
@@ -46,7 +47,7 @@
 - [x] 修复 transformers 5.x `apply_chat_template` 返回 `BatchEncoding` 导致 API 无法接真实 tokenizer 的问题（并对该分支补了契约测试）。
 - [x] 真实 30B API batch 32 开放环压测与最终报告数字，见 [benchmarks/P4-serving.md](../benchmarks/P4-serving.md)。
 
-## P5 指标校准、profiling 与内核深挖（进行中）
+## P5 指标校准、profiling 与内核深挖（已完成）
 
 **目标**：先把容量评估校准到 vLLM/SGLang/GenAI-Perf 风格口径，再由真实 30B profiling 决定优化方向，不凭经验盲选算子。
 
@@ -57,12 +58,27 @@
 - [x] MUSA Triton paged decode kernel 与 tiny poison-tail 数值测试；默认仍为 SDPA。
 - [x] 上游 MoE 复用评估：直接调用安装版 vllm-musa 的 Triton `fused_experts`（token 24/24 与 grouped_mm 一致），但默认配置更慢、厂商 mp22 fast path 在 1024 token illegal memory access → 保持 opt-in。详见 [docs/P5-moe-optimization-survey.md](P5-moe-optimization-survey.md)。
 - [x] P6 graph capture 可行性：MCCL all-reduce 可捕获，但 `torch._grouped_mm` 与 Triton kernel 不可捕获 → **本轮取消**，`enforce_eager` 保持。详见 [docs/P6-graph-capture.md](P6-graph-capture.md)。
-- [ ] 第 2 发 30B 加载：SDPA vs Triton paged 同进程 A/B（进行中；已发现 SDPA 在 b32/c512 自身不可复现，故门改为"候选确定性 + ≥99% token 一致"）。
-- [ ] 第 3 发（可选）：MoE 后端 A/B；上游 kernel 只在有 `MTT_S4000` autotune 配置后才值得再投入。
-- [ ] 第 4 发：最终离线 schema-v2 矩阵与 prefix cache 冷/热。
-- [ ] 第 5 发：最终 OpenAI API Poisson 容量/goodput 曲线。
+- [x] 第 2 发 30B 加载：SDPA vs Triton paged 同进程 A/B —— 结论 **keep_sdpa**（一致率 0.875<0.99；后经 I4 定位为 bf16 累加路径差异）。
+- [x] 第 3 发（可选）：MoE 后端 A/B —— `bmm_dense` 胜出并采用（1.29–1.53×）；厂商 fused_moe 的 autotune 配置仍缺，见 ISSUES E2。
+- [x] 第 4 发：最终离线 schema-v2 矩阵（`benchmarks/P5-final-matrix.md`）与 prefix cache 冷/热（P6 I6 补测：TTFT p95 -25.6%）。
+- [x] 第 5 发：OpenAI API Poisson 容量/goodput 曲线（`benchmarks/P5-serving-v2.md` → P6 v3 复测四档全 100% SLO）。
 
 详见 [benchmarks/P5-profiling.md](../benchmarks/P5-profiling.md) 和 [docs/HANDOFF.md](HANDOFF.md)。
+
+## P6 图捕获与 decode 内核（已定界）
+
+- [x] 图捕获算子级可行性 → 30B 6 桶捕获成功（+0.34~0.52 GiB）。
+- [x] **图 replay 不可用**：tiny MoE 与 8B dense 控制组各 0/5，无单一代码根因 → `enforce_eager=True`，禁 30B A/B（ISSUES I1/I2）。
+- [x] `bmm_dense` decode MoE 采用（b32 110.6 / b64 141.5 tok/s）。
+- [x] b32/b64 不稳定根治（shm 命令通道竞态）；在线容量 v3 四档全 100% SLO。
+- [x] triton_paged 分歧定位为 bf16 路径差异 → keep_sdpa（ISSUES I4）。
+
+## P7 投机解码（调研完成，Phase 0 待测）
+
+- [x] 调研与实施计划成文：必要性、选型（0.6B/1.7B/4B/EAGLE3/PARD/MTP）、代码改造点、autotune 手搓边界、加速判决表（[survey](P7-speculative-decoding-survey.md)、[plan](P7-implementation-plan.md)）。
+- [x] 草稿模型 0.6B/1.7B 下载并核实引擎兼容性。
+- [ ] **Phase 0**：实测 c（draft/target 步时比）与 α（接受率）→ 冻结门 k=3 加速 ≥1.3× 才立项（ISSUES S1）。
+- [ ] M1–M4 实现（仅 go 后）。
 
 ## P5 之后的长期打磨（不设期限）
 
