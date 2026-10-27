@@ -2,6 +2,7 @@
 
 > 日期：2026-10-27。**本文是执行排期的唯一权威**；架构判断见 [`P8-architecture-review.md`](./P8-architecture-review.md)，MoE 方案见 [`P8-moe-fusion-and-balance.md`](./P8-moe-fusion-and-balance.md)，指标规范见 [`P8-benchmark-spec.md`](./P8-benchmark-spec.md)。
 > 规则：**每个实验先写门再跑**（假设 → 唯一变量 → 预期 → 判定门 → 实际 → 决策）；一次只跑一个 GPU 任务；失败/负结果照样入报告；单问题 45 min 止损。
+> **更新（10-27 19:50，P0–P2 已完成）**：I19 已判定 **launch-bound**（`device_busy` 0.478–0.603、2,401 launches/step，见 `benchmarks/P6-layer-timing.md`）；I8 已有效复测（三档 SLO 0%，瓶颈 TTFT，见 `benchmarks/P6-i8-long-context.md`）；I4 已转正、paged 为默认；投机解码已补离线上界（`benchmarks/P7-spec-decode-addendum.md`）。因此 P8 的 **P1 从"定性 I19"改为"用该判定做 norm/rope 融合与 host-sync 的 A/B"**，§1.1 的“未提交改动”均已提交（`a296069`）。
 
 ---
 
