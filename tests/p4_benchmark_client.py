@@ -30,11 +30,14 @@ class StubState:
         self.requests = 0
         self.mixed = 0
         self.omit_done = False
+        self.prompts = []
 
-    def record_request(self):
+    def record_request(self, body):
         with self.lock:
             self.requests += 1
             self.mixed = self.requests // 2
+            messages = body.get("messages") or []
+            self.prompts.append(messages[0].get("content") if messages else None)
             return self.requests, self.mixed
 
     def snapshot(self):
@@ -80,8 +83,8 @@ def build_handler(state):
             )
 
         def do_POST(self):
-            self._read_body()
-            state.record_request()
+            body = self._read_body()
+            state.record_request(body)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Transfer-Encoding", "chunked")
@@ -159,6 +162,44 @@ def main():
         assert row["mixed_steps"] > 0, row
     assert all(row["done_received"] for row in payload["records"])
     assert all(row["output_tokens"] == CHUNKS for row in payload["records"])
+    assert all(row["prompt_tokens_p50"] == 12 for row in summaries)
+    assert payload["prompt_mode"] == "shared"
+    assert len(set(state.prompts)) == 1, state.prompts
+
+    unique_output = output.with_name("unique.json")
+    unique_state = StubState()
+    unique_port = free_port()
+    unique_server = ThreadingHTTPServer(
+        ("127.0.0.1", unique_port), build_handler(unique_state)
+    )
+    unique_thread = threading.Thread(target=unique_server.serve_forever, daemon=True)
+    unique_thread.start()
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "benchmark_online.py"),
+                "--base-url", f"http://127.0.0.1:{unique_port}",
+                "--model", "stub",
+                "--max-qps", "20",
+                "--requests", "3",
+                "--warmup-requests", "0",
+                "--max-tokens", "4",
+                "--prompt-words", "8",
+                "--prompt-mode", "unique",
+                "--fractions", "1.0",
+                "--arrival-pattern", "fixed",
+                "--output", str(unique_output),
+            ],
+            check=True,
+            cwd=REPO_ROOT,
+        )
+    finally:
+        unique_server.shutdown()
+        unique_server.server_close()
+    unique_payload = json.loads(unique_output.read_text(encoding="utf-8"))
+    assert unique_payload["prompt_mode"] == "unique"
+    assert len(set(unique_state.prompts)) == 3, unique_state.prompts
     missing_done_output = output.with_name("missing-done.json")
     missing_state = StubState()
     missing_state.omit_done = True

@@ -40,6 +40,15 @@ def prompts(batch, prompt_len, vocab_size, seed, shared_prefix_len=0):
     ]
 
 
+def numeric_delta(before, after):
+    """Return the numeric scheduler/cache counter delta for one benchmark run."""
+    return {
+        key: value - before.get(key, 0)
+        for key, value in after.items()
+        if isinstance(value, (int, float)) and isinstance(before.get(key, 0), (int, float))
+    }
+
+
 def run_verification(llm, sampling_params_cls, reference_path, max_tokens, repeats, backends,
                      decode_backend=None, soft=False):
     """Check greedy reproducibility before spending GPU time on the sweep.
@@ -285,9 +294,11 @@ def main():
             for repeat in range(args.repeats):
                 if cache_mode == "cold":
                     llm.scheduler.block_manager.clear_prefix_cache()
+                cache_metrics_before = llm.scheduler.metrics()
                 start = time.perf_counter()
                 outputs = llm.generate(batch_prompts, params, use_tqdm=False)
                 elapsed = time.perf_counter() - start
+                cache_metrics_after = llm.scheduler.metrics()
                 ttfts = [output["metrics"]["ttft_s"] for output in outputs]
                 itls = [
                     interval
@@ -308,6 +319,11 @@ def main():
                     "output_len": args.output_len,
                     "shared_prefix_len": shared_prefix_len,
                     "cache_mode": cache_mode,
+                    "cache_metrics_before": cache_metrics_before,
+                    "cache_metrics_after": cache_metrics_after,
+                    "cache_metrics_delta": numeric_delta(
+                        cache_metrics_before, cache_metrics_after
+                    ),
                     "elapsed_s": elapsed,
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,

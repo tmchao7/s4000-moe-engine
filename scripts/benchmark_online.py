@@ -11,6 +11,7 @@ from nanovllm.benchmarking import (
     coefficient_of_variation,
     distribution,
     goodput,
+    percentile,
     request_tpot,
 )
 
@@ -80,6 +81,24 @@ def _prompt_token_count(tokenizer, messages):
     if ids and isinstance(ids[0], (list, tuple)):
         ids = ids[0]
     return len(ids)
+
+
+def build_prompt(prompt_word, prompt_words, prompt_mode, seed, request_id):
+    """Build a deterministic benchmark prompt without serialising its content.
+
+    ``shared`` deliberately retains the historic workload: every request gets
+    the same prompt so prefix-cache behaviour remains comparable with v2/v3.
+    ``unique`` changes every word from the first token onward, preventing a
+    previous request from supplying a reusable full 256-token KV block.
+    """
+    if prompt_mode == "shared":
+        return (prompt_word + " ") * prompt_words
+    if prompt_mode == "unique":
+        return " ".join(
+            f"{prompt_word}-{seed}-{request_id}-{position}"
+            for position in range(prompt_words)
+        )
+    raise ValueError(f"unsupported prompt mode: {prompt_mode}")
 
 
 async def one_request(
@@ -181,7 +200,7 @@ def arrival_offsets(count, qps, pattern, seed):
     return offsets
 
 
-async def warmup(client, args, prompt, tokenizer):
+async def warmup(client, args, prompt_for_request, tokenizer, point_index):
     if args.warmup_requests == 0:
         return
     tracker = ConcurrencyTracker()
@@ -191,7 +210,7 @@ async def warmup(client, args, prompt, tokenizer):
             client,
             f"{args.base_url.rstrip('/')}/v1/chat/completions",
             args.model,
-            prompt,
+            prompt_for_request(-1 - point_index * args.warmup_requests - index),
             args.max_tokens,
             -index - 1,
             start + index * 0.05,
@@ -205,9 +224,9 @@ async def warmup(client, args, prompt, tokenizer):
         raise RuntimeError(f"warmup failed: {failures[0]['error']}")
 
 
-async def run_point(client, args, fraction, point_index, prompt, tokenizer):
+async def run_point(client, args, fraction, point_index, prompt_for_request, tokenizer):
     qps = args.max_qps * fraction
-    await warmup(client, args, prompt, tokenizer)
+    await warmup(client, args, prompt_for_request, tokenizer, point_index)
     metrics_before = await scrape_metrics(client, args.base_url)
     start = time.perf_counter() + 0.2
     offsets = arrival_offsets(
@@ -219,7 +238,7 @@ async def run_point(client, args, fraction, point_index, prompt, tokenizer):
             client,
             f"{args.base_url.rstrip('/')}/v1/chat/completions",
             args.model,
-            prompt,
+            prompt_for_request(point_index * args.requests + request_id),
             args.max_tokens,
             request_id,
             start + offsets[request_id],
@@ -246,6 +265,7 @@ def summarize(rows, max_concurrency, metrics_delta, args, fraction):
     e2es = [row["e2e_s"] for row in good]
     input_tokens = sum(row["prompt_tokens"] or 0 for row in good)
     output_tokens = sum(row["output_tokens"] or 0 for row in good)
+    prompt_token_counts = [row["prompt_tokens"] for row in good if row["prompt_tokens"] is not None]
     result = {
         "load_fraction": fraction,
         "target_qps": args.max_qps * fraction,
@@ -264,6 +284,12 @@ def summarize(rows, max_concurrency, metrics_delta, args, fraction):
         "prefill_steps": metrics_delta.get("engine_prefill_steps_total", 0.0),
         "decode_steps": metrics_delta.get("engine_decode_steps_total", 0.0),
     }
+    if prompt_token_counts:
+        result.update({
+            "prompt_tokens_min": min(prompt_token_counts),
+            "prompt_tokens_p50": percentile(prompt_token_counts, 0.50),
+            "prompt_tokens_max": max(prompt_token_counts),
+        })
     result.update(distribution(ttfts, "ttft"))
     result.update(distribution(tpots, "tpot"))
     result.update(distribution(itls, "itl"))
@@ -282,7 +308,10 @@ async def async_main(args):
     if args.tokenizer:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
-    prompt = (args.prompt_word + " ") * args.prompt_words
+    def prompt_for_request(request_id):
+        return build_prompt(
+            args.prompt_word, args.prompt_words, args.prompt_mode, args.seed, request_id
+        )
     limits = httpx.Limits(
         max_connections=args.requests + args.warmup_requests,
         max_keepalive_connections=args.requests + args.warmup_requests,
@@ -292,7 +321,7 @@ async def async_main(args):
         points = []
         for point_index, fraction in enumerate(args.fractions):
             rows, before, after, max_concurrency = await run_point(
-                client, args, fraction, point_index, prompt, tokenizer
+                client, args, fraction, point_index, prompt_for_request, tokenizer
             )
             all_rows.extend(rows)
             delta = _delta(before, after)
@@ -321,9 +350,11 @@ async def async_main(args):
         "schema_version": 2,
         "arrival_pattern": args.arrival_pattern,
         "seed": args.seed,
+        "prompt_mode": args.prompt_mode,
+        "prompt_words": args.prompt_words,
         "warmup_requests": args.warmup_requests,
         "prompt_tokens": _prompt_token_count(
-            tokenizer, [{"role": "user", "content": prompt}]
+            tokenizer, [{"role": "user", "content": prompt_for_request(0)}]
         ),
         "summary": summaries,
         "points": points,
@@ -368,6 +399,10 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--prompt-words", type=int, default=128)
     parser.add_argument("--prompt-word", default="benchmark")
+    parser.add_argument(
+        "--prompt-mode", choices=("shared", "unique"), default="shared",
+        help="shared preserves the historic prefix-sharing workload; unique disables full-block reuse",
+    )
     parser.add_argument("--arrival-pattern", choices=("fixed", "poisson"), default="poisson")
     parser.add_argument("--seed", type=int, default=20261026)
     parser.add_argument("--slo-ttft-ms", type=float, default=2000.0)
