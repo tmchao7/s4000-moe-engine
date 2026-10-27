@@ -24,7 +24,7 @@
 | I6 前缀缓存 | 8 请求、512-in/384 shared-prefix：cold 三轮命中增量均 0；hot 三轮均 **+2048 tokens**，TTFT p95 约 1.256 s → 0.911–0.935 s | `p6_i5_i6.json/.jsonl` |
 | I7 SLO 细点 | 0.8715 / 0.9135 / 0.9555 QPS 的 SLO 分别为 **128/128、102/128、128/128**；不是单调 knee，不能据此虚报精确容量点 | `p6_i7_knee.json/.jsonl` |
 | I8 长 unique prompt | 30B API 的 1k-input×3 档任务已在服务器锁 runner 中启动；**本交接撰写时尚未生成完整 JSON，未得结论，不重跑** | `/root/p6_i7_i8_runner.log` |
-| P7 投机解码调研 | 调研+实施计划已成文；草稿模型 0.6B/1.7B 已下载并核实与引擎兼容（dense/tie=True/head_dim 128/tokenizer 一致）；Phase 0（c 与 α 实测）已排队等 GPU | `docs/P7-speculative-decoding-survey.md`、`docs/P7-implementation-plan.md` |
+| P7 投机解码调研 | **调研已完成**（必要性/选型/代码改造点/autotune 边界/加速判决表）；0.6B/1.7B 已下载且逐项核实兼容（dense、tie=True、head_dim 128、tokenizer 151669 一致）；Phase 0（实测 c 与 α）脚本就绪、排队等 GPU；**预测 c≈0.10、α≈0.4–0.6 → 1.35–1.55×，门 1.3×** | `docs/P7-speculative-decoding-survey.md`、`docs/P7-implementation-plan.md`、`tests/p7_*.py` |
 
 ---
 

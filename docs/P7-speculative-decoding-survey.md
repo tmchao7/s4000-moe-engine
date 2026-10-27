@@ -1,82 +1,86 @@
 # P7 调研报告 — 30B MoE 引擎引入投机解码的可行性 + 厂商生态（autotune 等）手搓边界
 
-> 日期：2026-10-27　作者：P7 调研（计划已批准，Phase 0 测量进行中）
-> 面向：决定是否立项「投机解码」实现（P7）；顺带回答「厂商不给的 kernel 调参我们自己能不能做」。
-> 结论先行：**值得做，但定位是"低并发延迟优化"，不是容量优化；草稿模型选 Qwen3-0.6B（1.7B 做 A/B）；门槛判定走 Phase 0 实测（冻结门 ≥1.3×）。autotune 可手搓两处（我们的 paged kernel、vLLM fused_moe 配置），其余三处属于厂商 runtime，搓不动。**
+> 日期：2026-10-27　状态：**调研完成；Phase 0 实测待 GPU（用户 I8 实验占用中，已排队自动接力）**
+> 配套：`docs/P7-implementation-plan.md`（实施计划，含逐点代码方案、算法精确描述、测试门、排期、参考实现）。
+> 一句话结论：**值得做，定位是"低并发延迟优化"（单流 165 ms/token 是本机最疼的数字），草稿模型选 Qwen3-0.6B、1.7B 做 A/B、4B 排除；立项门槛走 Phase 0 实测（冻结门 k=3 加速 ≥1.3×）。autotune 能手搓两处（我们的 paged kernel、vLLM fused_moe 配置），其余三处属于厂商 runtime。**
+
+---
+
+## 0. 交付清单与完成度
+
+| # | 内容 | 状态 |
+|---|---|---|
+| 1 | 必要性与选型分析（本文 §2/§3） | ✅ 完成 |
+| 2 | 引擎兼容性事实核实（§3.2，含实测 config/tokenizer） | ✅ 完成（服务器实测） |
+| 3 | 代码改造点全图（§4，file:line 逐点） | ✅ 完成（两路代码勘察） |
+| 4 | 厂商生态手搓边界（§5） | ✅ 完成 |
+| 5 | 加速判决表（§7.1，任意 α/c 直接查表出结论） | ✅ 完成（预计算） |
+| 6 | Phase 0 实测：c（draft/target 步时比）、α（接受率） | ⏳ **待 GPU**（脚本已就绪并排队） |
+| 7 | Go/No-Go 判定（§7.3） | ⏳ 依赖 6（判决规则已冻结） |
+| 8 | 实施计划文档 | ✅ 完成（独立文件） |
 
 ---
 
 ## 1. 问题与结论速览
 
-**问题 A：30B MoE 有必要上投机解码吗？草稿模型多少 B 合适？**
+**问题 A：30B MoE 有必要上投机解码吗？草稿模型多少 B？**
 
 | 子问题 | 结论 | 依据 |
 |---|---|---|
-| 有必要吗 | **有，但只在低并发（b1–b8）区间**；单流 TPOT 0.165 s/token 是本机最疼的数字，预计 1.5–2.3× 加速 | §2.1 经济账：S4000 单步慢（165 ms）→ draft 开销占比 c≈0.1，与快硬件（A100/H100 已被证明投机解码不划算的场景）条件相反 |
-| 容量（在线高并发）能涨吗 | 估计 +20–40% goodput（verify 批摊薄 MoE 亚线性批效应），**不确定，需 Phase 0 实测**；不是立项理由 | §2.2 |
-| 草稿模型多大 | **0.6B 首选，1.7B 做 A/B；4B 排除**。0.6B 同 tokenizer/同家族/tied-embedding 已支持/TP2 分片后 ~0.3 GiB | §3 |
-| MTP 自投机 | **不可用**：Qwen3-30B-A3B-Instruct-2507 官方不带 MTP 权重（只有 Qwen3-Next 系列带） | §3.4 + HF 模型卡 |
-| 接受率预期 | 朴素 0.6B→30B-A3B 社区经验 α≈0.4–0.6（1.3–1.7 tok/step）；k=3、α=0.6 → 单流 ~1.5–1.8× | §2.1 公式 + 社区数据；**α 必须实测**（Phase 0c） |
-| 更高接受率路线 | EAGLE3 训练头（社区已有 Qwen3-30B-A3B 的现成权重）/ PARD-Qwen3-0.6B（声称 3.06×）——但引擎要实现 EAGLE 头，远期可选 | §3.3 |
+| 有必要吗 | **有，但只在低并发（b1–b8）**。单流 165 ms/token 是本机最疼的数字，预计 1.4–1.9× | §2.1 经济账：S4000 单步慢 → draft 开销占比 c≈0.09–0.15 很小；与"MoE 上投机解码不划算"的通用结论（针对 20–30 ms/步的快卡）前提相反 |
+| 容量能涨吗 | 估 +20–40% goodput，**不确定，不作立项依据** | §2.2：verify 批摊薄 MoE 亚线性成本（微基准 b1→b32 单层 1.27→2.86 ms） |
+| 草稿模型多大 | **0.6B 首选 / 1.7B A/B / 4B 排除** | §3.1 判决表：4B 的 c≈0.4 在数学上已不可能赢 |
+| MTP 自投机 | **不可用** | Qwen3-30B-A3B-Instruct-2507 不带 `mtp_weights`（只有 Qwen3-Next 系列带） |
+| 高接受率路线 | EAGLE3 头 / PARD-0.6B：α 可到 0.8+，但需实现树验证 + hidden-state 接口 → **Phase 3+ 可选** | §3.3 |
 
-**问题 B：厂商生态缺口（autotune 等）能否手搓？**
+**问题 B：厂商生态缺口能手搓吗？**
 
-| 对象 | 手搓? | 说明与注入点 |
+| 对象 | 手搓 | 注入点 / 说明 |
 |---|---|---|
-| 我们的 triton_paged decode kernel | ✅ **最佳候选** | `BLOCK_N=32, num_warps=4, num_stages=1` 硬编码于 `nanovllm/kernels/paged_attention.py:128-130`，单点注入；离线扫网格+按 (batch 桶, kv 桶) 持久化最优配置（`context_len` 保持 runtime 参数，不破坏图捕获兼容）。**应与 I4 一致性分歧修复合并做**（§5.2） |
-| vLLM fused_moe 的调参配置 | ✅ 机制明确 | `VLLM_TUNED_CONFIG_FOLDER` + `E=64,N=768,device_name=MTT_S4000.json`；扫描 harness 复用 `scripts/p6_moe_microbench.py` 的计时法+子进程隔离；或走 `vendor_moe.py:29-45` 的 source-rebind 直接注入 config dict。**低优先**：bmm_dense decode 已更快（1.27–2.86 ms/层），只有想要厂商 kernel 其他特性时才值得 |
-| grouped_mm | ❌ | `torch._grouped_mm`（qwen3_moe.py:248,256）是固定厂商 op，无 BLOCK/warps/stages 旋钮；仅旁边的 `moe_fusion.py:61-64,80-85` 两个小 fusion 有微调面 |
-| bmm_dense | ❌ | 纯 `torch.bmm`（qwen3_moe.py:317,321），无调参面，只有布局选择（已零拷贝） |
-| MUSAGraph replay 楔死（I1）/ MCCL 内部 / watchdog 行为 | ❌ | driver/runtime 层，只能报厂商（I18） |
+| **我们的 triton_paged decode kernel** | ✅ 最佳候选 | 三个元参数硬编码于 `nanovllm/kernels/paged_attention.py:128-130`；离线扫网格 + 持久化最优配置。**注意：I4 已证明 kernel 与 SDPA 有 bf16 累加路径差异，autotune 只改性能不改这一差异** |
+| **vLLM fused_moe 配置** | ✅ 机制明确 | `VLLM_TUNED_CONFIG_FOLDER` + `E=64,N=768,device_name=MTT_S4000.json`；或走 `vendor_moe.py:29-45` 的 source-rebind 注入 config dict。低优先（bmm_dense 已更快） |
+| grouped_mm | ❌ | `torch._grouped_mm`（qwen3_moe.py:248,256）固定厂商 op，无旋钮；仅旁边 `moe_fusion.py:61-64,80-85` 两个小 fusion 可微调 |
+| bmm_dense | ❌ | 纯 `torch.bmm`（qwen3_moe.py:317,321），只有布局（已零拷贝） |
+| MUSAGraph replay 漂移（I1/I2）、MCCL 内部、watchdog | ❌ | driver/runtime 层；I1/I2 已被重新定界为 MUSA graph 限制（控制组 tiny 0/5、8B 0/5） |
 
 ---
 
 ## 2. 必要性分析
 
-### 2.1 经济账（为什么 S4000 反而适合投机解码）
-
-投机解码单步净加速公式（贪心/拒绝采样理论值）：
+### 2.1 经济账
 
 ```
 speedup(k, α, c) = (1 - α^(k+1)) / (1 - α) × 1 / (1 + (k+1)·c)
 
-α = 每 token 草稿接受率（贪心下 = 草稿与目标的一致率）
-c = 草稿单步时间 / 目标单步时间
+α = 草稿接受率（贪心 = 与 target 贪心的逐 token 一致率）
+c = draft 单步时间 / target 单步时间
 k = 每轮草稿 token 数（verify 一次处理 k+1 个位置）
 ```
 
-本项目实测参数（P6 夜间数据）：
-- **目标单步（30B，采用栈 sdpa+bmm_dense，b1）≈ 165 ms**（离线 b1 TPOT p50 0.165 s；b32 ≈ 199–249 ms）。
-- Qwen3-0.6B（TP2 分片，bf16）：权重 ~0.6 GiB/卡，28 层 dense——单步估 15–25 ms → **c ≈ 0.09–0.15**。
-- Qwen3-1.7B：单步估 40–60 ms → c ≈ 0.24–0.36。
+**target 单步实测**（采用栈 sdpa+grouped_mm(prefill)+bmm_dense(decode)，离线矩阵 `itl_p50`）：
 
-代入（k=3）：
+| batch | target 单步 | 来源 |
+|---:|---:|---|
+| 1 | **165.3 ms** | P0 矩阵（`p6_eager_matrix.jsonl`，3 次中位） |
+| 8 | 174.2 ms | 同上 |
+| 32 | 248.8 ms | 同上 |
+| 64 | ~435 ms（TPOT p95 0.4347 s） | I5 补测 |
 
-| α \ c | 0.10（0.6B） | 0.30（1.7B） |
-|---:|---:|---:|
-| 0.4 | 1.23× | 0.98× |
-| 0.5 | 1.42× | 1.13× |
-| 0.6 | 1.62× | 1.29× |
-| 0.7 | 1.81× | 1.44× |
+**draft 单步**：0.6B（28 层、hidden 1024、bf16、TP2 分片 0.6 GB/卡）在 b1 下是纯权重带宽 bound，理论下限 ~1.3 ms；实际含 56 次 MCCL（28 层×2，0.08 ms/次 ≈ 4.5 ms）与 launch 开销，估 **12–20 ms → c ≈ 0.07–0.12**；1.7B 约 2.5–3× → **c ≈ 0.2–0.3**。**这两组数是 Phase 0a 要实测确认的。**
 
-**读法**：0.6B 草稿只要 α≥0.5 就稳赚 1.4×+；1.7B 需要 α≥0.65 才打平 0.6B 的收益（α 每高 0.1，speedup 约 +0.2，而 c 变差 0.2 大约 -0.3×）——所以 0.6B/1.7B 必须 A/B 实测（Phase 0），不能拍脑袋。
-
-**为什么通用结论"MoE 上投机解码不值钱"不适用于本机**：那个结论的成立条件是目标步已经很快（A100/H100 上 30B-A3B 单步 ~20–30 ms，draft+verify 的固定开销占比大，且 MoE 小激活量使 verify 批处理几乎不省时间）。S4000 单步 165 ms，是快卡的 6–8 倍，c 项被压得很小；同时 verify 的多 token 批在慢卡上摊薄的固定开销（kernel launch、每层 MCCL 96 次 all-reduce 里的固定延迟部分）比例更大。**这是"慢硬件+小草稿"的经典有利场景。**
-
-单流之外（b2–b8 多路在线）：TPOT p95 0.157–0.199 s（P0 矩阵 triton 列），同样处于"每步还有大量固定开销"区间，预期同比例受益。
+**为什么通用"MoE 投机解码不划算"的结论不适用**：该结论的前提是 target 步已经很快（A100/H100 上 30B-A3B ~20–30 ms），draft 与 verify 的固定开销（尤其每层 all-reduce、kernel launch）占比大。本机单步 165 ms，是快卡的 6–8 倍——固定开销被摊薄，c 项很小，公式里的分母 `1+(k+1)c` 接近 1。
 
 ### 2.2 容量区间的预期（不作立项依据）
 
-在线容量饱和点：并发 ~24–27（P2b 硬饱和 0.94 req/s / 60 tok/s 输出）。投机解码在饱和区的收益来源与低并发不同：
-- **正面**：verify 步批 = 并发×(k+1) 个 token 一次前向。MoE 每步成本对 batch 亚线性（微基准：b1→b32 单层 1.27→2.86 ms，即 32× token 只花 2.3× 时间），多 token verify 把这个非线性"折"得更划算——27 路×4 token = 108 token/步，落在亚线性曲线的平坦段。
-- **负面**：接受率随 batch 变化不保证；在线 mixed steps（prefill 混入）会让 draft/verify 的调度更复杂；拒绝后的回滚在批间产生气泡。
-- **净估计**：+20–40% goodput，**误差大，Phase 2 才实测**。立项理由以单流/低并发为主。
+- **正面**：verify 批 = 并发×(k+1) token 一次前向。MoE 每步成本对 batch 亚线性（单层 b1→b32：1.27→2.86 ms，32× token 只花 2.3× 时间），27 路×4 = 108 token/步落在平坦段。
+- **负面**：接受率在批间不一致 → 每条 seq 每轮 emit 数不同（1..k+1），调度与 KV 管理复杂化；拒绝产生回滚气泡；与 mixed prefill 步交互未测。
+- **净估计 +20–40% goodput**，误差大，Phase 2 实测。
 
-### 2.3 与现有优化路线的优先级关系
+### 2.3 与其他优化路线的关系
 
-1. **I4（triton_paged 转正）优先于投机解码**：+48–59% 吞吐是已实测、只差一致性解释的收益；投机解码是预测 1.5×、需实测 α 的收益。
-2. **I1（30B 图）与投机解码正交但抢显存/工程量**：图捕获的增量收益（~1.1×）已小于投机解码预期（1.5×+），且 I1 卡在厂商 runtime；**若 Phase 0 go，图的优先级应下调**。
-3. 投机解码与图可叠加（draft 图 + verify 图），但那是 Phase 3 的事。
+1. **I4（triton_paged）已完成定位但未转正**——结论是 bf16 累加路径差异（19/8,928 步 top-1 翻转、margin≈0–0.3），非页表 bug；保持 SDPA。投机解码在 SDPA 栈上就能做，不受阻。
+2. **I1/I2（图）已定界为 MUSA graph 限制**（控制组 0/5），图路线的预期收益（~1.1×）本就低于投机解码（1.4–1.9×）——**投机解码应是当前第一优先的性能方向**。
+3. 与 I4 的叠加：若将来产品接受"稳定但不同"的 paged 输出，spec + paged 可叠加（verify 的 attention 也是大头）。
 
 ---
 
@@ -84,144 +88,168 @@ k = 每轮草稿 token 数（verify 一次处理 k+1 个位置）
 
 ### 3.1 候选对比
 
-| 候选 | 参数量 | TP2 后权重/卡 | 单步估时 | c 估 | tokenizer | 预期 α | 备注 |
+| 候选 | 参数 | TP2 权重/卡 | 单步估 | c 估 | tokenizer | α 预期 | 判决 |
 |---|---:|---:|---:|---:|---|---:|---|
-| **Qwen3-0.6B** | 0.6B | ~0.3 GiB | 15–25 ms | 0.09–0.15 | 与 30B 完全一致（151936） | 0.4–0.6 | tied embedding（引擎 loader 已支持，qwen3.py:202-203）；28 层/16 头/8 KV 头/GQA/head_dim 128——**全部在引擎 dense 路径已支持的能力圈内**（attention_bias=false 路径正确） |
-| **Qwen3-1.7B** | 1.7B | ~0.85 GiB | 40–60 ms | 0.24–0.36 | 一致 | 0.6–0.8（估） | A/B 用；若 α(1.7B)−α(0.6B) ≥ 0.15 才值得换 |
-| Qwen3-4B | 4B | ~2 GiB | ~100 ms | ~0.6 | 一致 | 更高 | c 太大，数学上已不可能赢（speedup 公式 c=0.6 时 α=0.8 也只有 1.1×）——**排除** |
-| EAGLE3 头 | ~1B 可训 | ~0.5 GiB | ~20 ms | ~0.12 | n/a | 0.7–0.85（社区） | 需要实现 EAGLE 树验证 + hidden-state 接口，工程量 +2–3 夜；社区已有 Qwen3-30B-A3B 的 EAGLE3 权重（vllm-ascend/Qwen3-a3B_eagle3）可直接下——**Phase 3+ 可选** |
-| PARD-Qwen3-0.6B | 0.6B | ~0.3 GiB | ~20 ms | ~0.12 | n/a | 声称高 | AMD 发布的并行对齐残差草稿（HF: amd/PARD-Qwen3-0.6B，vLLM 3.06×），需要 PARD 前向支持——同 EAGLE 档，远期 |
-| MTP（模型自带） | — | — | — | — | — | — | **Qwen3-30B-A3B-Instruct-2507 不带 mtp_weights**（Qwen3-Next 才有）→ 自投机/MTP 路线直接排除 |
+| **Qwen3-0.6B** | 0.6B | ~0.6 GiB (bf16) | 12–20 ms | 0.07–0.12 | 与 30B **完全一致** | 0.4–0.6 | **首选** |
+| **Qwen3-1.7B** | 1.7B | ~1.7 GiB | 35–60 ms | 0.2–0.3 | 一致 | 0.6–0.8（估） | A/B |
+| Qwen3-4B | 4B | ~4 GiB | ~100 ms | ~0.6 | 一致 | 0.7–0.85 | **排除**：c=0.4 时 α=0.8 也只有 1.14×（§7.1 表） |
+| EAGLE3 头 | ~1B | ~0.5 GiB | ~20 ms | ~0.12 | n/a | 0.7–0.85 | Phase 3+（需树验证） |
+| PARD-Qwen3-0.6B | 0.6B | ~0.6 GiB | ~20 ms | ~0.12 | n/a | 高（声称 3.06×） | Phase 3+ |
+| MTP（自带） | — | — | — | — | — | — | **不可用**（2507 无 MTP 权重） |
 
-### 3.2 为什么 0.6B 是首选（工程侧）
+### 3.2 引擎兼容性：**已实测核实**（不是推断）
 
-1. **同家族同 tokenizer**：草稿输出 token id 可直接喂给目标 verify，无需任何词表映射。
-2. **引擎已支持**：`_model_cls` 按架构名分发（model_runner.py:18-22，`"Moe" not in arch → Qwen3ForCausalLM` dense 路径）；tied embeddings（loader.py:152-157 有专门特判）、GQA、`head_dim` 显式读取（qwen3.py:134）、`attention_bias=false`（qwen3.py:133 getattr 路径）——**加载 0.6B 不需要改任何模型代码**（Explore 已逐行核实）。
-3. **显存无痛**：KV 分配启发式在权重加载后测量（model_runner.py:420 `used = total - free`），draft 权重先加载会被自动扣除；0.3 GiB/卡 vs 当前 ~11 GiB 余量。
-4. **下载小**：~1.2 GiB，hf-mirror 可下（已在跑）。
+服务器上直接读取三个模型的 `config.json` 与 tokenizer（2026-10-27）：
 
-### 3.3 EAGLE3/PARD 的取舍（远期）
+| 字段 | Qwen3-0.6B | Qwen3-1.7B | 30B-A3B-2507 | 引擎要求 | 判定 |
+|---|---|---|---|---|---|
+| architectures | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` | `Qwen3MoeForCausalLM` | `"Moe" in arch` 分流（model_runner.py:18-22） | ✅ dense 走 `qwen3.py` |
+| hidden_size | 1024 | 2048 | — | 任意 | ✅ |
+| num_hidden_layers | 28 | 28 | 48 | 任意 | ✅ |
+| num_attention_heads / kv | 16 / 8 | 16 / 8 | — | `heads % tp_size == 0`（qwen3.py:31-34） | ✅ TP2 → 8/4 |
+| head_dim | 128 | 128 | — | 显式读取（qwen3.py:134）；paged kernel assert 128（paged_attention.py:105） | ✅ 甚至可用 paged |
+| intermediate_size | 3072 | 6144 | — | 任意 | ✅ |
+| vocab_size（config） | 151936 | 151936 | 151936 | draft/target 词表必须一致 | ✅ |
+| tokenizer len | **151669** | **151669** | **151669** | 同 tokenizer | ✅ 三模型完全一致 |
+| tie_word_embeddings | True | True | False | 支持（qwen3.py:202-203；loader.py:152-157 特判） | ✅ |
+| attention_bias | False | False | — | `getattr(config,'attention_bias',True)`（qwen3.py:133） | ✅ q_norm/k_norm 路径正确 |
+| hidden_act | silu | silu | — | assert silu（qwen3.py:110） | ✅ |
+| rope_theta | 1e6 | 1e6 | — | `get_rope` 读 config | ✅ |
+| max_position_embeddings | 40960 | 40960 | 1010000 | ≥ 我们的 1024 | ✅ |
 
-朴素 draft 的 α 上限 ~0.6–0.7（小模型能力天花板）；EAGLE3 类训练头用目标模型的 hidden state 做输入，α 可到 0.8+，但需要：① verify 时从目标模型抽取倒数第二层 hidden（我们的 Qwen3MoE 前向要加一个 return hidden 开关）；② EAGLE 树/链验证逻辑；③ 社区权重的接口适配。**收益：α 0.6→0.8 约等于 speedup 1.6→2.2×。建议 Phase 3 再说，先把朴素 draft 的管线跑通。**
+**结论：加载 0.6B/1.7B 不需要改任何模型代码**，只需双模型加载的编排（见实施计划 §3.2）。两个模型已下载到 `/root/autodl-tmp/models/`。
 
-### 3.4 MTP 结论依据
+### 3.3 为什么 0.6B 优先（工程视角）
 
-Qwen3-30B-A3B-Instruct-2507 的 HF 模型卡不含 `mtp_weights`；vLLM 的 MTP 文档明确该路线只适用于自带 MTP 的模型（Qwen3-Next 系列）。
+1. 同家族同 tokenizer → 草稿 token 直接喂 target verify，无映射。
+2. 引擎已支持 dense/tied/GQA/head_dim（上表逐项核实）。
+3. 显存无痛：KV 分配启发式在权重加载后测量（model_runner.py:420 `used = total - free`），draft 先加载会被自动扣除；0.6 GiB/卡 vs 当前余量 ~6–11 GiB。
+4. 步时小 → c 小，这是公式里最敏感的一项。
+
+### 3.4 EAGLE3/PARD（远期）
+
+用 target 的 hidden state 做草稿输入，α 可到 0.8+（对应 §7.1 表从 1.55× 升到 2.3×）。代价：① target 前向要能返回倒数第二层 hidden；② EAGLE 树/链验证；③ 权重接口适配。**Phase 3+，先跑通朴素 draft。**
 
 ---
 
-## 4. 投机解码实现：代码改造点全图（Phase 1 用）
+## 4. 代码改造点全图（详见实施计划）
 
-Explore 勘察的完整结论（file:line 均已核实）：
+**有利条件（已存在）**：多 token 一次前向 + per-token slot_mapping + 分页因果注意力（model_runner.py:446-491、attention.py:124-145）＝ verify 前向现成；KV 快照/恢复模板（model_runner.py:169-191）；mixed 步已存在；rank 间命令通道带 barrier（model_runner.py:121-138）；全词表采样已实现（sampler.py:13-15）。
 
-### 4.1 有利条件（已存在、可直接复用）
+**必改 5 处**：① `embed_head.py:58-60` 只回 last-token logits → verify 要多位置；② 单模型架构 → 双模型（Config/ModelRunner/kv_cache）；③ `scheduler.py:229` postprocess 硬编码 1 token/seq；④ draft 必须 **TP2 双 rank 分片**（rank0-only 会 hang：并行层绑定全局进程组且无条件 all_reduce）；⑤ 回滚：块内免费、块边界需 `release_last_block` + prefix-cache hash 作废（块边界可先 `clear_prefix_cache()` 兜底）。
 
-| 已有设施 | 位置 | 对投机解码的意义 |
-|---|---|---|
-| 多 token 一次前向 + 每 token slot_mapping + 分页因果注意力 | `model_runner.py:446-491`（prepare_prefill）、`attention.py:124-145` | **verify 步 = 一次 prefill-模式前向**：草稿 k 个 token + 上一接受 token 组成 k+1 token 的 query，per-token slot 写 KV，causal mask 只需对齐——机器现成 |
-| KV 快照/恢复模板 | `model_runner.py:169-191`（`_snapshot_kv_slots`/`_restore_kv_slots`，probe_attention_backends 在用） | 拒绝回滚的 KV 层模板：clone 本步写的 slot → 拒绝时 restore |
-| mixed 步已存在 | `scheduler.py:204-210`（fcfs/stall_free 都有 mixed） | 调度器已能处理"prefill 行与 decode 行混批"，verify 批就是 N 条 1-token prefill |
-| rank 间命令通道带 barrier | `model_runner.py:121-138` | 新命令 `run_spec` 自动双 rank 同步执行 |
-| 序列 pickle 已传全量 token_ids（prefill 模式） | `sequence.py:111-132` | 草稿 token 追加进 seq 后，rank1 通过命令 pickle 自动拿到 |
-| 全词表采样（温度路径） | `sampler.py:13-15`（gumbel 逆 CDF） | 拒绝采样需要的分布采样已存在，只是没暴露 probs |
-| dense 模型加载 + TP 分片 | §3.2 | 0.6B 草稿直接加载 |
-
-### 4.2 必改的 5 处（按实现顺序）
-
-1. **ParallelLMHead 只回 last-token logits**（`embed_head.py:58-60`：`last_indices = context.cu_seqlens_q[1:] - 1`）——verify 需要 k+1 个位置的全部 logits 来逐位置比对。改法：加 `return_all_positions` 开关（prefill 正常路径不变，verify 前向打开）。**这是第一刀，最简单。**
-2. **单模型架构 → 双模型**：`Config` 包一个 hf_config（config.py:66）、`ModelRunner` 建一个模型一个 kv_cache（model_runner.py:52-66, 404-438）、`__init__` 里 default dtype/device 的切换舞（model_runner.py:45-51, 72-73）。方案：`SpecModelRunner` 组合两个 ModelRunner？——不推荐；最小方案是 ModelRunner 加可选 `draft_config/draft_model/draft_kv_cache` 三件套 + `run_draft` 方法（draft 同样 TP2 分片，见第 4 点）。**KV 分配顺序：先 target 权重 → draft 权重 → 一次 allocate_kv_cache 各算各的**（draft KV 很小：28 层×2 KV头/rank）。
-3. **Scheduler.postprocess 硬编码 1 token/seq**（`scheduler.py:229-235`：`zip(seqs, token_ids)` 1:1）——接受 j 个 token 时要循环 append j 次并正确推进 block 分配（`may_append` 只在块边界触发，block_manager.py:109-114）。需要新的 `postprocess_spec(seqs, accepted_tokens_list)`。
-4. **draft 必须 TP2 双 rank 分片，不能 rank0-only**：所有并行层构造时绑定全局进程组（linear.py:23-24、embed_head.py:17-18）且 tp>1 时无条件 all_reduce——rank0-only 跑 draft 会立即与 rank1 desync/hang。draft TP2 分片（0.6B 分片后 8 q头/4 kv头，assert 满足 qwen3.py:31-34）顺着现有 `call()` 通道走，零新通信原语（引擎目前没有 broadcast/send/recv，`grep` 确认）。token 由 rank0 采样后通过命令 pickle 广播（天然，见 4.1）。
-5. **回滚的两个案例**：
-   - **块内回滚（最后一个 token 未到块边界）：零改动**。pop token、`num_tokens -= 1`，下个 decode 步重算同一 slot（model_runner.py:502 公式重推导）；超出 context_lens 的旧 KV 在 sdpa（attention.py:176-183）和 triton_paged 里都被 mask。
-   - **块边界回滚：要加 API**。`BlockManager` 需要①从 `seq.block_table` pop 最后一块还回 free 列表；②**作废该块已提交的 prefix-cache hash**（block_manager.py:116-126 在 postprocess 提交——含被拒 token 的块如果留在 hash 表里，未来序列会前缀命中一个"脏块"）。粗办法 `clear_prefix_cache()`（block_manager.py:140-145）能用但伤命中率；正确做法是 targeted hash removal。**greedy MVP 可以先限制"接受点不跨块边界回滚"绕开**（拒绝时保留多写的那一块，浪费 ≤1 块 KV）。
-
-### 4.3 工程量与阶段拆分（供排期）
-
-| 阶段 | 内容 | 预估 |
-|---|---|---|
-| Phase 1a | greedy MVP：draft 自回归 k 步（无 KV 复用也行，k 小）→ verify 一次前向 → 逐位置贪心比对 → 接受前缀 + 块内回滚 | 2–3 夜（改 4.2 的 1/2/3/4；①③是纯逻辑，②是体力活） |
-| Phase 1b | draft KV cache 接入（draft 也用 paged KV，草稿步 O(1)）+ batch 化（每条 seq 独立接受数） | 1–2 夜 |
-| Phase 2 | 温度>0 的标准拒绝采样（verify 需要 target probs：sampler 返回 (token, probs)，拒绝采样 gumbel 比对）；在线 API server 接入；在线容量复测 | 2 夜 |
-| Phase 3 | 图化（draft/verify 各自捕获，受制 I1）、EAGLE3 头、长度自适应 k | 可选 |
-
-### 4.4 风险清单
-
-| 风险 | 影响 | 缓解 |
-|---|---|---|
-| α 实测低于 0.45（社区数字偏乐观） | 单流 <1.3×，白干 | **Phase 0 冻结门 ≥1.3×，先测后写代码** |
-| 每步 MCCL all-reduce 次数 ×(k+2)（draft k 次 + verify 1 次 + 采样同步） | 0.08 ms/次 ×增量 在 165 ms 步里占比小，但批模式会放大 | Phase 1a 实测每步分解；必要时 draft 用张量并行外的副本（见下条） |
-| draft TP2 引入的 rank 同步开销 | 每 draft 步 2×all-reduce×28 层 | 0.6B 分片后单层小，先测；如果 draft 通信占比 >20%，考虑 draft 整卡副本（rank 各自完整副本、独立贪心确定性 → 无需同步；两边算的一样的贪心结果） |
-| verify 批形状 (bs×4) 触发未测过的 kernel 路径 | 潜在数值/性能意外 | Phase 1a 先 eager + sdpa 路径打通，kernel 走已验证组合 |
-| 与前缀缓存交互（4.2-5 的脏块） | 罕见但致命的正确性 bug | MVP 先"不跨块边界回滚"+ 检测到边界拒绝时 clear_prefix_cache 一次 |
-| I1 图楔死若未来叠加 | 图+spec 是 Phase 3 的事 | 正交，先不管 |
+**I4 的影响（新增）**：既然 SDPA 与 paged 在 bf16 下有稳定的数值路径差异（近 20/8928 步 top-1 翻转），**α 的测量与生产必须用同一个 attention 后端**（本项目 = SDPA），否则测出的接受率不能直接外推。spec 的正确性不受影响（输出 ≡ target 自身贪心轨迹，这是代数保证）。
 
 ---
 
 ## 5. 厂商生态手搓边界（autotune 详解）
 
-### 5.1 我们的 triton_paged kernel（✅ 搓得动，性价比最高）
+### 5.1 我们的 triton_paged kernel（✅ 搓得动）
 
-现状：`paged_attention.py:26-92` 是纯 `@triton.jit`（全仓库没有任何 `@triton.autotune`），launcher `paged_attention.py:95-132` 把三个元参数写死：
+现状：`paged_attention.py:26-92` 纯 `@triton.jit`，全仓库无任何 `@triton.autotune`；launcher 写死 `BLOCK_N=32, num_warps=4, num_stages=1`（:128-130）。约束：head_dim==128、page_size==256、GQA 整除（:105-108）；**`context_len` 是 runtime 循环边界**（:54-56），扫参不要把它 constexpr 化（会破坏 MUSA graph 的 kernel 复用）。
 
-```python
-# paged_attention.py:128-130（现状）
-_paged_decode_kernel[grid](  # grid = (batch, num_heads)
-    ..., BLOCK_N=32, num_warps=4, num_stages=1,
-)
-```
+方案：网格 `BLOCK_N∈{16,32,64,128} × warps∈{2,4,8} × stages∈{1..4}`（≤64 组）× 桶 `(batch∈{1,4,16,32,64}, kv∈{≤1k,≤4k,>4k})`；计时复用 `p6_moe_microbench.py` 的 `time_call`（5 warmup + musa.Event + synchronize，:179-190），每配置独立子进程（:283-298）；产出 `configs/paged_decode_MTT_S4000.json` + sha256 绑定 kernel 源（参照 expert-map 的 sha256 门控，qwen3_moe.py:146-153）。预算：一发 30B 加载 30–60 min。
 
-约束（不改）：`head_dim==128`、`page_size==256`、GQA 整除（paged_attention.py:105-108 的 assert）；`context_len` 故意是 runtime 循环边界（paged_attention.py:54-56）以兼容 MUSA graph 捕获——**扫参不要把它 constexpr 化**。
+### 5.2 vLLM fused_moe（✅ 搓得动，低优先）
 
-手搓方案（离线 autotune）：
-1. 扫描网格：`BLOCK_N ∈ {16,32,64,128}` × `num_warps ∈ {2,4,8}` × `num_stages ∈ {1,2,3,4}`（≤64 组合），按 (batch 桶 ∈ {1,4,16,32,64}, kv-len 桶 ∈ {≤1k, ≤4k, >4k}) 分桶计时。
-2. 计时方法复用 `p6_moe_microbench.py` 的 `time_call`（5 warmup + musa.Event 双事件 + synchronize，179-190 行）；每个配置独立子进程（失败 capture 污染流，283-298 行的先例）。
-3. 产出 `configs/paged_decode_MTT_S4000.json`：`{"(bs_bucket,kv_bucket)": {"BLOCK_N":..,"num_warps":..,"num_stages":..}}`；launcher 改为查表 + fallback 默认（表带 sha256 绑定 kernel 源版本——参照 expert-map 的 sha256 门控先例，qwen3_moe.py:146-153）。
-4. **与 I4 合并**：kernel 变快的同时审页边界/掩码的一致性分歧（I4 的 0.875<0.99）；一次加载同时出 autotune 表 + 分歧定位数据。
-5. 预算：一发 30B 加载跑完全部分桶扫描（每组合 ~2 s 计时 × 64 组合 × 若干桶 ≈ 30–60 min GPU 时间）。
+缺 `configs/E=64,N=768,device_name=MTT_S4000.json` → 默认配置慢 2.3–6.3×。搓法 A（零代码）：`VLLM_TUNED_CONFIG_FOLDER` 指向自生成 JSON（`docs/P5-moe-optimization-survey.md:64` 已规划，30–45 min 一发）；搓法 B（进程内）：`vendor_moe.py:29-45` 的 source-rebind 机制已在用，可注入 config dict。**低优先**：decode 侧 bmm_dense（1.27–2.86 ms/层）已更快；只有当 autotune 后的厂商 kernel 在 **prefill 大批**（2k–4k token）明显快于 grouped_mm 时才值得。
 
-### 5.2 vLLM fused_moe（✅ 搓得动，但优先级低）
+### 5.3 搓不动的（避免下轮浪费时间）
 
-- 机制：vLLM 的 fused_moe 按 `(E, N, device_name)` 查 `configs/*.json`；缺 `E=64,N=768,device_name=MTT_S4000.json` 时落到默认配置——P6b 实测默认比 grouped_mm 慢 2.3–6.3×。
-- 搓法 A（零代码）：`VLLM_TUNED_CONFIG_FOLDER` 指向我们生成的 JSON（扫描 `BLOCK_M/N/K × GROUP_M × warps × stages` 按 M 桶取最优——`docs/P5-moe-optimization-survey.md:64` 已写过这条路线，30–45 min 一发）。
-- 搓法 B（进程内）：`vendor_moe.py:29-45` 的 source-rebind 机制（inspect.getsource + 字符串替换 + exec 回模块命名空间）已在用，同一机制可把最优 config dict 直接织进 `fused_experts_impl`。
-- **为什么不急**：decode 侧 bmm_dense 单层 1.27–2.86 ms 已显著快于厂商 kernel 调好后的大概水平，且 prefill 侧 grouped_mm 够用；只有当 autotune 后的厂商 kernel 在 **prefill 大批**（几千 token）上明显快于 grouped_mm 时才有价值——这条 Phase 0 顺手测一下（`p6_moe_microbench.py --batches 512,2048`）。
-
-### 5.3 搓不动的部分（明确列出，避免下一轮浪费时间）
-
-- `torch._grouped_mm`：闭源厂商 op，无任何用户可见旋钮（qwen3_moe.py:248/256 是唯一调用点）。变慢的根因是固定开销（~1 TFLOP/s 上限已在 qwen3_moe.py:284-205 注释）——**不要试图调它，绕过它（bmm_dense 已做）**。
-- MUSAGraph replay 楔死（I1）：driver 层，8B 修复不可迁移已证。
-- MCCL 内部算法选择、watchdog 行为（I18）：runtime 层。
-- mp22 fast path 数值错误（I17）：厂商 kernel bug，报修。
+- `torch._grouped_mm`：闭源固定 op（qwen3_moe.py:248,256 唯一调用点），约 1 TFLOP/s 固定开销上限（:284-285 注释）——**绕过而非调优**（bmm_dense 已做）。
+- MUSAGraph replay 漂移（I1/I2）：已在控制组复现（tiny MoE 0/5、8B 0/5），driver 层；`enforce_eager=True` 保持。
+- MCCL 算法选择、watchdog 行为：runtime 层。
 
 ---
 
-## 6. Phase 0 测量计划（已冻结门，执行中）
+## 6. Phase 0 测量计划（脚本已就绪，等待 GPU）
 
-| 步骤 | 内容 | 产出 | GPU 成本 |
+| 步骤 | 命令/脚本 | 产出 | 成本 |
 |---|---|---|---|
-| 0a | 0.6B/1.7B draft 步时间微基准（b1/b8/b32，TP2，贪心，eager） | `p7_draft_steps.json` → c 实测 | 无 30B 加载，~10 min |
-| 0b | 30B 参考生成：32 条真实 chat prompt × 128 token 贪心（采用栈）+ b1/b8 步时 | `p7_target_ref.json` → target 步时基线 | 1 次 30B 加载（可与 I5/I7 共发） |
-| 0c | 0.6B/1.7B 对同一 prompt 集贪心重放 → 逐 token 前缀一致率 α(k) 曲线 | `p7_alpha.json` → α 实测 | 同 0b 加载内完成 |
-| 判定 | `speedup(k=3) = (1-α⁴)/(1-α) / (1+4c)`（用实测 α、c） | **go/no-go 写进本文件 §7** | — |
+| 0a | `tests/p7_draft_steps.py`（0.6B/1.7B × b1/b8/b32，TP2，eager，贪心） | `p7_draft_steps.json` → **c 实测** | 无 30B，~10 min |
+| 0b | `tests/p7_alpha_target.py`（32 条真实 chat prompt × 128 token，采用栈贪心） | `p7_target_ref.json` → target 参考轨迹 + 步时 | 1 次 30B 加载 |
+| 0c | `tests/p7_alpha_draft.py`（draft 重放 + LCP 统计 + 判决） | `p7_alpha.json` → **α 实测 + go/no-go** | 同 0b 加载内 |
+| 排队机制 | `/root/wait_p7.sh`（等 GPU 空闲 → `/root/run_p7.sh` 链式执行） | 自动 | — |
 
-**冻结门：k=3 单流预测加速 ≥ 1.3× 才进 Phase 1；<1.3× 归档结论、关闭 P7。**
-次级记录：k=1..5 各点的 speedup 曲线（选最优 k）；b32 批模式的 draft/verify 步时（容量侧参考）。
-
----
-
-## 7. Phase 0 结果（待回填）
-
-（0a/0b/0c 结果与 go/no-go 判定将在测量完成后回填本节。）
+**说明**：0a 的 draft 步时也能从 0c 的加载里顺带测（同进程），但分开跑可以先拿到 c 而不占 30B。
 
 ---
 
-## 8. 来源
+## 7. 判决表与 Go/No-Go
 
-- [Qwen3-30B-A3B-Instruct-2507 HF 模型卡](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507)（无 MTP 权重）
-- [vLLM MTP 文档](https://vllm.website.cncfstack.com/features/speculative_decoding/mtp)（MTP 仅限自带多 token 预测头的模型，如 Qwen3-Next）
-- [amd/PARD-Qwen3-0.6B](https://huggingface.co/amd/PARD-Qwen3-0.6B)（0.6B 草稿变体，vLLM 内 3.06× 声称）
-- [vllm-ascend/Qwen3-a3B_eagle3（ModelScope）](https://www.modelscope.cn/models/vllm-ascend/Qwen3-a3B_eagle3)（社区 EAGLE3 头，Qwen3-30B-A3B）
-- [vLLM speculative decoding 指南（论坛）](https://discuss.vllm.ai/t/how-to-use-speculative-decoding/562)
-- 项目内实测：`benchmarks/P6-nightly.md`、`benchmarks/P6-serving-v3.md`、`docs/P6-open-issues.md`（I4/I5/I7 等）
-- 代码勘察：两个 Explore 代理的逐行报告（2026-10-27），所有 file:line 均为本仓库当前 HEAD（f097ec6）
+### 7.1 加速判决表（预计算，最新 k ∈ 1..5 取最优）
+
+`speedup = (1-α^(k+1))/(1-α) / (1+(k+1)c)`，加粗 = **≥1.3×（立项门）**：
+
+| α \ c | 0.08 | 0.10 | 0.12 | 0.15 | 0.20 | 0.25 | 0.30 | 0.35 | 0.40 |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.30 | 1.12 | 1.08 | 1.05 | 1.00 | 0.93 | 0.87 | 0.81 | 0.76 | 0.72 |
+| 0.35 | 1.19 | 1.13 | 1.09 | 1.04 | 0.96 | 0.90 | 0.84 | 0.79 | 0.75 |
+| 0.40 | 1.26 | 1.20 | 1.15 | 1.08 | 1.00 | 0.93 | 0.87 | 0.82 | 0.78 |
+| 0.45 | **1.33** | 1.27 | 1.22 | 1.14 | 1.04 | 0.97 | 0.91 | 0.85 | 0.81 |
+| 0.50 | **1.42** | **1.35** | 1.29 | 1.21 | 1.09 | 1.00 | 0.94 | 0.88 | 0.83 |
+| 0.55 | **1.53** | **1.44** | **1.36** | 1.28 | 1.16 | 1.06 | 0.98 | 0.91 | 0.86 |
+| 0.60 | **1.65** | **1.55** | **1.47** | **1.36** | 1.22 | 1.12 | 1.03 | 0.96 | 0.89 |
+| 0.65 | **1.80** | **1.68** | **1.59** | **1.47** | **1.30** | 1.18 | 1.09 | 1.01 | 0.94 |
+| 0.70 | **1.99** | **1.85** | **1.73** | **1.58** | **1.41** | 1.27 | 1.15 | 1.07 | 1.00 |
+| 0.75 | **2.22** | **2.06** | **1.91** | **1.74** | **1.53** | **1.37** | 1.24 | 1.14 | 1.05 |
+| 0.80 | **2.49** | **2.31** | **2.14** | **1.94** | **1.68** | **1.49** | **1.34** | 1.23 | 1.14 |
+
+**读表要点**：
+- **0.6B 的 c≈0.10 → α 只需 ≥0.50 就有 1.35×；α=0.55 → 1.44×；α=0.60 → 1.55×。**
+- **1.7B 的 c≈0.25 → 需要 α≥0.72 才有 1.3×**（而 0.6B 同 α 下是 1.27+，所以 1.7B 只有在 α 比 0.6B 高出 0.15 以上时才值得）。
+- **4B 的 c≈0.4 → α 必须 ≥0.78 才勉强 1.14×**，实际上不可能赢 → 排除。
+- 若实测 α 只有 0.4 且 c=0.10 → 1.20×，**低于门 → 不立项**（这是"先测后写"的价值）。
+
+### 7.2 待填的实测值
+
+| 量 | 预期 | 实测 | 来源 |
+|---|---|---|---|
+| c(0.6B, b1) | 0.07–0.12 | ⏳ | Phase 0a |
+| c(1.7B, b1) | 0.20–0.30 | ⏳ | Phase 0a |
+| α(0.6B) | 0.40–0.60 | ⏳ | Phase 0c |
+| α(1.7B) | 0.60–0.80 | ⏳ | Phase 0c |
+| 最优 k | 3–4 | ⏳ | Phase 0c |
+
+### 7.3 Go/No-Go 规则（冻结）
+
+1. 取实测 (α, c)，查 §7.1 表得最优 k 与该 k 下的加速。
+2. **加速 ≥ 1.3× → go**，进实施计划 M1；**< 1.3× → no-go**，归档本报告并关闭 P7（不开工）。
+3. 若 0.6B 与 1.7B 都在门内，选**加速更高**者；若 0.6B 在门内而 1.7B 不在，直接选 0.6B。
+4. 次级记录（不改判决）：k=1..5 曲线用于定 k；b32 批模式的 c/α 用于容量侧参考。
+
+### 7.4 Phase 0 结果
+
+（⏳ 待回填：0a→c、0b→target 参考、0c→α 与判决。GPU 当前被 I8 长上下文实验占用，`/root/wait_p7.sh` 已排队自动接力。）
+
+---
+
+## 8. 风险与不确定性（诚实清单）
+
+| 项 | 说明 |
+|---|---|
+| α 可能低于社区数字 | 社区 40–60% 来自不同硬件/采样配置；我们的 32 条 chat prompt 偏"知识型"，α 可能更低（开放域长尾）。Phase 0c 用贪心 + 真实 chat prompt 就是要避免乐观偏差。 |
+| draft 步时估计可能偏乐观 | 若 0.6B 在 TP2 上受 MCCL 拖累（56 次 all-reduce ≈ 4.5 ms 只是下限），c 可能到 0.15 → 门内仍可（α 需 0.55）。若 c>0.2 则 0.6B 也危险。备选：draft 用**双 rank 整卡副本**（贪心确定 → 无同步；省掉 56 次 all-reduce），需 Phase 0a 后决定。 |
+| 批模式收益不确定 | 在线饱和区（并发 24–27）的接受率与回滚气泡未测；不作立项依据。 |
+| prefix-cache 脏块 | 块边界拒绝需作废 hash；MVP 用 `clear_prefix_cache()` 兜底（正确但伤命中率），1b 做 targeted unhash。 |
+| 工程量 | greedy MVP 2–3 夜，1b 1–2 夜，温度 2 夜（见实施计划 §5）。 |
+
+---
+
+## 9. 来源与参考
+
+**外部**
+- [Qwen3-30B-A3B-Instruct-2507（HF 模型卡）](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) — 无 MTP 权重
+- [vLLM MTP 文档](https://vllm.website.cncfstack.com/features/speculative_decoding/mtp) — MTP 仅适用自带多 token 预测头的模型
+- [amd/PARD-Qwen3-0.6B](https://huggingface.co/amd/PARD-Qwen3-0.6B) — 0.6B 草稿变体
+- [vllm-ascend/Qwen3-a3B_eagle3（ModelScope）](https://www.modelscope.cn/models/vllm-ascend/Qwen3-a3B_eagle3) — 社区 EAGLE3 头
+- [vLLM 论坛：如何使用投机解码](https://discuss.vllm.ai/t/how-to-use-speculative-decoding/562)
+- Leviathan et al., *Fast Inference from Transformers via Speculative Decoding*, ICML 2023 — 拒绝采样与分布不变性
+- Chen et al., *SpecDec++* 2024 — 动态 k；Cai et al., *Medusa* 2024 — 多头并行草稿；Li et al., *EAGLE-1/2/3* — hidden-state 草稿头
+
+**项目内**
+- `docs/P7-implementation-plan.md` — 实施计划（代码方案/算法/测试门/排期/参考实现）
+- `docs/P6-I4-attention-logits.md` — I4 定位（bf16 累加路径差异）
+- `benchmarks/P6-nightly.md`、`benchmarks/P6-serving-v3.md`、`benchmarks/P6-i5-i6-i7.md` — target 步时与容量基线
+- `docs/P6-open-issues.md` — 18 项问题台账
+- 代码锚点：`model_runner.py:169-191`（KV 快照）、`:446-491`（多 token 前向）、`embed_head.py:58-60`、`scheduler.py:229`、`block_manager.py:116-145`、`paged_attention.py:128-130`、`vendor_moe.py:29-45`
