@@ -261,7 +261,7 @@ v3 的目标：**同一份 JSON 能回答"容量多少、瓶颈在哪、结论�
 | 2 | `nanovllm/engine/sequence.py` | 增加 `prefill_s`/`decode_s` 派生字段（不改时间戳） | 0.2 h |
 | 3 | `nanovllm/entrypoints/openai/api_server.py` | 流式响应在 `stream_options.include_metrics=true` 时，最后一块带 `metrics`（queue/ttft/tpot/e2e/itls） | 0.5 h |
 | 4 | `scripts/benchmark_online.py` | `--mode concurrency`、`--repeats`、`--request-timeout-s`、`--duration`、`--prompt-mode mixed`、GPU 采样、summary v3、报告表出 p99 | 1.5 h |
-| 5 | `scripts/p2_benchmark.py` | `--prompt-source chat|synthetic`、pooled 百分位、p99、total tok/s 进 summary、attention 后端也进验证 | 0.8 h |
+| 5 | `scripts/p2_benchmark.py` | `--prompt-source chat/synthetic`、pooled 百分位、p99、total tok/s 进 summary、attention 后端也进验证 | 0.8 h |
 | 6 | `nanovllm/prometheus_metrics.py` | `prefix_cache_hit_rate` gauge（hit_tokens/prompt_tokens 窗口） | 0.2 h |
 | 7 | `tests/test_benchmarking_v3.py`（新） | Wilson/token goodput/ITL SLO/error 分桶/linear 百分位/schema 回放 | 0.5 h |
 
@@ -336,3 +336,19 @@ v2 不可比项；单实例/单客户端；固定形状或 mixed 分布。
 ## 9. 一句话
 
 v2 已经能测出"四档 100% SLO"；v3 要能回答"**这个 100% 有多确定、慢在排队还是算、在多少并发下会崩、达标的是多少 token**"。
+
+---
+
+## 10. 评审补充（2026-10-27 20:10）
+
+本轮实测暴露了 7 个 v3 必须处理的点；它们不改变上面的定义，只增加约束。
+
+1. **口径连续性**：`slo_standard`（请求级 TPOT）是 v2/v3/v4 的可比口径；`slo_strict`（max ITL）是新增的、**不与历史直接比**。任何"容量提升/回归"结论必须注明用哪套；只报 `slo_strict` 视为口径漂移。
+2. **p99 的统计功效**：128 请求的 p99 实际是第 2 大值，run-to-run 波动极大。规则：**每点 <500 请求时 p99 标 `p99_reference_only`，不得用于判决**；要下 p99 结论就把 `--requests` 提到 500+。p95 在 128 样本下可用，但仍需报重复极差。
+3. **拒绝与超时是独立桶**：`reject_429`（服务端主动拒绝）、`timeout`（客户端超时）与 `stream`（连接中断）必须分开计数；超时的请求**必须调用 `engine.cancel`**，否则服务端仍占 KV slot，污染后续档位。
+4. **服务端拆分**：在线也要报 `queue_s / prefill_s / decode_s`（来自 `--metrics-path` 的 step 记录：`mode`、`effective_batch`、`forward_s`），否则无法区分"TTFT 高是排队还是 prefill 慢"。I8 的结论（TTFT 3.84 s vs 空闲 0.368 s）就是靠这组数据定位的。
+5. **warmup 与 JIT 隔离**：paged 的 Triton 编译发生在服务端首次 decode；4 条 warmup 必须全部完成后再开始计时，并在报告里注明"已预热"。首档的第一个请求若含编译，TTFT 会被污染。
+6. **两种工作负载分列**：`shared`（共享前缀，测缓存/吞吐）与 `unique`（无前缀复用，测真实长尾）不能混在一张表里下结论；v3 报告必须两列都给，或明确只跑了哪一种。
+7. **重复与噪声**：同一档位的 run-to-run 极差在 v3/v4 已观察到 >5%（v3 90% 档 TPOT p95 0.312 vs v4 0.257 不是同一栈，但同栈重复也曾出现 100% vs 84.4% 的 SLO）。**单个点的一次结果不得作为回归结论**；回归门用 ≥2 次重复的中位数。
+
+**记录要求**：每份 v3 报告的表头必须写 `schema_version`、`slo_definition`（standard/strict）、`prompt_mode`、`warmup_done`、`percentile_method` 五个字段，缺一不可复现。

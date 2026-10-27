@@ -17,9 +17,9 @@
 | 负载均衡 | synthetic 下 rank 间不平衡 1.7–5.2%；`profiled` 放置已实现但从未在真实负载使用；折叠到 expert 0 使口径偏低 | **"看起来没问题"尚未被真实负载证实** | 真实 prompt 测量 + `linear` vs `profiled` A/B（门 ≥5%） |
 | MegaMoe | 无单 kernel；route/pack 558.8 ms 与两次 GEMM 同量级 | **字面 MegaMoe 不可搬，可搬子集明确** | 自研 fused route/pack（Triton），先微基准再改引擎 |
 | benchmark | 开放环 Poisson、`[DONE]` 校验、usage token、请求级 TPOT/ITL、SLO goodput、p99 内部有 | **高于平均，但定义漂移 + 10 项缺口** | 升级 schema v3（见专项） |
-| 最大杠杆 | I19：0.6B 步时 63.2 ms 中 forward 98.2%，每层固定开销 ~1.4 ms；30B b1 177.6 ms 中 forward 95.5% | **仍未定性（launch-bound vs 单 kernel 慢）** | 0.6B 逐层计时（脚本已就绪）→ 图或点名慢 kernel |
+| 最大杠杆 | I19：0.6B 步时 53.7–61.2 ms 中 kernel 设备时间仅 29.3–32.4 ms，**2,401 次 launch/步、13.5 µs/次**；每层 host 发射 ≈ 整步 | **已测：launch/CPU-bound**（`device_busy` 0.478–0.603） | fused RMSNorm/RoPE（约 1,500/2,401 launches）→ 图（4 h 硬停） |
 
-**一句话**：decode 路径的"算子收益"（bmm_dense + paged）已经吃干；剩下的空间在**每步固定成本（I19）**、**图重放**、**长上下文/容量**、**MoE 融合**四条线上，其中只有前两条能同时改善单流延迟和在线容量。
+**一句话**：decode 路径的"算子收益"（bmm_dense + paged）已经吃干；剩下的空间在**每步固定成本（I19，已确认 launch-bound）**、**图重放**、**长上下文/容量**、**MoE 容量收缩**四条线上；前三条同时改善单流与在线容量，容量收缩则是 30B 唯一可能改变容量曲线的单点。
 
 ---
 
@@ -117,7 +117,7 @@ mixed step 还会走 `prepare_prefill`（`model_runner.py:579`），因此：
 1. **KV admission 是整段预留**：`can_allocate`/`allocate` 在首个 chunk 前就要求整个剩余 prompt 的块（`block_manager.py:66, 76-78, 96-97`）。chunked prefill 只限制**每步算力**，不限制**KV 占用**；长 prompt 的准入仍是一次性的。
 2. **KV 耗尽不是优雅拒绝，是 assert**：FCFS 在无可调度项时 `assert scheduled_seqs`（`scheduler.py:125`）；stall-free 同理（`scheduler.py:203`）。`add_request` 不校验 `max_model_len`/容量（`llm_engine.py:75-80`）。对外表现为连接挂死或进程崩溃，而不是 429。
 3. **FCFS 不把 decode 计入 token 预算，也不看 running 就排 prefill**（`scheduler.py:108-127`）——这是被 stall_free 取代的原因，但 `fcfs` 仍是离线默认，跨策略比较时要注意。
-4. **每个 rank 独立算 KV 块数**：30B 实测 rank0 730 / rank1 728（`benchmarks/P6-serving-v4.md:54`，逻辑在 `model_runner.py:436-449`）。块表只由 rank0 分配，若 rank0 发出 block 729，rank1 的 KV tensor 只有 728 块 → **越界**。当前未观察到崩溃，但这是 latent correctness bug。
+4. **每个 rank 独立算 KV 块数**：30B 实测 rank0 730 / rank1 728（`benchmarks/P6-serving-v4.md:54`，逻辑在 `model_runner.py:436-449`）。块表只由 rank0 分配，若 rank0 发出 block 729，rank1 的 KV tensor 只有 728 块 → **越界**。**已升级为 P0 卫生项**（24h 计划 §4.1）：广播 `min(num_blocks)`，否则长上下文/高并发下的 latent OOB 会先烧掉一次 30B 加载。
 5. **前缀缓存无淘汰**：`free_block_ids` 是 FIFO，hash 表只在块被重新分配时被动失效（`block_manager.py:46-52, 100-107`）。长跑后"看似有缓存、实际命中率下降"。
 6. **`stall_free_lpm` 的候选扫描是 O(waiting × blocks)**，且先选最长前缀再检查容量，容量失败直接 break（`scheduler.py:132-143, 181-184`）→ 队头阻塞。
 7. **mixed step 强制走 prefill 后端**（§1.3），decode 行拿不到 `bmm_dense`/paged 的收益（paged 仍会走 `_forward_decode` 吗？不会：`is_prefill=True` 时 `forward` 直接进 `_forward_prefill`，`attention.py:119-122`）。
@@ -151,7 +151,7 @@ mixed step 还会走 `prepare_prefill`（`model_runner.py:579`），因此：
 
 **判断**：paged 的"换后端"收益已经吃完。下一层是 ① autotune（E1，30–60 min，预期个位数百分比）；② KV 量化（I20，容量翻倍，但要新数值门）。两者都不是 24h 的必做项。
 
-### 2.6 投机解码（用户问题 1 的一部分）
+### 2.6 投机解码（已关闭，不再排期）
 
 **引擎里没有任何投机钩子**：`postprocess` 硬编码每 seq 每步 1 token（`scheduler.py:227-252`）；`ParallelLMHead` 只回 last-token logits（`embed_head.py:58-60`）；BlockManager 没有回滚 API。所以"是否支持"的答案是：**完全没有，只有测量脚本和设计文档**。
 
@@ -298,15 +298,15 @@ mixed step 还会走 `prepare_prefill`（`model_runner.py:579`），因此：
 | 30B b1 forward 占比 | 95.5% | 固定成本在层内 kernel |
 | 30B b32 sample | 36.6 ms（13.7%） | 独立目标 |
 
-### 4.2 两种假设与判别
+### 4.2 两种假设与判别（已判定：launch-bound）
 
 | 假设 | 现象 | 判别 | 若成立的对策 |
 |---|---|---|---|
-| **launch-bound** | 每层很多小 kernel，GPU 在 kernel 之间空转；`device_busy < 0.70` | 逐层 host wall ≈ device span；profiler 显示 kernel 多而短 | 图重放（I1）、kernel 合并、减少 host sync |
-| **单 kernel 慢** | 某些 kernel 本身慢；`device_busy ≥ 0.90` | profiler top-kernel 吃大头 | 点名优化（paged? bmm? layernorm?） |
+| **launch-bound** ✅ | 每层很多小 kernel，GPU 在 kernel 之间空转；`device_busy < 0.70` | 逐层 host wall ≈ device span；profiler 显示 kernel 多而短 | 图重放（I1）、kernel 合并、减少 host sync |
+| 单 kernel 慢 | 某些 kernel 本身慢；`device_busy ≥ 0.90` | profiler top-kernel 吃大头 | 点名优化（paged? bmm? layernorm?） |
 | 混合 | 两者都有 | 0.70–0.90 | 先做便宜的 sync 消除，再按 top kernel 处理 |
 
-判别脚本已就绪：`tests/p6_layer_timing.py`（A 异步 hook / B 逐层 sync / C profiler），分类阈值写死在 docstring 与 `classify()`（`device_busy <0.70 launch_bound / ≥0.90 kernel_bound`）。
+**实测结论（2026-10-27，`benchmarks/P6-layer-timing.md`）**：0.6B TP1 eager b1 两次重复——步时 53.7–61.2 ms、kernel 设备时间 29.3–32.4 ms、`device_busy` **0.478–0.603**；每步 **2,401 次 launch**（35 种 kernel，13.5 µs/次）；每层 host 1.84–2.13 ms × 28 ≈ 整步。**GPU 空转 ~40%，CPU 发射是关键路径。**
 
 ### 4.3 无论哪种假设都成立的便宜项
 
@@ -316,6 +316,18 @@ mixed step 还会走 `prepare_prefill`（`model_runner.py:579`），因此：
 4. **`postprocess` 的 Python `hash_blocks` + `running.remove`**：每步纯 Python，长上下文时块多，需 profile 后再决定。
 
 这三项都不改变数值路径（argmax 与贪心分支不变），可以用"token 全等 + 时间"双门验证。
+
+### 4.4 融合清单（按 launch 数排序，来自 profiler 类型计数）
+
+| 来源 | 每层 launch（约） | 28 层合计 | 代码 | 融合方案 |
+|---|---:|---:|---|---|
+| **RMSNorm ×2**（fp32 上采样：cast→add→to→pow→mean→add→rsqrt→mul→to→mul） | ~18 | **~1,000** | `layernorm.py:24-38` | bf16 进出、fp32 内累加的单 kernel，同时产出 residual |
+| **RoPE**（chunk + 4 乘加 + cat + cast，q/k 各一遍） | ~18 | ~500 | `rotary_embedding.py:12-15` | cos/sin 查表 + 单 kernel 旋转 |
+| SDPA decode 的 mask/gather/select/concat | ~6 | 168 | `attention.py:160-192` | **paged 已替代**（decode-only），无需再融合 |
+| GEMV/GEMM | ~4 | 113 | — | 真正算力，合计 ~3.4 ms，不动 |
+| sampler host sync | — | 2 次/步 | `sampler.py:11,16` | host 侧算 `all_greedy`，不进 kernel |
+
+**为什么 `torch.compile` 帮不上**：`compat.py:14` 在 MUSA 上默认 `ENABLE_COMPILE=0`，inductor 无 MUSA 后端；`maybe_compile` 是空装饰器。融合必须手写 Triton，并对每个 kernel 走一次 L2 数值门（翻转率 <0.5%）。
 
 ---
 
@@ -423,3 +435,22 @@ mixed step 还会走 `prepare_prefill`（`model_runner.py:579`），因此：
 - MegaMoe / DeepEP：FP8 + TMA + persistent kernel + all-to-all；本项目的 S4000 不具备前三者的硬件前提
 
 > 外部对标只作为"口径与设计"的参照；本项目所有数字以仓库内实测为准，不引用未验证的厂商声明。
+
+---
+
+## 9. 评审修订（2026-10-27 20:10）
+
+本轮 P0–P2 之后，以下判断被实测更新；本轮评审同时删除了不再有信息量的方向。
+
+| 本文原判断 | 更新后 | 证据 |
+|---|---|---|
+| I19 "仍未定性（launch-bound vs 单 kernel 慢）" | **launch/CPU-bound**：`device_busy` 0.478–0.603、2,401 launches/步、13.5 µs/次、每层 host ≈ 整步 | `benchmarks/P6-layer-timing.md` |
+| 长上下文"未覆盖/无效跑" | **已有效覆盖**：384/384、rank1 存活；三档 SLO 0%，瓶颈 TTFT（3.84/8.28/10.22 s p50），空闲单请求 TTFT 0.368 s | `benchmarks/P6-i8-long-context.md` |
+| I4 "L1–L4 过、L5 待" | **已转正**：四档 100% SLO、TPOT p95 −18.4%、paged 为默认 | `benchmarks/P6-serving-v4.md` |
+| 调度层缺三项（admission / 淘汰 / priority） | **本轮只补 admission/429、mixed-step 路由、HOL 阻塞**；淘汰与 radix tree 降为条件项（需小页 + 节点 LRU + 共享前缀负载） | 24h 计划 §4.5、§11 |
+| 投机解码"没有钩子、只有测量" | **关闭，不再排期**：模型草稿两次否决 + 离线解析上界（α 距 1.3× 门 142×） | `benchmarks/P7-spec-decode-addendum.md` |
+| MoE "融合 route/pack 第二优先" | **容量收缩升为第一优先**（bmm_dense 按 T×K 做 dense bmm，实际只需 counts.max()）；route/pack 次之 | `P8-moe-fusion-and-balance.md` §3 |
+| 图"价值待定" | **机制可用（`torch.musa.MUSAGraph`，捕获成功）**；卡点是 replay 漂移，padding-slot 是最强假设；paged 后需重估 launch 数；capture 前必须 JIT 预热 | `model_runner.py:563-571, 584`、24h 计划 §4.3 |
+| KV 块数 730/728 "latent bug" | **升级为 P0**：长上下文/高并发会先踩到越界 | 24h 计划 §4.1 |
+
+**已删除**：投机解码 Track（含"终裁"步骤）、I19 逐层计时步骤、I8 基线重测步骤；`133.0 tok/s` 保留为"来自 P6 eager matrix、未固化基线"的历史数字（`HANDOFF-P6c.md:17`），不重测。理由与复活条件见 `P8-24h-plan.md` §10。

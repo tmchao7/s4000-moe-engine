@@ -93,7 +93,8 @@ EP=2、K=8 时，每个 token 平均 **4 个 owned slot、4 个 non-owned slot**
 
 1. 打开 `collect_expert_stats`，用 32 条真实 chat prompt（中英各 16），prefill 512 / decode 64，记录每层全局 `expert_counts`。
 2. 新增一次性统计（不改主路径）：按 `global_to_local` 计算每层每 rank 的 `owned_counts[e]` 与 `folded_extra`（非 owned 但 local_id=0 的数量）。
-3. 输出：`expert_load_max/mean`、Gini、`rank_imbalance`、`expert0_ratio`、`waste_ratio = 1 - owned/total`。
+3. **计数点必须在 fold 之前**：在 `topk_ids` 处（`qwen3_moe.py:215-221` 之前）插桩，统计真实路由；`local_pairs` 只含 owned slot，**看不到 expert 0 的折叠倾斜，不可用于本项**。先确认现有 `expert_counts` 是在 fold 前还是 fold 后累加的——若在 fold 后，本项全部作废重测。
+4. 输出：`expert_load_max/mean`、Gini、`rank_imbalance`、`expert0_ratio`、`waste_ratio = 1 - owned/total`。
 
 **这是所有后续决策的前提**：如果真实路由的 `counts.max()` 接近 `T×K`（极端偏斜），容量收缩的收益会消失；如果接近平均值（正常），收益成立。
 
@@ -163,12 +164,12 @@ out = expert_out[sorted_ids, ranks] * weights
 | 每层 `counts.max().item()` 的 sync（48 次/步） | 实测开销；若 >2 ms，改为固定容量 C + 溢出 expert 回退 grouped_mm（或 graph 分桶） |
 | 小 M bmm 效率下降 | 实测；固定开销 1.2 ms 是下限，收益上限受它限制 |
 | 破坏图的单形状假设 | 图本来未启用；未来按 S 分桶捕获（4/8/16/32/64） |
-| 数值不一致 | 门：32 条 prompt × 128 token 与现行 bmm_dense **逐 token 全等**；不相等则降级为"数值等价但不同"并走 L1–L4 门（默认不采用） |
+| 数值不一致 | 门：先试 32 条 prompt × 128 token 与现行 bmm_dense **逐 token 全等**（bonus，不是硬门）；若 bmm 形状从 GEMM 退化为 GEMV 导致归约顺序变化，则走 L1 `max_abs ≤2e-3` + L2 翻转率 ≤0.5% + 自确定 3/3——这与 bmm_dense 当初采用的标准一致，不是降级 |
 
 ### 3.5 判决门（先写后跑）
 
-- 正确性：逐 token 全等（首选）；否则 L1 `max_abs ≤2e-3` + L2 翻转率 ≤0.5% + 两后端各 3 次确定。
-- 性能：b32 与 b64 的 **MoE 层时间 −≥20%**；decode 步时 −≥10%。
+- 正确性（**不要求与现行 bmm_dense 逐 token 全等**）：自确定 3/3（同一输入三次 token 一致）+ L1 `max_abs ≤2e-3` + L2 翻转率 ≤0.5%、翻转处 margin <0.5；逐 token 全等只作为 bonus 报告。
+- 性能：b32 与 b64 的 **MoE 层时间 −≥20%**；decode 步时 **−≥10%**；交错重复 ≥5 次、CV ≤5%。
 - 显存：`x_pad` 峰值不高于现状（应显著更低）。
 - 不过门：保留为 opt-in，不设默认。
 
@@ -276,14 +277,16 @@ P5 的 rank 间不平衡最大 5.19%（b32/c2048），低于预冻结 10% 门 �
 
 | 期 | 内容 | 成本 | 门 | 产出 |
 |---|---|---|---:|---|---|
-| M0 | 真实负载统计（§2.4） | 0.5 h | 每层 counts、S_max、waste/ratio | `p8_moe_balance.json` |
-| M1 | `linear` vs `profiled` A/B | 1.5 h | 吞吐 +5% 或 imbalance −10% | 采用/关闭 |
-| M2 | bmm_dense 容量收缩原型 | 2 h | token 全等；MoE −20%；步时 −10% | `p8_moe_capacity.json` |
+| M0 | 真实负载统计（§2.4，**fold 前计数**） | 0.5 h | 每层 counts、S_max、waste/ratio | `p8_moe_balance.json` |
+| M1 | **bmm_dense 容量收缩原型**（§3） | 2 h | 自确定 3/3 + L2 软门；MoE −20%；步时 −10% | `p8_moe_capacity.json` |
+| M2 | `linear` vs `profiled` A/B（容量收缩开启） | 1.5 h | 吞吐 +5% 或 imbalance −10% | 采用/关闭 |
 | M3 | fused route/pack 微基准 | 1.5 h | route −30%；MoE −5% | `p8_moe_fusion.json` + 设计 |
-| M4 | 改引擎主路径（下一轮） | 4–6 h | M2/M3 门 + 回归 | 默认切换 |
+| M4 | 改引擎主路径（下一轮） | 4–6 h | M1/M2/M3 门 + 回归 | 默认切换 |
 | M5 | KV 量化（I20，周级） | — | L1–L4 + 容量/带宽 | 另立 |
 
-**硬约束**：M2/M3 都只在 `decode_moe_backend` 上生效；不改 `moe_backend`（prefill）默认；不做全局 `bmm_dense`（prefill OOM）。
+**为什么 M1 在 M2 之前**：容量收缩是 30B 唯一可能改变容量曲线的单点（估算 decode MoE 层 −50~75%），且不需要真实负载统计就能实现；placement 的 +5% 门在容量收缩后才有意义（否则瓶颈仍在 dense bmm 的行数上，放置差异被掩盖）。
+
+**硬约束**：M1/M3 都只在 `decode_moe_backend` 上生效；不改 `moe_backend`（prefill）默认；不做全局 `bmm_dense`（prefill OOM）。
 
 ---
 
