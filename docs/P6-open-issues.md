@@ -3,7 +3,7 @@
 > 写于 2026-10-27 上午（夜间迭代 `96317e9` + 台账回填 `1c7c42b` 之后的自检）。
 > 方法：不凭记忆，逐份扫描本轮全部落盘证据（`docs/NIGHTLY-LOG.md`、`benchmarks/P6-nightly.md`、`benchmarks/data/p6b/` 下 13+ 份 JSON/日志、`docs/HANDOFF-P6c.md`）+ 本轮触过但没跑完的计划项，逐条登记现状、证据、影响、下一步。
 > 用途：给下一轮迭代的优先级输入；给用户的「没做到什么」清单。**凡是门没过的、没验证到的、解释不了的都在这里，一个不藏。**
-> **状态速览（2026-10-27 12:00 更新）**：18 项中 **✅ 已关闭 8**（I5/I6/I7 经补测关闭——b64 141.5 tok/s、前缀缓存 TTFT -25.6%、拐点修正为高方差软边界；I9 已解释；I10/I11/I13/I15 已修），**I4 已定位未转正**（bf16 累加路径放大，非页表 bug），**I1/I2 已重新定界为 MUSA graph runtime 限制**（控制组 0/5），未结 7（🔴 I1/I2、🟡 I3/I4/I8、🟢 I12/I14、⚪ I16–I18）。补测数据 `benchmarks/P6-i5-i6-i7.md`，I4 详情 `docs/P6-I4-attention-logits.md`。
+> **状态速览（2026-10-27，P6 覆盖/图隔离收口）**：18 项中 **✅ 已关闭 8**（I5/I6/I7/I9/I10/I11/I13/I15）；I4 已定位、冻结为 SDPA，未转正。仍需行动的有 9 项：本项目 I1/I2/I3/I8/I12/I14，厂商 I16–I18。I8 的长 unique-prompt API 任务在本次交接写入时仍在远端 runner 中，尚不能算通过。补测数据 `benchmarks/P6-i5-i6-i7.md`，新图证据在 `benchmarks/data/p6b/p6_graph_isolation.json`，I4 详情 `docs/P6-I4-attention-logits.md`。
 
 状态图例：🔴 阻塞主路径　🟡 冻住的收益/覆盖缺口　🟢 工程债/低风险　⚪ 厂商侧（我们不可修）
 
@@ -11,9 +11,9 @@
 
 ## A. 技术硬问题
 
-### I1 🔴 30B 图 replay 第一次即打死设备（8B 修复不可迁移）
-- **现状**：30B 捕获成功（6 桶 1/2/4/8/16/32，bmm_dense + triton_paged，reserved +0.525 GiB，两 rank 一致），但 `verify graph_candidate` 的**第一次 generate（replay）**即楔死设备：~10 分钟后 rank0 watchdog `RuntimeError: MUSA error: the launch timed out and was terminated`（栈在 replay 后的 barrier——设备已被 replay 打楔，下一次 launch 才报错），rank1 死于 `call()` 命令级 barrier。
-- **证据**：`benchmarks/data/p6b/p5_graph_ab.log`（完整现场）；对照 8B 同栈 5/5 全绿（`p6_graph_bisect2.log`）。
+### I1 🔴 图路径控制组全失败；禁止 30B 图 A/B
+- **现状**：历史 30B 的第一次 replay 会楔死；本轮按固定 `SDPA + bmm_dense decode` 重做 TP2 隔离，tiny MoE 与 Qwen3-8B dense 均 **0/5**。tiny 是稳定 token 漂移；8B 五次均超过 120 s watchdog。没有单一、可证实的代码级根因，因此 30B graph A/B 被前置门阻止。
+- **证据**：`benchmarks/data/p6b/p6_graph_isolation.json/.jsonl`（sha256 `80832dd809500274...` / `096fe57cd83ebe645...`）；历史 30B 现场仍在 `p5_graph_ab.log`。旧的“8B 5/5 绿”只适用于此前变量组合，不能外推本轮生产候选组合。
 - **已排除**：rank 间 replay 错位（8B 上 barrier 有效）；跨桶 pool 复用（8B 上私有池有效）——这两个修复在 30B 不够。
 - **未排除（下一轮候选，按性价比排序）**：① 分段捕获（attention/linear 进图、MoE eager，SGLang 式）；② 图内去 MCCL（all-reduce 留 eager 或改结构）；③ 厂商 MUSAGraph 对「48 层 × 96 次/步图内 all-reduce + 图内 bmm」规模的已知限制清单（问厂商/读源码）；④ 8B MoE 版复现（当前 8B 复现是 dense 模型，缺一个「8B+MoE、无 triton」的中间档来隔离变量：是 MoE 图内核还是规模）。
 - **影响**：decode 图的 1.1–1.2× 收益拿不到（eager 已通过 bmm_dense 拿到大头，图增量变小——P6b §2.5 估过 1.03–1.17×，且移除每层同步后可能更小）。
@@ -23,10 +23,11 @@
 - **证据**：`benchmarks/data/p6b/p6_graph_3gen_bisect12.log`（tokens[0] vs tokens[1]）。
 - **根因假设（未验证）**：replay 读到旧 KV 块（清前缀缓存后块布局变化，而图内 block_tables 只写了前 bs 行；或 kv_len 冻结问题，P6b §2.6 曾在 tiny 上观察到类似现象）。
 - **影响**：即使 I1 修好，replay 的输出一致性也不足以上生产；这是图路径转正的第二道门。
-- **下一步**：在 8B 上做最小二分（gen2 前不清缓存 → 是否漂移；padding 行 block_tables 清零 vs 复制真实块）。
+- **本轮定界**：graph→eager→graph、连续三次 graph generate 与清/不清 prefix cache 都不能消除漂移；blocking 重放仍出现首个 graph replay token 异常。故不是 I4 Triton 数值路径，也不能靠清 prefix cache 解决。
+- **下一步**：保持 eager。只有拿到单一可验证的 runtime/代码根因才重开最小二分；不做猜测性 patch 或 30B 重试。
 
-### I3 🟡 tiny 图捕获仍间歇性失败（捕获阶段，先于 replay）
-- **现状**：本轮廉价回归中 `p6_bmm_dense_tiny.py` 的 graph 段在 tiny TP2 捕获时崩 `RuntimeError: MUSA error: operation not permitted`（23:38）。P6b 曾实测「加 barrier+设备同步后 tiny TP2 3/3 稳定」，本轮说明**捕获间歇性并未根除**。
+### I3 🟡 tiny 图捕获间歇失败本轮未复现，但不能关闭
+- **现状**：本轮 five-run isolation 的 tiny 捕获都完成；失败发生在后续一致性门而非 capture。一次未复现不能否定既有 `operation not permitted` 现场，故继续单列。
 - **证据**：`benchmarks/data/p6b/reg_bmmdense.log`。
 - **影响**：任何图实验的样本量都会被捕获噪声污染；也是 I1 的背景噪声（捕获与 replay 两类死法要分开统计）。
 - **下一步**：失败即重试（独立进程）+ 在捕获失败时自动补一次 `MUSA_LAUNCH_BLOCKING=1` 定位 operator；统计捕获成功率作为图实验的固定前置指标。
@@ -59,10 +60,9 @@
 - **修正后的容量表述**：SLO 可持续负载 ≈ **0.81–0.86 req/s（达成值）**；0.87–0.96 目标区间 SLO 80–100% 波动；≥1.09 进入饱和。上轮「拐点 0.87–0.957」的说法精度过高。
 - **证据**：`/root/p6_i7_knee.json`、`benchmarks/P6-i5-i6-i7.md` §3。
 
-### I8 🟡 在线容量只覆盖一种负载形状（沿 v2 的既有限制）
-- **现状**：全部在线数据都是 137-in / 64-out 短输入中输出；长输入（≥1k，prefill 主导）区间没测过在线表现。
-- **影响**：容量结论不能外推到长上下文产品形态；P5 profiling 已知长上下文 attention 占 forward 58%，paged kernel 的价值恰恰在那一档（与 I4 联动）。
-- **下一步**：改 prompt-words/输出长度的 v4 形状矩阵（1 个长形状 × 3 档即可起步）。
+### I8 🟡 长 unique-prompt 在线覆盖在途（尚不能算通过）
+- **状态**：生产栈 API 已启动单一锁 runner，执行 1,024 words、64-out、`--prompt-mode unique`、0.435/0.653/0.870 QPS、128 请求/档。写本报告时 JSON 尚未完整落盘，不能报告 SLO 或 token 长度门。
+- **收尾**：只等待现有 `/root/p6_i7_i8_runner.log` 自然退出；然后确认 `prompt_tokens_p50 >= 1000`、JSONL 128 条/档、同步 sha256。若失败，保留原始结果而非立刻重跑。
 
 ### I9 ✅ 已解释（10-27 补测）v3 的 90% 档 TPOT 低于 75% 档
 - **解释**：I7 补测给出直接证据——TPOT 主要由**瞬时并发**决定（并发 29 → TPOT p95 0.414 s；并发 45 → 0.593 s），而瞬时并发由 Poisson 到达的随机尖峰决定，与目标负载率不严格单调。v3 的 90% 档并发 21 低于 75% 档的 24，故 TPOT 更低。
@@ -120,10 +120,10 @@
 
 | 优先 | 问题 | 理由 |
 |---|---|---|
-| 1 | I4 triton_paged 分歧定位 | 收益最大且路径清晰（+48~59% 吞吐）；先做 logits diff 上界判定走工程路还是决策路 |
-| 2 | I1(+I3) 30B 图 | 先补 8B+MoE 中间档隔离变量，再决定是否值得分段捕获；严格时间盒 |
-| 3 | I5+I6+I7 验证补齐 | 三项共用一次 30B 加载就能全部补上（b64 点 + 探针 + 拐点细化），性价比最高 |
-| 4 | I2 图 token 漂移 | 依赖 I1 有进展后才有意义 |
+| 1 | I8 当前 runner 收口 | 已加载；只核验 JSON 完整、unique prompt token 长度与三档记录，不重跑 |
+| 2 | I1/I2 图路径 | 两控制组已 0/5；先要厂商 runtime 限制/诊断证据，禁止无根因 patch 和 30B A/B |
+| 3 | I12/I14 | 图方向停止试错后，处理 teardown 安全性和历史 bisect 补丁去留 |
+| 4 | I4 | 已决策 keep_sdpa，除非产品契约改变，不再占实验额度 |
 | 5 | ~~I10/I11/I13 工具债~~（✅ 已修 10-27，连同 I15） | 小改动，防下一轮浪费加载 |
 | — | I12/I14/I15/I16–I18 | 随手修/等待外部 |
 

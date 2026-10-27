@@ -10,6 +10,8 @@
 > **2026-10-27 追加（自检+快修后定稿，最新）**：**先读 `docs/HANDOFF-P6c.md`（交接定稿：当前栈、成绩单、18 项问题逐项状态表、SOP、红线）**。核心事实：`decode_moe_backend=bmm_dense` 过全部 30B 门并落地（离线 b32 110.6/133 tok/s，+59%/+92%）；b32/b64 不稳定被 shm 修复治好（证实）；在线容量 v3 四档全 100% SLO（100% 档 goodput 15.4×）、真实天花板 0.94 req/s / 60 tok/s（容量 2.1× v2）；triton_paged 冻结门判 keep_sdpa（0.875<0.99，可复现数值差异）；图 replay 8B 已修（barrier+私有池，5/5 绿）但 30B 未修。问题台账：`docs/P6-open-issues.md`（18 项，4 项已修），逐实验过程 `docs/NIGHTLY-LOG.md`。代码 HEAD `91e3fd3`，未 push。
 >
 > **2026-10-27 追加（I4 logits 定位，最新）**：I4 的 TP2 同状态 logits 诊断已完成（代码 `41ab19b`）：扩展页边界/poison-tail 参考全绿，首层差仅 `2.44e-4`，但 bf16 深层放大到最大 logits 差 6.09，并在 8,928 个 request-step 中出现 19 个近平局 top-1 翻转。故**不是页表/mask bug，不做无依据内核试错，不改冻结门，默认继续 SDPA**；详情先读 `docs/P6-I4-attention-logits.md`，再读 `HANDOFF-P6c.md`。
+>
+> **2026-10-27 追加（P6 覆盖/图隔离收口，最新）**：**先读 `docs/HANDOFF-P6c.md`**。生产保持 `sdpa + grouped_mm prefill + bmm_dense decode + enforce_eager`；I4 继续 keep_sdpa。I5 b64 稳定性与 I6 prefix-cache 命中已验证关闭；图隔离两控制组均 0/5，未跑 30B 图 A/B；I7 是高方差软边界而非精确 knee；I8 仍在单一远端 runner 中。`fcfb81c` 已推送，禁止“不要 push”的旧规则已废止；以 `git ls-remote` 核验收尾提交。
 
 ---
 

@@ -114,3 +114,17 @@
 - 低层页边界矩阵（255/256/257、511/512/513、2047/2048/2049、混合长度/乱序页/poison tail）通过，`max_abs=1.2207e-4 < 2e-3`；没有 mask/tail/page 地址错误。
 - 12 个 30B run 共 8,928 request-step，19 个 top-1 翻转；首层最大差仅 `2.4414e-4`，但在 bf16 深层放大到 logits `6.09375`、layer 36 `8.7217`。翻转均是 baseline top-2 margin `≤0.3125` 的近平局。
 - **决策**：这是数值路径而不是可证明的局部 bug；`p5_decide.py` 不改、默认继续 `sdpa`、不跑第二次 30B 验证。完整备忘录见 `docs/P6-I4-attention-logits.md`。
+
+## 9. P6 覆盖补齐与图路径定界（10-27；I8 仍在途）
+
+- **图路径**：新 TP2 隔离器固定 `SDPA + bmm_dense decode`，tiny MoE 和 Qwen3-8B dense 各在独立进程尝试 5 次（120 s watchdog）。两组均 **0/5**：tiny 是稳定 graph/eager token 漂移；8B 全部 watchdog，`MUSA_LAUNCH_BLOCKING=1` 重放仍见首个 graph replay 漂移。graph→eager→graph、三次连续 graph 与清/不清 prefix cache 都不消除它。没有单一代码级根因，**不运行 30B graph A/B，`enforce_eager=True` 维持**。
+- **I5 b64**：采用栈在 b64、128-in/128-out、3 repeats 下 3/3 完成、token 完全一致、无 MUSA error；吞吐 141.48 / 140.97 / 141.75 tok/s，关闭 I5。
+- **I6 prefix cache**：同一进程 8 请求、512-in/384 shared-prefix。cold 的 hit-token delta 三轮均 0；hot 三轮均 +2048，TTFT p95 约 1.256 s 降至 0.911–0.935 s，关闭 I6。
+- **I7/I9**：0.8715、0.9135、0.9555 QPS 的 SLO 分别 128/128、102/128、128/128。该结果是高方差软边界/Poisson 瞬时并发效应的证据，不能把 0.9135 叫作精确 knee；详见 `benchmarks/P6-i5-i6-i7.md`。
+- **I8 long unique prompt**：API 复用 I7 服务并运行 1k-input×3 档任务；本报告写入时 runner 尚未完成，因此不提前给结论。
+
+| 文件 | 内容 | sha256 |
+|---|---|---|
+| `p6_graph_isolation.json/.jsonl` | 两控制组 5×图隔离 | `80832dd809500274...` / `096fe57cd83ebe645...` |
+| `p6_i5_i6.json/.jsonl` | b64 稳定性与 cold/hot cache 指标 | `f5a5fad4974cc409...` / `504f19099225ed3f...` |
+| `p6_i7_knee.json/.jsonl` | 0.8715/0.9135/0.9555 QPS 逐请求记录 | `4c4c73756c8e71eb...` / `07d4c2102c4fb68a...` |
