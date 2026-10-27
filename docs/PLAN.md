@@ -42,22 +42,22 @@
 
 **因此不启动 M1–M4。** 唯一可能的复活路径是 S6（EAGLE3/PARD 训练头，α 0.8+），且**前置条件是先解决 I19**——否则 α=0.8 在 c=0.39 下也只有 ~1.1×。
 
-### Track B' — 每步固定成本（新，当前第一优先）
+### Track B' — 每步固定成本（✅ 判定完成 10-27：launch-bound）
 
-| 步 | 内容 | 产出 | 成本 |
+| 步 | 内容 | 结果 | 成本 |
 |---|---|---|---|
-| B'1 | 30B 的 step_overhead 分解（沿用 `tests/p6_step_overhead.py`，采用栈） | 165 ms 里 forward/prepare/sample 与每层占比 → 「砍固定成本」的上界 | ~15 min（需 1 发 30B 加载，可与其它实验共发） |
-| B'2 | 0.6B 逐层计时（28 层逐层前向） | 区分「launch 数量多」还是「单 kernel 慢」 | ~10 min |
-| B'3 | 判定：若 launch-bound → 图（I1）从低优升高优，先解决 replay 漂移；若非 launch-bound → 找具体慢 kernel | 决策记录 | — |
+| B'1 | 30B 的 step_overhead 分解 | ✅ b1 177.6 ms 中 forward 95.5%、prepare 0.15%、sample 4.3%；b32 的 sample 13.7% | 已完成 |
+| B'2 | 0.6B 逐层计时（28 层逐层前向） | ✅ **launch/CPU-bound**：device_busy **0.478–0.603**，每步 **2,401 次 launch**（13.5 µs/次），每层 host 1.84–2.13 ms × 28 ≈ 整步；GPU 空转 ~40% | 已完成 |
+| B'3 | 判定 | ✅ **launch-bound**。两条路：① 纯 eager 的 norm/rope 融合（不依赖图，可逐项 A/B）；② 图（I1）有 63.2→40.0 ms 的现成 23 ms，但被 replay 漂移（I2）卡住 | 记录于 `benchmarks/P6-layer-timing.md` |
 
-**为什么优先于投机解码**：它同时压着单流延迟（30B b1 165 ms）、容量（0.94 req/s 硬饱和）和所有多步方案；且 0.6B 的实测已显示 **90% 步时是固定开销**（权重带宽下限仅 ~3 ms）。
+**为什么优先于投机解码**：它同时压着单流延迟（30B b1 175 ms）、容量（0.94 req/s 硬饱和）和所有多步方案。逐层计时现已把矛头指向 **RMSNorm/RoPE/mask 的逐元素小 kernel**（top-15 占设备时间 74%），而不是算力。
 
 ### Track C — 生态手搓
 
 | 步 | 内容 | 触发条件 | 成本 |
 |---|---|---|---|
 | C1（E2） | 生成 `E=64,N=768,device_name=MTT_S4000.json`（`VLLM_TUNED_CONFIG_FOLDER`），或 vendor_moe source-rebind 注入 | 先用 `p6_moe_microbench.py --batches 512,2048` 判"厂商 kernel 调好后 prefill 大批是否真的快于 grouped_mm" | 30–45 min / 发 |
-| C2（E1） | paged decode kernel autotune（扫 BLOCK_N×warps×stages，按 batch/kv 桶持久化） | **必须先有 I4 的产品决策**（接受"稳定但不同"的输出），否则 tuner 产物用不上 | 30–60 min / 发 |
+| C2（E1） | paged decode kernel autotune（扫 BLOCK_N×warps×stages，按 batch/kv 桶持久化） | **已解闸**（I4 于 10-27 转正，paged 为默认）；ROI 低于 I19 的 norm/rope 融合 | 30–60 min / 发 |
 | — | 明确不做：调 `_grouped_mm`（无旋钮）、调 MUSAGraph/MCCL/watchdog（runtime 层） | — | — |
 
 ### Track D — 冻结 / 等厂商（当前不做实验）
@@ -75,22 +75,20 @@
 ## 2. 依赖图与时间盒
 
 ```
-I8 收口 (A, 0.5h, 占用 GPU)
-      │
-      ▼
-S1 Phase 0 ──► ✅ NO-GO (0.73×，10-27) ──► S2–S5 不启动
-      │
+I8 收口 ──► ✅ 有效跑 (10-27)：384/384 完成、rank1 存活；三档 SLO 0%（瓶颈 TTFT）──► 下一步 I26/I23
+S1 Phase 0 ──► ✅ NO-GO (0.73×) ──► S2–S5 不启动；离线再断言见 P7-spec-decode-addendum.md
       └─► 唯一复活路径 S6（EAGLE3/PARD），前置 = I19
 
-I19 每步固定成本 (~50ms/步，0.6B 实测 90% 是固定开销)
-      ├─► B'1 30B 分解 (~15min) ─► 上界
-      ├─► B'2 0.6B 逐层 (~10min) ─► launch-bound?
-      └─► 若 launch-bound ──► I1 图（1.55× @0.6B b1 已观测）升高优
+I19 每步固定成本 ──► ✅ launch-bound (device_busy 0.48–0.60, 2,401 launches/step)
+      ├─► 近期：eager 的 norm/rope 融合（不依赖图）
+      └─► I1 图（63.2→40.0 ms 的 23 ms 现成收益）仍被 I2 replay 漂移卡住
 
-I4 产品决策 ──────────► E1 (paged autotune)
+I4 决策 ──► ✅ 已转正 (10-27) ──► E1 paged autotune 解闸（低优先）
 prefill 大批需求 ─────► E2
 厂商回信 ─────────────► I1/I2、E3–E6
 ```
+
+**加载时间修正**：`load_model` 的 FP8 逐 expert 反量化实测 **351–354 s（热）**，冷页缓存 11–12 min；到 `/health` 总计 6–12 min。启动窗口按 **≥20 min** 设，判活用 `NANOVLLM_TRACE_INIT=1`。
 
 **时间盒（每轮/每发）**
 - 任何 30B 加载前：kill 残留 → `rm -f /dev/shm/nanovllm*` → `mthreads-gmi` 双卡 0 MiB（HANDOFF-P6c §4）。

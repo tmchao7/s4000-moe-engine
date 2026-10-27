@@ -14,19 +14,18 @@
 | **S** | P7 投机解码 | S1–S6 |
 | **E** | 生态与厂商（autotune 手搓边界、runtime 限制） | E1–E6 |
 
-**统计（28 项 = 未结 16 + 已关闭 11）**（10-27 I4 转正后更新）
+**统计（28 项 = 未结 17 + 已关闭 11）**（10-27 I4 转正 / I8 有效闭合后更新）
 
 | 状态 | 数量 | 条目 |
 |---|---:|---|
-| 🔴 阻塞主路径 / 最大杠杆 | 2 | I1、**I19（每步固定成本）** |
-| 🟡 收益冻结 / 未闭合 | 6 | I2、I3、I8、S2、S3、S4（S5 随 S1 一并搁置） |
-| 🟡 条件触发（被 I4 决策闸住） | 1 | E1 |
-| 🟢 工程债 / 低优先 | 4 | I12、I14、S6、E2 |
+| 🔴 阻塞主路径 / 最大杠杆 | 2 | I1、**I19（每步固定成本；已确认 launch-bound）** |
+| 🟡 收益冻结 / 未闭合 | 6 | I2、I3、S2、S3、S4、S5（S5 随 S1 搁置） |
+| 🟢 工程债 / 低优先 | 5 | I12、I14、S6、**E1（I4 已转正，解闸）**、E2 |
 | ⚪ 厂商侧（我们不可修） | 4 | E3、E4、E5、E6 |
-| ✅ 已关闭 | 11 | I4、I5、I6、I7、I9、I10、I11、I13、I15、**S1（no-go）**、I8（无效跑，见下） |
+| ✅ 已关闭 | 11 | I4、I5、I6、I7、**I8（有效跑）**、I9、I10、I11、I13、I15、**S1（no-go）** |
 
-核对：2+6+1+4+4+11 = 28 ✓（I 系列未结 7 = I1/I2/I3/I8*/I12/I14/I19；S 系列未结 5 = S2–S6；E 系列 6；已关闭 11）
-> \* I8 按「无效跑」关闭：prompt 实际 18,354 token（非意图的 ~1k），且 rank1 中途死亡导致 120–124/128 请求无 `[DONE]`、SLO 0% —— 结论不可用，需重设计后再测（见 ISSUES I8 条目）。
+核对：2+6+5+4+11 = 28 ✓（I 系列未结 6 = I1/I2/I3/I12/I14/I19；S 系列未结 5 = S2–S6；E 系列 6；已关闭 11）
+> I8 已用有效跑闭合（1.0–1.15k token、384/384、rank1 存活）；三档 SLO 0% 是真实容量结论（瓶颈在 TTFT），见 I8 条目。
 
 状态图例：🔴 阻塞主路径／决定立项　🟡 收益被冻结或覆盖缺口　🟢 工程债/低优　⚪ 厂商 runtime，我们不可修
 
@@ -69,17 +68,20 @@
 - **L3 的关键发现（推翻了初版门）**：初版用字符级编辑距离 p95 ≤8% → 实测 **p95 65%、仅 20/100 条请求完全一致**，看似"质量崩了"。但 **LCP 中位 42.5 / 均值 60.7（共 128）** + 首 token 100% 一致 → 现象是"先一致 1/3~1/2，遇一次近平局翻转后整段走不同分支"。12 组人工判读全部语义等价（例："降低显存/提高速度/降低功耗" vs "计算量/内存/延迟"）。**编辑距离度量的是措辞，不是质量**，故 L3 改为"首 token + 退化 + 人工判读"。
 - **当前决策**：`benchmarks/p6-attention-equivalence-decision.json` = **`adopt_triton_paged`**，L5 已过；`nanovllm/config.py:33` 与 `api_server.py` 默认值已改为 `triton_paged`，sdpa 保留为显式 opt-in 与历史参考后端。
 - **证据**：`benchmarks/P6-serving-v4.md`、`benchmarks/data/p6b/p6_attention_equivalence.json`、`p6_L3_review.json`、`p6_attention_logits_i4.json`、`benchmarks/P6-L3-review.md`
-### I8 ⚠️ 已跑但**无效**（10-27 12:00 结束）：长 unique-prompt 覆盖仍未完成
-- **实际结果**：`/root/p6_i8_long_unique.json`（384 条记录）——`prompt_mode=unique`、`prompt_words=1024`，但 **`prompt_tokens=18,354`**（"1024 words unique" 被切成 18k token，超出意图 18×）。
-- **三档全部崩溃**：TTFT p95 **115.9 / 110.6 / 65.8 s**；每档仅 **8/128、8/128、4/128** 请求拿到 `[DONE]`（其余 120–124 条 `stream ended before [DONE]`）；SLO **0%**；`tpot_s` 有 120+ 条为 null。
-- **根因（两项，都不是引擎的长上下文能力结论）**：① prompt 构造超擞（words≠tokens）；② **rank1 在运行中死亡**（收尾时 GPU1 仅剩 34 MiB、rank0 仍持有 43 GiB），足以解释大面积 stream 中断。
-- **决策**：按计划「失败原样记录，不重跑」。**I8 仍未覆盖**；重设计要点：用 token 数而不是 words 控制长度（目标 ~1k token）、max_model_len 显式设置、运行中监控 rank1 存活、失败请求单列 `ok` 与 `slo` 分母。
-- **证据**：`/root/p6_i8_long_unique.json/.jsonl`（本地 `benchmarks/data/p6b/`）
+### I8 ✅ 已闭合（10-27 19:42，重设计后有效跑）：长上下文可服务，但容量在 0.435 QPS 就崩
+- **有效跑**：`prompt_mode=unique`、`--prompt-tokens 1024`（tokenizer 校准 68 词 → 1,018 token；逐请求实际 1,018–1,154）、`--max-model-len 4096`、三档 0.5/0.75/1.0、128 请求/档、64 token 输出；栈 = 新默认（paged + bmm_dense + stall_free）。
+- **有效性**：384/384 成功且 `[DONE]`；5 s watchdog 全程 rank1 存活（只有 spawn 前第一条为空）；长度门按字面未过（二/三档 p50 1,154，超 ±6% 到 +12.7%），但落在 0.99–1.13× 目标区间，按"长度区间有效"使用并在报告中注明。
+- **结果**：三档 SLO **全部 0%**——TTFT p50 **3.84 / 8.28 / 10.22 s**、p95 5.48 / 12.45 / 14.65 s；TPOT p50 0.418 / 1.175 / 1.419 s；最大并发 **25 / 80 / 104**（v4 同请求率是 14/23/24）。
+- **失败定位**：**TTFT，不是 decode**。50% 档满足 TTFT≤2 s 的请求 0/128，满足 TPOT≤0.5 s 的 83/128；空闲时同长度单请求 TTFT **0.368 s**、TPOT **0.144 s**。→ 单请求能力正常，崩在"1k prefill 与 decode 混跑 + 无准入控制"的排队。
+- **与上轮无效跑的区别**：上轮 18,354 token、8/128 完成、rank1 死亡；本轮 1.0–1.15k token、384/384、rank1 存活。**这次的 0% SLO 是真实容量结论，不是故障。**
+- **下一步**：I26 准入/背压 → I23 mixed step 后端 → prefill chunk 曲线 → 重定长上下文目标 QPS（0.87 是 137-token 口径）。
+- **证据**：`benchmarks/P6-i8-long-context.md`、`benchmarks/data/p6d/p6_i8_long_unique_v2.json`（sha256 `1249e49bcb3de838500bf0e0e9007310597ee27957deddb0c54017cfacaa297e`）、`i8_watch.log`（`dd3b0c1e…`）
 
 ### I12 🟢 崩溃进程 teardown 卡死
 - **现状**：rank 间 DistBackendError 后主进程挂在退出路径（bmmdense 回归、30B graph A/B 均遇到），需人工按 PID kill。
 - **下一步**：engine `exit()` 加 barrier 超时 + `os._exit` 兜底；短期靠 SOP（HANDOFF-P6c §4）。
-- **10-27 新增第三类现场**：`api_server --attention-backend triton_paged` 启动期挂住——两 rank 权重载入完成（各 29.5 GiB）、**无任何日志**、GPU 0% util、`/health` 无响应，15 分钟未起。与 teardown 卡死同类（rank 间推进不对齐），但发生在**启动 warmup 段**。排查线索：加 `MUSA_LAUNCH_BLOCKING=1` 与逐步 print。
+- **10-27 第三类现场已澄清（不是挂死）**：`api_server --attention-backend triton_paged` 启动时两 rank 各占 29.5 GiB、零日志、0% util、`/health` 无响应，曾被记为"启动挂死"。加 `NANOVLLM_TRACE_INIT=1` + `faulthandler` 后实测：`load_model` 的 FP8 逐 expert 反量化占 **351.4 s（rank0）/354.0 s（rank1）**，warmup 16 s，KV 分配 0.08 s，**到 `/health` 共 377 s**；faulthandler 栈全部落在 `loader.py:103/108`。冷页缓存时该段 11–12 min（本轮参考基线生成实测）。**与 paged 无关**：warmup 只跑 prefill（恒 SDPA），paged 模块首次 decode 才 import，`allocate_kv_cache` 无 backend 分支。**运维修正**：启动窗口按 ≥20 min（冷）设置；判活用 `NANOVLLM_TRACE_INIT=1`，不要用"显存已占"推断"权重已加载完"。
+- **10-27 另一个 SOP 漏洞**：rank1 的 spawn 子进程 argv 是 `/usr/bin/python3 -c ...`，`pgrep -fa "^python3"` **匹配不到**；`pgrep -f "nanovllm...api_server"` 又会匹配到发起命令的 bash 自身（曾把执行 kill 的 ssh shell 一起杀掉）。正确写法：`pgrep -fa "^/usr/bin/python3|^python3|^[s]pawn_main"`，kill 前先列 PID。
 ### I14 🟢 BISECT-1/2 补丁去留未决
 - **现状**：`model_runner.py` 的 `# BISECT-1`（replay 前后 rank barrier）与 `# BISECT-2`（每桶私有 graph pool）。8B 当时是实证修复（5/5），本轮隔离下 8B 仍 0/5 → **该修复不构成通用解**。
 - **下一步**：I1 有结论后一并处理——图若要重开则保留并重验；图永久放弃则删除，降低认知负担。当前对 eager 路径无影响，可暂留。
@@ -91,9 +93,10 @@
 - **推论**：0.6B 的权重带宽下限只有 ~3 ms/步，实测 ~40 ms 净 GPU 时间 → **约 90% 是每层固定开销**（28 层 → ~1.4 ms/层；8B 32 层 → ~2.2 ms/层，P6b 74.3 ms 亦吻合）。
 - **为什么它最优先**：同时压着 (a) 单流延迟（30B b1 = 165 ms/step）、(b) 容量（0.94 req/s 硬饱和）、(c) 所有"多步"方案（投机解码需要 k+1 个 draft 步；这正是 S1 判 no-go 的技术原因）。收益面大于投机解码，且不依赖产品决策。
 - **30B 分解已完成（10-27）**：b1 步 177.6 ms 中 **forward 169.6 ms（95.5%）**、prepare 0.27 ms（0.15%）、sample 7.7 ms（4.3%）；b8 96.0%/0.15%/3.9%；**b32 的 sample 升到 36.6 ms（13.7%）**。→ 固定成本在 **forward 内部（层内 kernel）**，不是 Python/调度/采样路径；b32 的 sample 是独立的便宜目标（`bool(greedy.all())` 同步 + argmax）。
-- **剩余下步测量**：0.6B 逐层计时（~10 min）→ 区分"launch 数量多"还是"单 kernel 慢"。
-- **若确认是 launch-bound**：图的 1.55× 就是现成收益（0.6B b1 观测 graph 40.0 ms vs eager 63.2 ms），I1 从"低优"升为"高优"——但必须先解决 replay 漂移。
-- **证据**：`/root/p7_step_overhead_06.json`、`/root/p7_draft_steps.jsonl`、`benchmarks/P7-phase0.md` §2
+- **逐层计时已完成（10-27，两次重复）**：0.6B TP1 eager b1 → **launch/CPU-bound，不是单 kernel 慢**。步时 53.7–61.2 ms，kernel 设备时间 29.3–32.4 ms → `device_busy = 0.478–0.603`（门 <0.70）；每步 **2,401 次 launch**（35 种 kernel，平均 **13.5 µs**/launch）；每层 host 发射 1.84–2.13 ms × 28 ≈ 整步步时 → **CPU 发射是关键路径，GPU 空转约 40%**。
+- **成本构成**：top-15 kernel 占设备时间 74%，几乎全是 RMSNorm/RoPE/mask 的逐元素小 kernel（Cast fp32↔bf16、Mul/Add/Rsqrt/Pow/Select/Concat）；真正的 flash attention 只有 28 次 / 2.3 ms，GEMV/GEMM 合计 ~3.4 ms。**算力不是瓶颈，是"小 kernel 洪水"。**
+- **下一步（按 ROI）**：① **纯 eager 的 norm/rope 融合**（消掉每层几十次 launch，不依赖图，可逐项 A/B）——新发现的可执行方向；② 图路径（I1/I2）仍是 63.2→40.0 ms 的现成 23 ms，但被 replay 漂移卡住；③ 30B TP2 抽查一次，确认 launch-bound 在 MCCL 下仍成立。
+- **证据**：`benchmarks/P6-layer-timing.md`、`benchmarks/data/p6d/p6_layer_timing_06.json`（sha256 `ec7e02078d8bb9695737f91c5bb7f9fa8739a4259ff7119f740806db9377eef3`）、`/root/p7_step_overhead_06.json`、`benchmarks/P7-phase0.md` §2
 
 ### P8 规划新增（尚未执行；编号在 P8 报告中定稿）
 
@@ -147,11 +150,11 @@
 
 > 核心结论：**能手搓两处**（E1 我们的 paged kernel、E2 vLLM fused_moe 配置），**搓不动四类**（E3 grouped_mm、E4 MUSAGraph、E5 mp22、E6 watchdog）——后者是 driver/runtime 闭源层。
 
-### E1 🟡（条件触发）手搓 paged decode kernel 的 autotune
+### E1 🟢（已解闸，低优先）手搓 paged decode kernel 的 autotune
 - **可做性**：✅ 单点注入。`nanovllm/kernels/paged_attention.py:128-130` 写死 `BLOCK_N=32, num_warps=4, num_stages=1`；全仓库无 `@triton.autotune`。
 - **方案**：扫 `BLOCK_N∈{16,32,64,128} × warps∈{2,4,8} × stages∈{1..4}`（≤64 组）× 桶 `(batch∈{1,4,16,32,64}, kv∈{≤1k,≤4k,>4k})`；计时复用 `scripts/p6_moe_microbench.py` 的 `time_call` + 子进程隔离；产出 `configs/paged_decode_MTT_S4000.json` + sha256 绑定 kernel 源。预算：一发 30B 加载 30–60 min。
 - **硬约束**：`context_len` 必须保持 runtime 循环边界（不然破坏 kernel 复用）；**autotune 只改性能，不改变 SDPA↔paged 的 bf16 数值路径差异（I4）**——不要指望 autotune 解决 I4。
-- **触发条件**：**必须先有 I4 的产品决策**（接受"稳定但不同"的输出）。否则 tuner 出来的 kernel 用不上。
+- **触发条件**：**已满足**——I4 已于 10-27 转正（L1–L5 全过，paged 成为默认）。现在可做，但与 I19 的 norm/rope 融合相比 ROI 更低，排在 P8 计划之后。
 
 ### E2 🟢 手搓 vLLM fused_moe 的 S4000 配置（原 I16 重新归类）
 - **纠正**：此前记为"⚪ 厂商侧不可修"——**不准确**。缺的是 `configs/E=64,N=768,device_name=MTT_S4000.json` 这个**文件**，而生成它是我们的工作。
