@@ -98,6 +98,7 @@ cd /root/moe-server-s4000                            # 代码（服务器无 .gi
 | 15 | 图路径重新隔离（tiny MoE / 8B dense 各 5 次） | ❌ 0/5 ×2，定界为 MUSA graph runtime 限制 | `p6_graph_isolation.json/.jsonl` |
 | 16 | P7 Phase 0（draft 步时 + 30B 参考 + α 判决） | ✅ 完成 → **NO-GO**（α=0.006、c=0.384、最优 0.73×） | `benchmarks/P7-phase0.md`、`/root/p7_*.json` |
 | 17 | 0.6B 每步开销分解（发现固定成本主导） | ✅ 完成（forward 占 98.2%；0.6B/1.7B 步时相同 → 每层 ~1.4–2.2 ms 固定开销） | `/root/p7_step_overhead_06.json` |
+| 17b | 30B 每步分解（采用栈） | ✅ 完成（b1 forward 95.5%/prepare 0.15%/sample 4.3%；b32 sample 13.7%） | `/root/p7_step_split_30b.json`、`benchmarks/P7-phase0.md` §2.1 |
 | 18 | I8 长 unique-prompt（第 14 发） | ⚠️ **无效跑**（prompt 18,354 token 非 ~1k；rank1 中途死亡 → 120–124/128 无 `[DONE]`） | `/root/p6_i8_long_unique.json` |
 
 夜间台账总账见 `docs/NIGHTLY-LOG.md`（每发预冻结门 + 实际结果）；交接 successor 文档 `docs/HANDOFF-P6c.md`。

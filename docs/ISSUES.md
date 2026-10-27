@@ -83,7 +83,8 @@
 - **实测（10-27）**：0.6B 与 1.7B 的 b1 步时**都是 ~63.8 ms**（若带宽 bound，1.7B 应慢 2.5–3×）；TP1 只比 TP2 快 ~12 ms（all-reduce 不是主因）；0.6B eager b1 的 63.2 ms 中 **forward 占 98.2%**（62.1 ms），prepare 0.22 ms、sample 0.86 ms。
 - **推论**：0.6B 的权重带宽下限只有 ~3 ms/步，实测 ~40 ms 净 GPU 时间 → **约 90% 是每层固定开销**（28 层 → ~1.4 ms/层；8B 32 层 → ~2.2 ms/层，P6b 74.3 ms 亦吻合）。
 - **为什么它最优先**：同时压着 (a) 单流延迟（30B b1 = 165 ms/step）、(b) 容量（0.94 req/s 硬饱和）、(c) 所有"多步"方案（投机解码需要 k+1 个 draft 步；这正是 S1 判 no-go 的技术原因）。收益面大于投机解码，且不依赖产品决策。
-- **两个便宜的下步测量**（各 ≤15 min）：① 30B 的 step_overhead 分解（165 ms 里 forward/prepare/sample 与每层占比）→ 给出"砍固定成本"的上界；② 0.6B 逐层计时 → 区分"launch 数量多"还是"单 kernel 慢"。
+- **30B 分解已完成（10-27）**：b1 步 177.6 ms 中 **forward 169.6 ms（95.5%）**、prepare 0.27 ms（0.15%）、sample 7.7 ms（4.3%）；b8 96.0%/0.15%/3.9%；**b32 的 sample 升到 36.6 ms（13.7%）**。→ 固定成本在 **forward 内部（层内 kernel）**，不是 Python/调度/采样路径；b32 的 sample 是独立的便宜目标（`bool(greedy.all())` 同步 + argmax）。
+- **剩余下步测量**：0.6B 逐层计时（~10 min）→ 区分"launch 数量多"还是"单 kernel 慢"。
 - **若确认是 launch-bound**：图的 1.55× 就是现成收益（0.6B b1 观测 graph 40.0 ms vs eager 63.2 ms），I1 从"低优"升为"高优"——但必须先解决 replay 漂移。
 - **证据**：`/root/p7_step_overhead_06.json`、`/root/p7_draft_steps.jsonl`、`benchmarks/P7-phase0.md` §2
 
