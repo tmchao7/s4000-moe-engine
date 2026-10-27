@@ -18,7 +18,7 @@
 | b32/b64 稳定性 | **已修复**：b32 ×10 三栈零分歧（含历史不稳定的 sdpa b32），b64 3/3 不崩——shm 命令通道竞态根因证实并修掉 | `/root/p6_d2_nightly.json`，`P6-nightly.md` §2 |
 | 在线容量 v3 | **四档（50/75/90/100%）全部 100% SLO**（v2 只有 50% 档）；100% 档 goodput 0.050→**0.771 req/s（15.4×）** | `benchmarks/P6-serving-v3.md` |
 | 容量天花板（P2b+I7 合看） | **不是锐利拐点**：0.87–0.96 目标 QPS 是**高方差软边界（SLO 80–100%；同一负载两次跑出 100% vs 84.4%）**；硬饱和 **0.94 req/s / 60 tok/s 输出**；SLO 容量 ≈ v2 的 **2.1×**（可持续达成值 ≈0.81–0.86 req/s） | `online-v3-highload.json`、`p6_i7_knee.json`，`P6-i5-i6-i7.md` §3 |
-| I4 paged attention 定位 | 页边界/poison-tail 直接参考通过（`1.22e-4 < 2e-3`）；首层差 `2.44e-4` 经 bf16 深层放大，30B 同状态 probe 出现 19/8,928 近平局 top-1 翻转（最大 logits 差 6.09） | `docs/P6-I4-attention-logits.md`，`p6_attention_logits_i4.json/.jsonl` |
+| I4 paged attention（L1–L4 过，L5 待） | 差异=bf16 归约顺序（19/8,928 翻转、margin ≤0.3125）；**L1–L4 全过 → 决策 `adopt_triton_paged`**；L3 人工判读 12/12 语义等价；**L5 因 paged 启动挂死未完成 → 默认仍 sdpa** | `docs/P6-numerics-policy.md`、`benchmarks/P6-L3-review.md`、`benchmarks/p6-attention-equivalence-decision.json` |
 | 图 replay（本轮重新隔离） | `SDPA + bmm_dense` 下 tiny MoE **0/5**（稳定 token 漂移），8B dense **0/5**（120 s watchdog）；blocking 重放确认首个 graph replay 漂移，清 prefix cache 无效。**未找到单一代码根因，禁止 30B 图 A/B** | `benchmarks/data/p6b/p6_graph_isolation.json/.jsonl`（sha256 见 §2） |
 | I5 采用栈 b64 | b64、128-in/128-out、3 repeats：**3/3 完成、无 MUSA error、三轮 token 完全一致**；中位吞吐 141.48 / 140.97 / 141.75 tok/s | `p6_i5_i6.json/.jsonl` |
 | I6 前缀缓存 | 8 请求、512-in/384 shared-prefix：cold 三轮命中增量均 0；hot 三轮均 **+2048 tokens**，TTFT p95 约 1.256 s → 0.911–0.935 s | `p6_i5_i6.json/.jsonl` |

@@ -54,14 +54,21 @@
 - **影响**：图实验样本量受捕获噪声污染；捕获失败与 replay 漂移必须分开计数。
 - **下一步**：失败即独立进程重试 + 捕获失败时自动加 `MUSA_LAUNCH_BLOCKING=1` 定位 operator；把捕获成功率作为图实验固定前置指标。
 
-### I4 🟡 paged attention 与 SDPA 的 bf16 数值路径差异（已定位，keep_sdpa）
-- **现状**：冻结门性能项全过（TPOT ratio 0.594–0.618、吞吐比 1.48–1.59、CV ≤0.013、candidate 自身确定），但 b32/c2048 请求级一致率 **0.875 < 0.99**（c512 也仅 0.938/0.969）。
-- **定位**：TP2 同状态 logits probe（每步 SDPA→还原 KV→Triton→恢复）在 8,928 个 request-step 中 **19 次 top-1 翻转**；页边界/poison-tail 参考误差仅 `1.2207e-4 < 2e-3`，首层最大差 `2.4414e-4`，bf16 48 层后放大到 logits `6.09`（layer 36：`8.72`）；翻转处 baseline top-2 margin 均 ≤0.3125。**排除页表/mask/tail 地址错误**。
-- **结论**：在线 softmax 与 SDPA 的累加顺序差异，无法用有证据的局部 patch 消除。默认保持 SDPA；**不再做第二次 30B paged A/B，不做无依据内核试错**。
-- **转正条件（唯一）**：产品方明确接受"稳定但不同"的 greedy 输出并授权新的正确性契约 → 另立门禁评估。
-- **证据**：`docs/P6-I4-attention-logits.md`、`benchmarks/data/p6b/p6_attention_logits_i4.json`（`f9b686bcb46e768d6…`）/`.jsonl`（`46a06091ae7df233…`）、`p6_attention_ab.json`、`benchmarks/p6-attention-ab-decision.json`。
-- **在桌收益**：c2048 TPOT 可再降 31–41%（离线实测）。
+### I4 🟡 已过数值/质量/确定性三门，性能门（L5）未完成 —— 默认暂仍 sdpa
+- **诊断（已完成，不再重做）**：差异是 **bf16 归约顺序**，非页表/mask/tail bug。同状态 teacher-forced probe：8,928 request-step 中 **19 次 top-1 翻转（0.213%）**，翻转处 top-2 margin **全部 ≤0.3125**；页边界/乱序页/poison-tail 参考误差 `1.22e-4 < 2e-3`。
+- **门已按业界标准重写**（`docs/P6-numerics-policy.md`；实现 `scripts/p6_decide_attention_equivalence.py`；旧 `p5_decide.py` 阈值**未改**，其 `keep_sdpa` 作为历史保留）：
 
+  | 层 | 结果 |
+  |---|---|
+  | L1 结构 | ✅ `max_abs=1.22e-4` |
+  | L2 数值 | ✅ 翻转率 0.213% < 0.5%；margin 0.3125 < 0.5 |
+  | L3 质量 | ✅ 首 token 一致率 **100%**、退化 0/0、**12 组人工判读 12/12 语义等价** |
+  | L4 确定性 | ✅ 两后端各 3 次重复逐 token 一致（两次独立实验数值完全相同） |
+  | L5 性能 | ❌ **未完成**：`api_server --attention-backend triton_paged` 启动期挂住（双卡各 29.5 GiB 权重已载、零日志、0% util、/health 无响应），按"失败即记录"停掉，未重试 |
+
+- **L3 的关键发现（推翻了初版门）**：初版用字符级编辑距离 p95 ≤8% → 实测 **p95 65%、仅 20/100 条请求完全一致**，看似"质量崩了"。但 **LCP 中位 42.5 / 均值 60.7（共 128）** + 首 token 100% 一致 → 现象是"先一致 1/3~1/2，遇一次近平局翻转后整段走不同分支"。12 组人工判读全部语义等价（例："降低显存/提高速度/降低功耗" vs "计算量/内存/延迟"）。**编辑距离度量的是措辞，不是质量**，故 L3 改为"首 token + 退化 + 人工判读"。
+- **当前决策**：`benchmarks/p6-attention-equivalence-decision.json` = **`adopt_triton_paged`**（L2/L3/L4 全过），但**默认值暂不切换**——按契约 L5 也必须过。
+- **证据**：`benchmarks/data/p6b/p6_attention_equivalence.json`、`p6_L3_review.json`、`p6_attention_logits_i4.json`、`benchmarks/P6-L3-review.md`
 ### I8 ⚠️ 已跑但**无效**（10-27 12:00 结束）：长 unique-prompt 覆盖仍未完成
 - **实际结果**：`/root/p6_i8_long_unique.json`（384 条记录）——`prompt_mode=unique`、`prompt_words=1024`，但 **`prompt_tokens=18,354`**（"1024 words unique" 被切成 18k token，超出意图 18×）。
 - **三档全部崩溃**：TTFT p95 **115.9 / 110.6 / 65.8 s**；每档仅 **8/128、8/128、4/128** 请求拿到 `[DONE]`（其余 120–124 条 `stream ended before [DONE]`）；SLO **0%**；`tpot_s` 有 120+ 条为 null。
@@ -72,7 +79,7 @@
 ### I12 🟢 崩溃进程 teardown 卡死
 - **现状**：rank 间 DistBackendError 后主进程挂在退出路径（bmmdense 回归、30B graph A/B 均遇到），需人工按 PID kill。
 - **下一步**：engine `exit()` 加 barrier 超时 + `os._exit` 兜底；短期靠 SOP（HANDOFF-P6c §4）。
-
+- **10-27 新增第三类现场**：`api_server --attention-backend triton_paged` 启动期挂住——两 rank 权重载入完成（各 29.5 GiB）、**无任何日志**、GPU 0% util、`/health` 无响应，15 分钟未起。与 teardown 卡死同类（rank 间推进不对齐），但发生在**启动 warmup 段**。排查线索：加 `MUSA_LAUNCH_BLOCKING=1` 与逐步 print。
 ### I14 🟢 BISECT-1/2 补丁去留未决
 - **现状**：`model_runner.py` 的 `# BISECT-1`（replay 前后 rank barrier）与 `# BISECT-2`（每桶私有 graph pool）。8B 当时是实证修复（5/5），本轮隔离下 8B 仍 0/5 → **该修复不构成通用解**。
 - **下一步**：I1 有结论后一并处理——图若要重开则保留并重验；图永久放弃则删除，降低认知负担。当前对 eager 路径无影响，可暂留。

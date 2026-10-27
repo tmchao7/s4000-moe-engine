@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "input": "benchmarks/data/p6b/p6_attention_equivalence.json",
+  "evidence_sha256": "4f9b3f3cca23596d2d4cbd8dba48acae9138c5d52bcab76224c45001262dbbfb",
+  "l2_input": "benchmarks/data/p6b/p6_attention_logits_i4.json",
+  "l2_sha256": "f9b686bcb46e768d6d456b8c389d12120caebf90d0f6f833e010e03f6ce4017e",
+  "thresholds": {
+    "first_token_agreement_min": 0.99,
+    "degenerate_max": 0,
+    "review_equivalent_ratio_min": 0.9,
+    "review_degraded_max": 0,
+    "determinism_required": true,
+    "flip_rate_max": 0.005,
+    "flip_margin_max": 0.5,
+    "report_only": [
+      "request_token_identical",
+      "request_token_agreement_mean",
+      "edit_distance_ratio_p50",
+      "edit_distance_ratio_max"
+    ]
+  },
+  "checks": [
+    {
+      "layer": "L3",
+      "name": "first_token_agreement",
+      "value": 1.0,
+      "threshold": 0.99,
+      "pass": true
+    },
+    {
+      "layer": "L3",
+      "name": "degenerate_outputs",
+      "value": 0,
+      "threshold": 0,
+      "pass": true
+    },
+    {
+      "layer": "L3",
+      "name": "qualitative_equivalence_ratio",
+      "value": 1.0,
+      "threshold": 0.9,
+      "pass": true,
+      "detail": {
+        "reviewed": 12,
+        "equivalent": 12,
+        "artifact": "benchmarks/P6-L3-review.md"
+      }
+    },
+    {
+      "layer": "L3",
+      "name": "review_degraded_count",
+      "value": 0,
+      "threshold": 0,
+      "pass": true
+    },
+    {
+      "layer": "L4",
+      "name": "per_backend_determinism",
+      "value": {
+        "sdpa": true,
+        "triton_paged": true
+      },
+      "threshold": "both true",
+      "pass": true
+    },
+    {
+      "layer": "L2",
+      "name": "top1_flip_rate",
+      "value": 0.002128136200716846,
+      "threshold": 0.005,
+      "pass": true,
+      "detail": {
+        "flips": 19,
+        "compared_request_steps": 8928
+      }
+    },
+    {
+      "layer": "L2",
+      "name": "flip_margin_max",
+      "value": 0.3125,
+      "threshold": 0.5,
+      "pass": true
+    }
+  ],
+  "reported_only": {
+    "request_token_identical": 20,
+    "request_token_agreement_mean": 0.509296875,
+    "edit_distance_ratio_p50": 0.23316420300149962,
+    "edit_distance_ratio_max": 0.8526315789473684
+  },
+  "decision": "adopt_triton_paged",
+  "adopt": true
+}
