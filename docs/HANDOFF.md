@@ -7,7 +7,7 @@
 >
 > **2026-10-26 22:55 追加（会话 #6 收手交接，最新）**：**先读 `docs/HANDOFF-P6b.md`，它推翻上面 20:25 的 T1 结论**。15.6 GiB 是 `qwen3_moe.py` 的惰性权重转置副本（576 MiB/层），不是厂商 workspace；零拷贝厂商 MoE 已验证但默认配置慢 2.3–6.3×，**decode 改用新的 `bmm_dense`（1.3–1.95× 于 grouped_mm，且可捕获）**；30B 图捕获成功（6 桶，+0.34 GiB）但 **replay 在模型规模上间歇性挂死**（唯一未解）；另修掉 shm 命令通道竞态（很可能就是历史 b32/b64 不稳定根因）。夜间迭代主线是 eager 的 `bmm_dense + triton_paged`，图只做时间盒诊断。
 >
-> **2026-10-27 凌晨追加（夜间自主迭代收尾，最新）**：**先读 `docs/HANDOFF-P6c.md`**。P6b 的全部【待验证】项已闭环：`decode_moe_backend=bmm_dense` 过全部 30B 门并落地（离线 b32 110.6/133 tok/s，+59%/+92%）；**b32 不可复现与 b64 崩溃被 shm 修复治好（证实）**；在线容量 v3 四档全 100% SLO（100% 档 goodput 15.4×）；triton_paged 冻结门判 keep_sdpa（一致率 0.875<0.99，分歧为可复现数值差异）；图 replay 8B 找到候选修复（replay 前后 barrier + 每桶私有 pool，5/5 绿）但 30B 第一次 replay 仍打死设备，图方向时间盒关闭。逐实验过程见 `docs/NIGHTLY-LOG.md`。
+> **2026-10-27 凌晨追加（夜间自主迭代收尾，最新）**：**先读 `docs/HANDOFF-P6c.md`**。P6b 的全部【待验证】项已闭环：`decode_moe_backend=bmm_dense` 过全部 30B 门并落地（离线 b32 110.6/133 tok/s，+59%/+92%）；**b32 不可复现与 b64 崩溃被 shm 修复治好（证实）**；在线容量 v3 四档全 100% SLO（100% 档 goodput 15.4×）；triton_paged 冻结门判 keep_sdpa（一致率 0.875<0.99，分歧为可复现数值差异）；图 replay 8B 找到候选修复（replay 前后 barrier + 每桶私有 pool，5/5 绿）但 30B 第一次 replay 仍打死设备，图方向时间盒关闭。逐实验过程见 `docs/NIGHTLY-LOG.md`；未解决问题 18 项汇总（含优先级）见 `docs/P6-open-issues.md`。
 
 ---
 
