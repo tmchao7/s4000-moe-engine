@@ -1,5 +1,7 @@
 # HANDOFF-P6d — 交接（2026-10-27 15:30；19:50 更新：P0–P2 已完成）
 
+> ⚠️ **本文已被 [`HANDOFF-P6e.md`](./HANDOFF-P6e.md) 取代**（2026-10-27 19:50）。本文保留为历史记录；接手请先读 P6e。
+>
 > **本文是当前权威交接**（下一轮排期见 `docs/P8-24h-plan.md`），后继 `docs/HANDOFF-P6c.md`。接手顺序：
 > ① 本文全文 → ② [`docs/PLAN.md`](./PLAN.md)（做什么、按什么顺序，**唯一计划**）→ ③ [`docs/ISSUES.md`](./ISSUES.md)（20 项台账）→ ④ 细节：`docs/P6-numerics-policy.md`（I4 契约）、`docs/P7-speculative-decoding-survey.md`（P7 已判死）、`docs/NIGHTLY-LOG.md`（时间线）。
 > 规则：**文档与代码/实测冲突时以代码和实测为准，先修文档再继续。计划只在 PLAN.md 改，本文件不重复排期。**
