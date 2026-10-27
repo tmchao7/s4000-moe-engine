@@ -38,3 +38,4 @@
 - **在线压测 v2**：Poisson/固定开放环注入；只有收到 `[DONE]` 和真实 token usage 才成功，报告 request/input/output/total throughput、TTFT/TPOT/ITL/E2E、goodput 与最大并发。
 - **样本量**：机制测试保留原 32 请求/点；P5 容量结论至少 128 请求/点，最终 75%/90% 点使用 256 请求。
 - **已知偏差**：本轮吞吐测量用 `temperature=0`（贪心），与生产常见 temperature=0.6 不同；温度只影响采样，不影响前向开销，后续如需与外部数字对比应统一标注。
+- `P7-phase0.md` — 投机解码 Phase 0 实测与 go/no-go（**NO-GO**：α=0.006、c=0.384、0.73×）+ 每步固定成本发现

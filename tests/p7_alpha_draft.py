@@ -11,7 +11,13 @@ per-round emission; the speedup is that divided by the round-cost factor
 The go/no-go gate (frozen in the approved plan): best-k single-stream
 speedup >= 1.3x.
 
-Run:  PYTHONPATH=/root/moe-server-s4000 python3 tests/p7_alpha_draft.py
+Run ONE draft model per process (loading two in one process exhausts the KV
+budget of the second).  ``--draft-steps`` accepts the JSONL streamed by
+``tests/p7_draft_steps.py``; the lookup key is (model, tp, batch) and ``--tp``
+selects which entry is used for the cost ratio.
+
+Run:  PYTHONPATH=/root/moe-server-s4000 python3 tests/p7_alpha_draft.py \
+          --models /root/autodl-tmp/models/Qwen3-0.6B --tp 2
 """
 import argparse
 import json
@@ -37,7 +43,9 @@ def lcp(a, b):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--models", default="/root/autodl-tmp/models/Qwen3-0.6B,/root/autodl-tmp/models/Qwen3-1.7B")
+    parser.add_argument("--models", default="/root/autodl-tmp/models/Qwen3-0.6B")
+    parser.add_argument("--tp", type=int, default=2)
+    parser.add_argument("--output-suffix", default="")
     parser.add_argument("--reference", default="/root/p7_target_ref.json")
     parser.add_argument("--draft-steps", default="/root/p7_draft_steps.json")
     parser.add_argument("--max-tokens", type=int, default=128)
@@ -53,9 +61,14 @@ def main():
     target_tokens = [row["token_ids"] for row in reference["rows"]]
     target_len = reference["max_tokens"]
 
-    draft_steps = json.loads(Path(args.draft_steps).read_text(encoding="utf-8"))
+    steps_path = Path(args.draft_steps)
+    steps_text = steps_path.read_text(encoding="utf-8")
+    if steps_path.suffix == ".jsonl":
+        step_records = [json.loads(line) for line in steps_text.splitlines() if line.strip()]
+    else:
+        step_records = json.loads(steps_text)["records"]
     step_by_model = {
-        (r["model"], r["batch"]): r["itl_p50_s"] for r in draft_steps["records"]
+        (r["model"], r.get("tp", 2), r["batch"]): r["itl_p50_s"] for r in step_records
     }
 
     analysis = {"gate": args.gate, "target_step_s": TARGET_STEP_S, "drafts": {}}
@@ -65,7 +78,7 @@ def main():
         llm = LLM(
             model,
             enforce_eager=True,
-            tensor_parallel_size=2,
+            tensor_parallel_size=args.tp,
             attention_backend="sdpa",
             scheduler_policy="fcfs",
             max_model_len=1024,
@@ -90,7 +103,7 @@ def main():
             "speedup": {},
         }
         # single-stream (b1) verdict with measured c
-        d1 = step_by_model.get((name, 1))
+        d1 = step_by_model.get((name, args.tp, 1))
         c = d1 / TARGET_STEP_S["b1"] if d1 else None
         entry["draft_step_b1_s"] = d1
         entry["c_b1"] = c
@@ -111,8 +124,11 @@ def main():
             flush=True,
         )
 
-    Path(args.output).write_text(json.dumps(analysis, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"[p7c] wrote {args.output}", flush=True)
+    out_path = Path(args.output)
+    if args.output_suffix:
+        out_path = out_path.with_name(out_path.stem + args.output_suffix + out_path.suffix)
+    out_path.write_text(json.dumps(analysis, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[p7c] wrote {out_path}", flush=True)
 
 
 if __name__ == "__main__":

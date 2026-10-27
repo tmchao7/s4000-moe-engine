@@ -3,7 +3,7 @@
 > **② 台账：`docs/ISSUES.md`**（27 项：I 系列 P6 技术债、**S 系列 P7 投机解码**、**E 系列生态/厂商**，含已关闭表与优先级总表）；
 > **③ 状态与 SOP：`docs/HANDOFF-P6c.md`**（当前栈、成绩单、服务器状态、红线）。
 > 本文件（HANDOFF.md）自此只承担 **P0–P6 历史与加载台账** 的角色；P6-open-issues.md 已收敛为指针。
-> 关键现状：bmm_dense 已采用（b32 110.6 / b64 141.5 tok/s）；b32/b64 稳定性闭环；在线四档全 100% SLO；**图控制组 0/5 → 保持 eager、禁 30B A/B**；**I4 keep_sdpa**（bf16 路径差异）；**投机解码调研完成、只差 Phase 0 的 c/α 实测（门 1.3×）**。
+> 关键现状：bmm_dense 已采用（b32 110.6 / b64 141.5 tok/s）；b32/b64 稳定性闭环；在线四档全 100% SLO；**图控制组 0/5 → 保持 eager、禁 30B A/B**；**I4 keep_sdpa**（bf16 路径差异）；**投机解码 Phase 0 已测 → NO-GO（α=0.006、c=0.384、最优 0.73×）**；**新发现 I19：每步 ~50 ms 固定成本是当前最大杠杆**。
 
 # HANDOFF — moe-server-s4000（MUSA S4000 双卡推理引擎）
 
@@ -96,7 +96,9 @@ cd /root/moe-server-s4000                            # 代码（服务器无 .gi
 | 13 | I7 拐点细化（max-qps 1.05，fractions 0.83/0.87/0.91） | ✅ 完成（软边界 80–100%，非锐利 knee） | `p6_i7_knee.json`、`benchmarks/P6-i5-i6-i7.md` §3 |
 | 14 | I8 长 unique-prompt 在线覆盖（1k words × 3 档） | 🟡 **在途**（runner 未完成，不重跑） | `/root/p6_i7_i8_runner.log`、`/root/p6_i8_long_unique.json` |
 | 15 | 图路径重新隔离（tiny MoE / 8B dense 各 5 次） | ❌ 0/5 ×2，定界为 MUSA graph runtime 限制 | `p6_graph_isolation.json/.jsonl` |
-| 16 | P7 Phase 0（draft 步时 + 30B 参考 + α 判决） | ⏳ **待跑**（GPU 被 #14 占用；`/root/wait_p7.sh` 已排队） | `p7_draft_steps.json` / `p7_target_ref.json` / `p7_alpha.json` |
+| 16 | P7 Phase 0（draft 步时 + 30B 参考 + α 判决） | ✅ 完成 → **NO-GO**（α=0.006、c=0.384、最优 0.73×） | `benchmarks/P7-phase0.md`、`/root/p7_*.json` |
+| 17 | 0.6B 每步开销分解（发现固定成本主导） | ✅ 完成（forward 占 98.2%；0.6B/1.7B 步时相同 → 每层 ~1.4–2.2 ms 固定开销） | `/root/p7_step_overhead_06.json` |
+| 18 | I8 长 unique-prompt（第 14 发） | ⚠️ **无效跑**（prompt 18,354 token 非 ~1k；rank1 中途死亡 → 120–124/128 无 `[DONE]`） | `/root/p6_i8_long_unique.json` |
 
 夜间台账总账见 `docs/NIGHTLY-LOG.md`（每发预冻结门 + 实际结果）；交接 successor 文档 `docs/HANDOFF-P6c.md`。
 

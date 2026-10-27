@@ -7,8 +7,17 @@ frozen 30B target step times this yields the cost ratio
 ``c = draft_step / target_step`` used by the go/no-go gate in
 docs/P7-speculative-decoding-survey.md §6.
 
+Records stream to ``--jsonl`` as they complete (a crash keeps finished points).
+Run ONE model per process: loading a second model in the same process hits the
+KV-cache heuristic budget (the first model's KV cache is not released).
+
+TP1 timing is the "per-rank full replica" cost used by the draft-without-
+all-reduce design (docs/P7-speculative-decoding-survey.md §3.2): in a TP2
+deployment each rank can hold a whole 0.6B replica and drop all MCCL from the
+draft, so pass ``--tp 1`` to measure that variant.
+
 Run:  PYTHONPATH=/root/moe-server-s4000 python3 tests/p7_draft_steps.py \
-          --models /root/autodl-tmp/models/Qwen3-0.6B,/root/autodl-tmp/models/Qwen3-1.7B
+          --models /root/autodl-tmp/models/Qwen3-0.6B --tp 2 --jsonl /root/p7_draft_steps.jsonl
 """
 import argparse
 import json
@@ -24,7 +33,9 @@ from nanovllm.benchmarking import percentile  # noqa: E402
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--models", default="/root/autodl-tmp/models/Qwen3-0.6B,/root/autodl-tmp/models/Qwen3-1.7B")
+    parser.add_argument("--models", default="/root/autodl-tmp/models/Qwen3-0.6B")
+    parser.add_argument("--tp", type=int, default=2)
+    parser.add_argument("--jsonl", default="/root/p7_draft_steps.jsonl")
     parser.add_argument("--batches", default="1,8,32")
     parser.add_argument("--prompt-len", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=32)
@@ -37,13 +48,14 @@ def main():
 
     batches = [int(b) for b in args.batches.split(",")]
     results = []
+    jsonl_handle = open(args.jsonl, "a", encoding="utf-8") if args.jsonl else None
     for model in [m.strip() for m in args.models.split(",") if m.strip()]:
         name = Path(model).name
         get_rope.cache_clear()
         llm = LLM(
             model,
             enforce_eager=True,
-            tensor_parallel_size=2,
+            tensor_parallel_size=args.tp,
             attention_backend="sdpa",
             scheduler_policy="fcfs",
             max_model_len=args.prompt_len + args.max_tokens + 16,
@@ -64,6 +76,7 @@ def main():
                         tpots.append(output["metrics"]["tpot_s"])
                 record = {
                     "model": name,
+                    "tp": args.tp,
                     "batch": batch,
                     "prompt_len": args.prompt_len,
                     "itl_p50_s": percentile(itls, 0.50),
@@ -71,11 +84,16 @@ def main():
                     "tpot_p50_s": statistics.median(tpots),
                 }
                 results.append(record)
+                if jsonl_handle is not None:
+                    jsonl_handle.write(json.dumps(record, sort_keys=True) + "\n")
+                    jsonl_handle.flush()
                 print("[p7a]", json.dumps(record, sort_keys=True), flush=True)
         finally:
             llm.exit()
             get_rope.cache_clear()
 
+    if jsonl_handle is not None:
+        jsonl_handle.close()
     Path(args.output).write_text(json.dumps({"records": results}, indent=2), encoding="utf-8")
     print(f"[p7a] wrote {args.output}", flush=True)
 

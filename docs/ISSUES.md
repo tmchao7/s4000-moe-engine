@@ -14,18 +14,19 @@
 | **S** | P7 投机解码 | S1–S6 |
 | **E** | 生态与厂商（autotune 手搓边界、runtime 限制） | E1–E6 |
 
-**统计（27 项 = 未结 19 + 已关闭 8）**
+**统计（28 项 = 未结 17 + 已关闭 10）**（10-27 Phase 0 后更新）
 
 | 状态 | 数量 | 条目 |
 |---|---:|---|
-| 🔴 阻塞主路径 / 决定立项 | 2 | I1、S1 |
-| 🟡 收益冻结 / 未闭合 | 8 | I2、I3、I4、I8、S2、S3、S4、S5 |
+| 🔴 阻塞主路径 / 最大杠杆 | 2 | I1、**I19（每步固定成本）** |
+| 🟡 收益冻结 / 未闭合 | 7 | I2、I3、I4、I8、S2、S3、S4（S5 随 S1 一并搁置） |
 | 🟡 条件触发（被 I4 决策闸住） | 1 | E1 |
 | 🟢 工程债 / 低优先 | 4 | I12、I14、S6、E2 |
 | ⚪ 厂商侧（我们不可修） | 4 | E3、E4、E5、E6 |
-| ✅ 已关闭 | 8 | I5、I6、I7、I9、I10、I11、I13、I15 |
+| ✅ 已关闭 | 10 | I5、I6、I7、I9、I10、I11、I13、I15、**S1（no-go）**、I8（无效跑，见下） |
 
-核对：2+8+1+4+4+8 = 27 ✓（I 系列未结 7 + S 系列 6 + E 系列 6 = 19 未结；已关闭 8）
+核对：2+7+1+4+4+10 = 28 ✓（I 系列未结 8 = I1/I2/I3/I4/I8*/I12/I14/I19；S 系列未结 5 = S2–S6；E 系列 6；已关闭 10）
+> \* I8 按「无效跑」关闭：prompt 实际 18,354 token（非意图的 ~1k），且 rank1 中途死亡导致 120–124/128 请求无 `[DONE]`、SLO 0% —— 结论不可用，需重设计后再测（见 ISSUES I8 条目）。
 
 状态图例：🔴 阻塞主路径／决定立项　🟡 收益被冻结或覆盖缺口　🟢 工程债/低优　⚪ 厂商 runtime，我们不可修
 
@@ -61,10 +62,12 @@
 - **证据**：`docs/P6-I4-attention-logits.md`、`benchmarks/data/p6b/p6_attention_logits_i4.json`（`f9b686bcb46e768d6…`）/`.jsonl`（`46a06091ae7df233…`）、`p6_attention_ab.json`、`benchmarks/p6-attention-ab-decision.json`。
 - **在桌收益**：c2048 TPOT 可再降 31–41%（离线实测）。
 
-### I8 🟡 长 unique-prompt 在线覆盖（在途，未结论）
-- **状态**：生产栈 API + 单一锁 runner，执行 1,024 words、64-out、`--prompt-mode unique`、0.435/0.653/0.870 QPS、128 请求/档。**写本文时 JSON 尚未完整落盘，不能报告 SLO 或 token 长度门。**
-- **收尾方式**：只等 `/root/p6_i7_i8_runner.log` 自然退出 → 核验 `prompt_tokens_p50 ≥ 1000`、每档 128 条记录、sha256 → 归档；若失败，原样记录，不立刻重跑。
-- **影响**：容量结论目前只覆盖 137-in/64-out；长输入（prefill 主导）是空白。
+### I8 ⚠️ 已跑但**无效**（10-27 12:00 结束）：长 unique-prompt 覆盖仍未完成
+- **实际结果**：`/root/p6_i8_long_unique.json`（384 条记录）——`prompt_mode=unique`、`prompt_words=1024`，但 **`prompt_tokens=18,354`**（"1024 words unique" 被切成 18k token，超出意图 18×）。
+- **三档全部崩溃**：TTFT p95 **115.9 / 110.6 / 65.8 s**；每档仅 **8/128、8/128、4/128** 请求拿到 `[DONE]`（其余 120–124 条 `stream ended before [DONE]`）；SLO **0%**；`tpot_s` 有 120+ 条为 null。
+- **根因（两项，都不是引擎的长上下文能力结论）**：① prompt 构造超擞（words≠tokens）；② **rank1 在运行中死亡**（收尾时 GPU1 仅剩 34 MiB、rank0 仍持有 43 GiB），足以解释大面积 stream 中断。
+- **决策**：按计划「失败原样记录，不重跑」。**I8 仍未覆盖**；重设计要点：用 token 数而不是 words 控制长度（目标 ~1k token）、max_model_len 显式设置、运行中监控 rank1 存活、失败请求单列 `ok` 与 `slo` 分母。
+- **证据**：`/root/p6_i8_long_unique.json/.jsonl`（本地 `benchmarks/data/p6b/`）
 
 ### I12 🟢 崩溃进程 teardown 卡死
 - **现状**：rank 间 DistBackendError 后主进程挂在退出路径（bmmdense 回归、30B graph A/B 均遇到），需人工按 PID kill。
@@ -76,15 +79,24 @@
 
 ---
 
+### I19 🔴 每步固定成本 ~1.4–2.2 ms/层（当前最大性能杠杆）
+- **实测（10-27）**：0.6B 与 1.7B 的 b1 步时**都是 ~63.8 ms**（若带宽 bound，1.7B 应慢 2.5–3×）；TP1 只比 TP2 快 ~12 ms（all-reduce 不是主因）；0.6B eager b1 的 63.2 ms 中 **forward 占 98.2%**（62.1 ms），prepare 0.22 ms、sample 0.86 ms。
+- **推论**：0.6B 的权重带宽下限只有 ~3 ms/步，实测 ~40 ms 净 GPU 时间 → **约 90% 是每层固定开销**（28 层 → ~1.4 ms/层；8B 32 层 → ~2.2 ms/层，P6b 74.3 ms 亦吻合）。
+- **为什么它最优先**：同时压着 (a) 单流延迟（30B b1 = 165 ms/step）、(b) 容量（0.94 req/s 硬饱和）、(c) 所有"多步"方案（投机解码需要 k+1 个 draft 步；这正是 S1 判 no-go 的技术原因）。收益面大于投机解码，且不依赖产品决策。
+- **两个便宜的下步测量**（各 ≤15 min）：① 30B 的 step_overhead 分解（165 ms 里 forward/prepare/sample 与每层占比）→ 给出"砍固定成本"的上界；② 0.6B 逐层计时 → 区分"launch 数量多"还是"单 kernel 慢"。
+- **若确认是 launch-bound**：图的 1.55× 就是现成收益（0.6B b1 观测 graph 40.0 ms vs eager 63.2 ms），I1 从"低优"升为"高优"——但必须先解决 replay 漂移。
+- **证据**：`/root/p7_step_overhead_06.json`、`/root/p7_draft_steps.jsonl`、`benchmarks/P7-phase0.md` §2
+
 ## 2. P7 投机解码（S 系列）
 
 > 详细论证见 [`docs/P7-speculative-decoding-survey.md`](./P7-speculative-decoding-survey.md)（必要性、选型、判决表）与 [`docs/P7-implementation-plan.md`](./P7-implementation-plan.md)（代码方案、算法、测试门）。排期见 PLAN §1 Track B。
 
-### S1 🔴 Phase 0 未测：c 与 α 都还没有实测值 → P7 立项与否未定
-- **现状**：`c = draft 单步 / target 单步`、`α = 草稿接受率` 两个数决定一切。目前只有估计：c(0.6B)≈0.07–0.12、c(1.7B)≈0.2–0.3、α≈0.4–0.6（社区经验）。target 单步已实测（b1 165.3 / b8 174.2 / b32 248.8 ms，采用栈）。
-- **已就绪**：draft 0.6B/1.7B 已下载并逐项核实与引擎兼容（dense、tie=True、head_dim 128、tokenizer 151669 一致）；脚本 `tests/p7_draft_steps.py`（0a）、`tests/p7_alpha_target.py`（0b）、`tests/p7_alpha_draft.py`（0c）已就位；服务器 `/root/wait_p7.sh` 已排队等 GPU。
-- **冻结门**：查 `docs/P7-speculative-decoding-survey.md` §7.1 判决表，**k 最优下单流加速 ≥ 1.3× → 立项**；< 1.3× → 归档关闭 P7，不开工。
-- **阻塞原因**：GPU 被 I8 长 prompt 覆盖任务占用（一次只跑一个 GPU 任务）。
+### S1 ✅ 已判决 NO-GO（10-27 Phase 0 实测）：朴素 draft 路线不成立
+- **实测**（`benchmarks/P7-phase0.md`）：α(0.6B→30B) = **0.0056**、α(1.7B→30B) = **0.0068**（32 条 prompt，LCP 均值 0.72/0.88，最大 4/7，零条完全一致）；c = **0.384/0.386**。最优 k=1 的加速 **0.725×/0.741×** —— **比基线慢 26–28%**，与冻结门 1.3× 相差 44%。
+- **两个独立否决原因**：① draft 太慢（c≈0.39，源于每步固定成本，见 I19）；② 接受率≈0（0.6B/1.7B 是 Qwen3 初代思考型后训练，target 是 2507 非思考；跨代组合导致首 token 分布即分叉）。
+- **已排除的伪因**：tokenizer 三模型逐 token 一致（14/14/14）；引擎收 raw encode 无模板差异；草稿输出连贯非退化（48 token 34 个不同，与 target 前 2 token 相同）。
+- **决策**：`P7-implementation-plan.md` 的 M1–M4 **不启动**；S6（EAGLE3/PARD 训练头）成为唯一可能路线，且**前置条件是先解决 I19**（否则 α=0.8 也只有 ~1.1×）。
+- **证据**：`/root/p7_target_ref.json`、`/root/p7_draft_steps.jsonl`、`/root/p7_alpha_06_tp2.json`、`_17_tp2.json`、`/root/p7_step_overhead_06.json`
 
 ### S2 🟡 M1：双模型加载 + 多位置 logits（Phase 0 通过后开工）
 - **改动**：`embed_head.py:58-60` 只回 last-token logits → verify 需多位置；`ModelRunner` 需第二套 draft config/model/kv_cache（当前严格单模型）；Config 增 3 字段（`draft_model`/`spec_k`/`spec_enable`，否则被 `llm_engine.py:34-37` 过滤掉）。
@@ -161,18 +173,18 @@
 
 ---
 
-## 5. 优先级总表
+## 5. 优先级总表（10-27 Phase 0 后重排）
 
 | 优先 | 条目 | 理由 | 成本 |
 |---:|---|---|---|
-| 1 | **I8 收口** | 已加载的实验只差核验，零边际成本 | ~0.5 h，无新增加载 |
-| 2 | **S1 Phase 0** | 决定 P7 生死；不做则整个投机解码路线悬空 | 1 发 30B 加载（~8–15 min）+ 0a ~10 min |
-| 3 | **I12** teardown 超时 | 每轮都要人工 kill；小改动但需 TP2 实测 | ~1–2 h |
-| 4 | **S2→S3→S4→S5** | 仅在 S1 过门后；M2 的逐 token 全等门是硬门槛 | 4–6 夜 |
-| 5 | **E2** fused_moe 配置 | 便宜（30–45 min），但只在 prefill 大批需要时才有价值 | 1 发加载 |
-| 6 | **E1** paged autotune | 高收益（+48–59% 之上再调），但**被 I4 产品决策闸住** | 1 发加载 30–60 min |
-| 7 | **I14** BISECT 补丁去留 | 随 I1/S 结论一并决 | 分钟级 |
-| 8 | **I1/I2/I3/I4/E3–E6** | 等厂商证据或产品决策；**当前不做任何实验** | — |
-| 9 | **S6** EAGLE3/PARD | 远期，需 S1–S5 落地 | 周级 |
+| 1 | **I19 每步固定成本** | 新测量的最大杠杆：0.6B 90% 的步时是每层固定开销；同时压单流延迟、容量、以及所有多步方案 | 先 2 个 ≤15 min 的分解测量 |
+| 2 | **I8 重设计重测** | 长上下文覆盖仍是空白（本轮无效跑）；需要 token 长度控制 + rank 存活监控 | 1 发加载 |
+| 3 | **I12** teardown 超时 | 本轮又踩一次（rank1 卡 barrier）；每轮都要人工 kill | 1–2 h |
+| 4 | **I1/图** | 若 I19 确认 launch-bound，图的 1.55×（0.6B b1）就变成高优——但需先解决 replay 漂移 | 时间盒 2–3 h |
+| 5 | **E2** fused_moe 配置 | 便宜，但只在 prefill 大批需要时才有价值 | 30–45 min |
+| 6 | **E1** paged autotune | 仍被 I4 产品决策闸住 | 30–60 min |
+| — | ~~S1 投机解码~~ | **已判 no-go（0.73×）**；S2–S5 不启动 | — |
+| — | S6 EAGLE3/PARD | 唯一可能的说明路线，前置是 I19 | 周级 |
+| — | I2/I3/I4/E3–E6 | 等厂商证据或产品决策 | — |
 
 **关键依赖**：S1 → {S2, S3, S4} → S5 → S6；**I4 产品决策 → E1**；I1 根因 → {I2, I14}。A（I8）与 B（S1）无依赖，但**都抢同一块 GPU，必须串行**。
