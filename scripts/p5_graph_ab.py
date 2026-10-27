@@ -18,8 +18,10 @@ Output: a payload consumable by the frozen gate
 """
 import argparse
 import json
+import os
 import statistics
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -73,6 +75,8 @@ def main():
     # utilisation heuristic fills the device (two OOMs during capture).
     parser.add_argument("--num-kvcache-blocks", type=int, default=64)
     parser.add_argument("--verify-tokens", type=int, default=32)
+    parser.add_argument("--verify-watchdog-s", type=int, default=300,
+                        help="hard deadline per verify generate; a wedged device exits(97) naming the phase")
     parser.add_argument("--output", default="/root/p5_graph_ab.json")
     args = parser.parse_args()
     batches = [int(value) for value in args.batches.split(",")]
@@ -214,12 +218,50 @@ def main():
     verify_prompts = prompts(4, args.prompt_len, vocab_size, seed=999)
     verify_params = SamplingParams(temperature=0, max_tokens=args.verify_tokens, ignore_eos=True)
 
+    def _with_watchdog(fn, seconds, label):
+        """Run one generate under a hard deadline.
+
+        A wedged MUSA device (30B graph replay, docs/P6-open-issues.md I1)
+        blocks inside the call forever; the driver watchdog only fires after
+        ~10 minutes and the resulting error surfaces at the *next* launch, so
+        the true hang point is lost.  This prints the exact config/phase that
+        hung and hard-exits (os._exit skips the teardown that itself hangs on
+        a wedged device; the runner's cleanup kills the spawn ranks).
+        """
+        result = {}
+
+        def worker():
+            try:
+                result["value"] = fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised in main thread
+                result["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(seconds)
+        if thread.is_alive():
+            print(
+                f"[graph-ab] WATCHDOG {label}: exceeded {seconds}s - device likely "
+                "wedged, hard exit (see docs/P6-open-issues.md I1)",
+                flush=True,
+            )
+            os._exit(97)
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
     def verify(config):
         configure(config)
         print(f"[graph-ab] verify {config}", flush=True)
         llm.scheduler.block_manager.clear_prefix_cache()
-        llm.generate(verify_prompts, verify_params, use_tqdm=False)  # warmup
-        outputs = llm.generate(verify_prompts, verify_params, use_tqdm=False)
+        _with_watchdog(
+            lambda: llm.generate(verify_prompts, verify_params, use_tqdm=False),
+            args.verify_watchdog_s, f"{config} warmup",
+        )  # warmup
+        outputs = _with_watchdog(
+            lambda: llm.generate(verify_prompts, verify_params, use_tqdm=False),
+            args.verify_watchdog_s, f"{config} measured",
+        )
         return [list(output["token_ids"]) for output in outputs]
 
     tokens["graph_candidate"] = verify("graph_candidate")

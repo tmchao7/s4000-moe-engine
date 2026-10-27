@@ -70,11 +70,13 @@
 
 ## D. 工程债 / 工具
 
-### I10 🟢 `p6_bmm_dense_tiny.py` 的退出码语义误导
+### I10 ✅ 已修（10-27）`p6_bmm_dense_tiny.py` 的退出码语义误导
+- **修复**：graph vs eager 段改为 `--with-graph` 显式开启（默认跳过并打印提示）；六配置 token 全等门单独决定退出码。tiny 捕获的间歇性（I3）不再污染回归 rc。
 - **现状**：六配置 token 全等门**通过**后，该脚本附带的 graph vs eager 段在 tiny 捕获时崩溃 → 整个脚本 rc=1。只看 rc 的自动化会误判回归失败。
 - **下一步**：把 graph 段拆成独立脚本（或加 `--skip-graph`，默认跳过 graph 段）；主门（六配置全等）单独决定退出码。
 
-### I11 🟢 `p5_graph_ab.py` verify 阶段没有 per-step watchdog
+### I11 ✅ 已修（10-27）`p5_graph_ab.py` verify 阶段没有 per-step watchdog
+- **修复**：verify 的每次 generate 包在 `_with_watchdog`（`--verify-watchdog-s`，默认 300 s）里——超时打印精确卡点（config/phase）并 `os._exit(97)` 硬退（跳过会自己卡死的 teardown）。下一轮 30B 图实验单次失败成本从 ~10 分钟降到 ≤5 分钟，且日志直接指认卡死阶段。
 - **现状**：30B 失败时 rank1 先死、rank0 在 wedge 状态白等满 10 分钟 watchdog 才报错，且报错点（barrier）不是真凶（replay）。
 - **影响**：图实验的单次失败成本 ~10 分钟，且日志指向性差。
 - **下一步**：verify 循环加每步 `timeout`（如 120 s/步，超时主动 abort + 打印当前 bucket/step）。
@@ -83,7 +85,8 @@
 - **现状**：两轮都遇到：rank 间 DistBackendError 后主进程挂在退出路径（本轮 bmmdense 回归、30B graph A/B），需要人工按 PID kill。
 - **下一步**：engine `exit()` 加超时保护（barrier 带 timeout，超时直接 os._exit）；短期维持人工清理 SOP（HANDOFF-P6c §4）。
 
-### I13 🟢 `benchmark_online.py` 断言 fraction ≤ 1
+### I13 ✅ 已修（10-27）`benchmark_online.py` 断言 fraction ≤ 1
+- **修复**：断言放宽为 `0 < fraction`（fraction 是 `--max-qps` 的乘数，>1 是探索饱和的合法用法），加注释说明语义。下轮抬注入率不会再误撞断言浪费加载。
 - **现状**：抬注入率只能加 `--max-qps`，fraction>1 直接断言失败。本轮因此浪费一发 30B 加载（~8 分钟）。
 - **下一步**：要么放开断言（fraction 作为 max-qps 的乘数本就允许 >1），要么在 `--help` 里写明。一行改动，注意别动 SLO 统计口径。
 
@@ -91,7 +94,8 @@
 - **现状**：`# BISECT-1`（replay 前后 rank barrier）+ `# BISECT-2`（每桶私有 graph pool）。8B 上是实证修复（5/5）；30B 上不解决问题但也无害（eager 默认路径 replay 分支不执行；非 eager 时私有池略增显存）。
 - **下一步**：I1 有了结论后一并处理——若图转正：保留（作为修复的一部分）；若图永久放弃：删掉减少认知负担。
 
-### I15 🟢 本地 `~/.ssh/config` 的 `s4000b` 别名指向死端口
+### I15 ✅ 已修（10-27）本地 `~/.ssh/config` 的 `s4000b` 别名指向死端口
+- **修复**：`Port 18484` → `28036`，且 `IdentityFile` 由未安装的 `id_ed25519_autodl` 改为服务器上已装的 `id_ed25519`；`ssh s4000b` 实测可用（并顺带确认双卡 0 MiB）。
 - **现状**：服务器重建后端口 18484→28036，本地 config 里 `Host s4000b` 仍是旧端口；本轮一直用显式 `-p 28036`。
 - **下一步**：更新 `~/.ssh/config`（一行）。
 
@@ -119,7 +123,7 @@
 | 2 | I1(+I3) 30B 图 | 先补 8B+MoE 中间档隔离变量，再决定是否值得分段捕获；严格时间盒 |
 | 3 | I5+I6+I7 验证补齐 | 三项共用一次 30B 加载就能全部补上（b64 点 + 探针 + 拐点细化），性价比最高 |
 | 4 | I2 图 token 漂移 | 依赖 I1 有进展后才有意义 |
-| 5 | I10/I11/I13 工具债 | 小改动，防下一轮浪费加载 |
+| 5 | ~~I10/I11/I13 工具债~~（✅ 已修 10-27，连同 I15） | 小改动，防下一轮浪费加载 |
 | — | I12/I14/I15/I16–I18 | 随手修/等待外部 |
 
 ## 本次自检确认没问题的项（防误读）

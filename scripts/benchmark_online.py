@@ -376,7 +376,9 @@ def main():
     args = parser.parse_args()
     assert args.max_qps > 0 and args.requests > 0 and args.warmup_requests >= 0
     assert args.slo_ttft_ms > 0 and args.slo_tpot_ms > 0
-    assert all(0 < fraction <= 1 for fraction in args.fractions)
+    # fraction is a multiplier on --max-qps; values > 1 are legitimate for
+    # exploring saturation beyond the nominal single-stream ceiling.
+    assert all(0 < fraction for fraction in args.fractions)
     asyncio.run(async_main(args))
 
 

@@ -35,7 +35,7 @@
 
 ## 3. 下一轮建议（优先级序；完整 18 项问题清单见 `docs/P6-open-issues.md`）
 
-**未解问题速览**：🔴 I1 30B 图 replay 打死设备（8B 修复不可迁移，未测：分段捕获/图内去 MCCL/8B+MoE 中间档）；🟡 I2 图 replay 跨 generate token 漂移（8B 修复后仍在）；🟡 I3 tiny 图捕获仍间歇失败（捕获阶段）；🟡 I4 triton_paged 被 0.875<0.99 一致率冻住（+48~59% 吞吐在桌上，根因未定位）；🟡 I5 采用栈的 b64 离线点未跑；🟡 I6 前缀缓存 cold/hot 探针连续两轮遗留；🟡 I7 SLO 拐点 0.87–0.957 之间空白；🟡 I8 在线容量只有 137/64 一种形状；🟢 I10–I15 工具债（回归 rc 语义、graph verify 无 watchdog、teardown 卡死、fraction≤1 断言、BISECT 补丁去留、ssh 别名）；⚪ I16–I18 厂商侧（autotune 配置缺失、mp22 数值错、watchdog 诊断能力）。
+**未解问题速览**：🔴 I1 30B 图 replay 打死设备（8B 修复不可迁移，未测：分段捕获/图内去 MCCL/8B+MoE 中间档）；🟡 I2 图 replay 跨 generate token 漂移（8B 修复后仍在）；🟡 I3 tiny 图捕获仍间歇失败（捕获阶段）；🟡 I4 triton_paged 被 0.875<0.99 一致率冻住（+48~59% 吞吐在桌上，根因未定位）；🟡 I5 采用栈的 b64 离线点未跑；🟡 I6 前缀缓存 cold/hot 探针连续两轮遗留；🟡 I7 SLO 拐点 0.87–0.957 之间空白；🟡 I8 在线容量只有 137/64 一种形状；🟢 I10/I11/I13/I15 工具债 ✅ 已修（10-27：--with-graph、verify watchdog、fraction 乘数、ssh 端口）；余 I12 teardown 卡死、I14 BISECT 补丁去留；⚪ I16–I18 厂商侧（autotune 配置缺失、mp22 数值错、watchdog 诊断能力）。
 
 1. **triton_paged c2048 分歧定位**（I4，收益最大）：先做 bf16 logits diff 上界判定走「工程修复」还是「决策接受」；或直接审 paged kernel 页边界/掩码。门不要动。
 2. **30B 图换路子**（I1）：先补 8B+MoE 中间档隔离变量（是 MoE 图内核还是规模），再决定分段捕获 / 图内去 MCCL / 厂商限制清单；8B 的 barrier+私有池不可迁移，不要重走。
