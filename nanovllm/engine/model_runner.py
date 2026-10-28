@@ -42,6 +42,13 @@ def set_host_sync_fix(enabled: bool) -> None:
 # through its own prepare/forward; runtime-switchable for A/B.
 _MIXED_SPLIT = [os.environ.get("NANOVLLM_MIXED_SPLIT", "1") == "1"]
 
+# I29 segmented-graph prototype (P10): capture per-layer segment graphs with
+# ZERO collectives inside (the two per-layer all_reduces run eagerly between
+# segment replays).  TP2 whole-graph replay wedges (I29); TP1 graphs (no
+# in-graph collectives) never do — this tests whether removing in-graph MCCL
+# from the ENGINE replay path dodges the wedge.  Default off.
+_SEGMENT_GRAPH = [os.environ.get("NANOVLLM_SEGMENT_GRAPH", "0") == "1"]
+
 
 def set_mixed_split(enabled: bool) -> None:
     _MIXED_SPLIT[0] = bool(enabled)
@@ -139,7 +146,11 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            # Whole-graph mode sets graphs/graph_pool; segment mode sets
+            # seg_a/seg_b/seg_bufs/graph_pool — delete whichever exist.
+            for attr in ("graphs", "seg_a", "seg_b", "seg_bufs", "graph_pool"):
+                if hasattr(self, attr):
+                    delattr(self, attr)
         self.acc.synchronize()
         dist.destroy_process_group()
 
@@ -589,6 +600,10 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, mode: str):
+        if (mode == "decode" and not self.enforce_eager
+                and _SEGMENT_GRAPH[0] and getattr(self, "seg_a", None)
+                and input_ids.size(0) <= self.graph_bs[-1]):
+            return self._run_model_segment(input_ids, positions)
         if mode != "decode" or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
@@ -660,8 +675,177 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def _segment_layers(self):
+        return self.model.model.layers
+
+    def _set_segment_defer(self, value: bool):
+        for module in self._defer_modules:
+            module.defer_reduce = value
+
+    @torch.inference_mode()
+    def capture_segment_graphs(self):
+        """I29 segmented-graph prototype (P10): per-layer segment graphs with
+        ZERO in-graph collectives.  Segment A = ln1 -> qkv/rope/attn ->
+        o_proj(partial); segment B = post_ln -> mlp/moe(partial).  The two
+        per-layer all_reduces run eagerly between replays in
+        _run_model_segment, so the captured graphs never touch MCCL — the
+        TP1-style shape that has never wedged (I29)."""
+        config = self.config
+        hf_config = config.hf_config
+        max_bs = min(self.config.max_num_seqs, 512)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        positions = torch.zeros(max_bs, dtype=torch.int64)
+        slot_mapping = torch.arange(max_bs, dtype=torch.int32)
+        context_lens = torch.full(
+            (max_bs,), min(self.block_size, config.max_model_len), dtype=torch.int32
+        )
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        if self.graph_bs[-1] != max_bs:
+            self.graph_bs.append(max_bs)
+        self.graph_vars = dict(
+            positions=positions, slot_mapping=slot_mapping,
+            context_lens=context_lens, block_tables=block_tables,
+        )
+        layers = self._segment_layers()
+        self._defer_modules = []
+        for layer in layers:
+            self._defer_modules.append(layer.self_attn.o_proj)
+            self._defer_modules.append(layer.mlp)          # MoE combine AR
+            down = getattr(layer.mlp, "down_proj", None)   # dense MLP AR
+            if down is not None:
+                self._defer_modules.append(down)
+        dtype = next(self.model.parameters()).dtype
+        eager_backend = config.moe_backend
+        capture_backend = config.decode_moe_backend or eager_backend
+        if capture_backend != eager_backend:
+            self.set_moe_backend(capture_backend)
+        self.captured_moe_backend = capture_backend
+        self._set_segment_defer(True)
+        self.seg_a = {li: {} for li in range(len(layers))}
+        self.seg_b = {li: {} for li in range(len(layers))}
+        self.seg_bufs = {}
+        pool = None
+        Graph = self.acc.MUSAGraph
+        graph_ctx = self.acc.graph
+        for bs in self.graph_bs:
+            hidden = hf_config.hidden_size
+            self.seg_bufs[bs] = dict(
+                ping0=torch.zeros(bs, hidden, dtype=dtype, device=self.device),
+                ping1=torch.zeros(bs, hidden, dtype=dtype, device=self.device),
+                h_attn=torch.zeros(bs, hidden, dtype=dtype, device=self.device),
+                r=torch.zeros(bs, hidden, dtype=dtype, device=self.device),
+            )
+            bufs = self.seg_bufs[bs]
+            if self.world_size > 1:
+                dist.barrier()
+            # Warmup every module once per bucket (collectives deferred, values
+            # garbage, launches/JIT real), mirroring the whole-graph warmup;
+            # same degenerate-but-valid decode context as the engine capture.
+            set_context(
+                False, slot_mapping=slot_mapping[:bs],
+                context_lens=context_lens[:bs], block_tables=block_tables[:bs],
+            )
+            self.model(
+                torch.zeros(bs, dtype=torch.int64, device=self.device),
+                positions[:bs],
+            )
+            if self.world_size > 1:
+                dist.barrier()
+                self.acc.synchronize()
+            print(f"[graph-seg] rank{self.rank} bucket={bs} warmup done "
+                  f"({len(layers)} layers)", flush=True)
+            for li, layer in enumerate(layers):
+                read = bufs["ping0"] if li % 2 == 0 else bufs["ping1"]
+                write = bufs["ping1"] if li % 2 == 0 else bufs["ping0"]
+                h_attn, r_buf = bufs["h_attn"], bufs["r"]
+                pos_view = positions[:bs]
+                if li == 0:
+                    def seg_a_body(layer=layer, read=read, h_attn=h_attn,
+                                   r_buf=r_buf, pos_view=pos_view):
+                        hn = layer.input_layernorm(read)
+                        r_buf.copy_(read)
+                        h_attn.copy_(layer.self_attn(pos_view, hn))
+                else:
+                    def seg_a_body(layer=layer, read=read, h_attn=h_attn,
+                                   r_buf=r_buf, pos_view=pos_view):
+                        hn, r_out = layer.input_layernorm(read, r_buf)
+                        h_attn.copy_(layer.self_attn(pos_view, hn))
+                        r_buf.copy_(r_out)
+
+                def seg_b_body(layer=layer, h_attn=h_attn, r_buf=r_buf, write=write):
+                    hn2, r2 = layer.post_attention_layernorm(h_attn, r_buf)
+                    write.copy_(layer.mlp(hn2))
+                    r_buf.copy_(r2)
+
+                if self.world_size > 1:
+                    dist.barrier()
+                graph_a = Graph()
+                with graph_ctx(graph_a, pool):
+                    seg_a_body()
+                if pool is None:
+                    pool = graph_a.pool()
+                self.seg_a[li][bs] = graph_a
+                if self.world_size > 1:
+                    dist.barrier()
+                    self.acc.synchronize()
+                    dist.barrier()
+                graph_b = Graph()
+                with graph_ctx(graph_b, pool):
+                    seg_b_body()
+                self.seg_b[li][bs] = graph_b
+                if self.world_size > 1:
+                    dist.barrier()
+                    self.acc.synchronize()
+                print(f"[graph-seg] rank{self.rank} bucket={bs} layer={li} captured",
+                      flush=True)
+        self._set_segment_defer(False)
+        self.graph_pool = pool
+        if capture_backend != eager_backend:
+            self.set_moe_backend(eager_backend, capture_backend)
+        report = self.memory_report()
+        print(
+            f"[graph-seg] rank{self.rank} layers={len(layers)} buckets={self.graph_bs} "
+            f"graphs={2 * len(layers) * len(self.graph_bs)} "
+            f"decode_moe_backend={capture_backend} "
+            f"allocated={report['allocated_gib']:.2f} GiB",
+            flush=True,
+        )
+
+    @torch.inference_mode()
+    def _run_model_segment(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        bs = input_ids.size(0)
+        cap = next(x for x in self.graph_bs if x >= bs)
+        bufs = self.seg_bufs[cap]
+        context = get_context()
+        gv = self.graph_vars
+        gv["positions"][:bs] = positions
+        # Same scratch-slot contract as the whole-graph path (I22): padding
+        # rows write KV into the reserved scratch block, never slot 0.
+        gv["slot_mapping"].fill_(self.scratch_slot)
+        gv["slot_mapping"][:bs] = context.slot_mapping
+        gv["context_lens"].fill_(1)
+        gv["context_lens"][:bs] = context.context_lens
+        gv["block_tables"].fill_(self.scratch_block_id)
+        gv["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        bufs["ping0"][:bs].copy_(self.model.model.embed_tokens(input_ids))
+        self._set_segment_defer(True)
+        for li in range(len(self.seg_a)):
+            write = bufs["ping1"] if li % 2 == 0 else bufs["ping0"]
+            self.seg_a[li][cap].replay()
+            dist.all_reduce(bufs["h_attn"][:bs])
+            self.seg_b[li][cap].replay()
+            dist.all_reduce(write[:bs])
+        self._set_segment_defer(False)
+        final = bufs["ping0"] if len(self.seg_a) % 2 == 0 else bufs["ping1"]
+        hidden, _ = self.model.model.norm(final[:bs], bufs["r"][:bs])
+        return self.model.compute_logits(hidden)
+
     @torch.inference_mode()
     def capture_cudagraph(self):
+        if _SEGMENT_GRAPH[0] and self.world_size > 1:
+            self.capture_segment_graphs()
+            return
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)

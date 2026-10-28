@@ -522,7 +522,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         else:
             out = self._forward_loop(hidden_states, topk_ids, topk_weights)
         with self._profile("moe.ep_all_reduce"):
-            dist.all_reduce(out)
+            # defer_reduce: P10 segment-graph prototype — this combine moves
+            # out of the captured segment; run_model all_reduces eagerly.
+            if not getattr(self, "defer_reduce", False):
+                dist.all_reduce(out)
         return out
 
 

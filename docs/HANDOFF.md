@@ -1,65 +1,50 @@
-# HANDOFF — 当前交接(滚动更新;本版 = P9 轮收官,2026-10-28)
+# HANDOFF — 当前交接(滚动更新;本版 = P10 轮,2026-10-28 晚)
 
-> 本文是**唯一交接文档**(由 HANDOFF-P10 重命名,历史版本在 git 历史)。接手先读本文,再按 [AGENTS.md](../AGENTS.md) 核验环境。执行日志(逐实验冻结门→判定)见 git 历史 `docs/NIGHTLY-LOG.md`。
-> 规则不变:先写门再跑;一次一个 GPU 任务;负结果照录;本地 commit 不 push;到点无论进度必须停下写交接。
+> 本文是**唯一交接文档**(历史版本在 git 历史)。接手先读本文,再按 [AGENTS.md](../AGENTS.md) 核验环境。执行日志见 git 历史 `docs/NIGHTLY-LOG.md`。
+> 规则不变:先写门再跑;一次一个 GPU 任务;负结果照录;本地 commit;到点无论进度必须停下写交接。
 
 ## 0. 30 秒状态
 
-- **仓库**:`feat/musa-port`,P9 全部改动已本地 commit;工作区干净。
-- **服务器**:双卡 0 MiB、锚定 pgrep 无进程、`/dev/shm` 无 `nanovllm*`、无本轮 lock(收官时已核验)。
-- **生产栈(未变)**:`attention=triton_paged`、`moe_backend=grouped_mm`、`decode_moe_backend=bmm_dense`、`enforce_eager=True`、`scheduler=stall_free`、TP2/EP2、chunk-256。30B eager b1 decode 步时 142.06 ms(P8 基线沿用)。
-- **P9 净代码变化**:① `tests/p2_grouped_mm.py` 钉 `attention_backend="sdpa"`(harness 修复);② 新增 `tests/p9_mccl_graph_probe.py`(I29 分级探针,含 watchdog/phase 标记);③ 新增 `tests/p9_placement_ab.py`(placement A/B + map 生成);④ `benchmarks/data/p6d/online-v4-paged.json` 补拷到服务器(v3 单测 15/15 需要)。(P9 曾加 `NANOVLLM_GRAPH_REPLAY_BARRIER` 实验 flag,已在文档/代码瘦身 commit 中删除——I29 workaround 已否定。)
+- **仓库**:`feat/musa-port`,已 push 至 origin(P9+瘦身在 `4ab04a2`,P10 见后续 commit);工作区干净。
+- **服务器**:双卡 0 MiB、锚定 pgrep 无进程、shm 干净、无 lock(收官时已核验)。
+- **生产栈(未变)**:`triton_paged` + `grouped_mm`/`bmm_dense` + `enforce_eager=True` + `stall_free` + TP2/EP2 + chunk-256 + `MIXED_SPLIT=1`。30B eager b1 decode 步时 142.06 ms。**两个默认值经 P10 实测维持不动**(chunk-2048、split=0 均不过门)。
+- **P10 净代码变化**:① `NANOVLLM_SEGMENT_GRAPH=1` 分段图原型(默认关):`linear.RowParallelLinear`/`MoE.combine` 的 `defer_reduce` 惰性属性 + `model_runner.capture_segment_graphs`/`_run_model_segment`;② `tests/p10_segment_smoke.py`(分段冒烟);③ 修复 exit() 在分段模式下 `del self.graphs` 的 AttributeError。
 
-## 1. P9 轮判决(证据在 `benchmarks/P9-*.md`)
+## 1. 本轮(P10)判决(证据 `benchmarks/P10-*.md`)
 
-| # | 项 | 判决 | 关键数字 |
-|---|---|---|---|
-| P1 | I29 图探针 | **定性收口**:TP2 引擎级 MUSAGraph+MCCL 间歇性 replay 楔死;纯张量(含引擎协议复刻六桶共享 pool)全绿、TP1 全绿;**最小复现 = 0.6B TP2 paged 首次 replay(3/3,2 min 加载)**;sdpa 撞 2 次 generate 后楔;**replay barrier 否定**;30B 双轨门维持结构性阻断 | `P9-graph.md` |
-| P2 | profiled placement | **动机假设否定**:imbalance **0.1685→0.0009(−99.5%)** 但 decode b32 303.28→303.30 ms(**+0.01%**)→ rank 失衡不是 30B decode 瓶颈(与 I19 固定等待主导互证);**不采用为默认**,map 流程保留 | `P9-moe.md` |
-| P3 | TTFT(chunk-2048) | **P8 未过的改进门达成**:50% 档 TTFT p50 3.31→**1.036 s(−69%,门 ≤2 s)**;75%/100% 档 −70%/−73%;50% 档 SLO std 0.8%→**100%**;高负载 TPOT 同时 −21~33%。**chunk-2048 = 1k 场景推荐配置** | `P9-long-context.md` |
-| P4 | Poisson ×3 CI | 四档 ×3 **全 100% SLO(std+strict)**,Wilson CI [99.0%,100%],极差 ≤0.018 s;容量 = ≥99% SLO 最大达成 QPS **0.713**(未 bracketed);回归门:TTFT p95 过(1.19≤1.263)、**TPOT p95 0.387–0.397 vs 门 0.343 FAIL(+13~16%,稳定)→ 新开 I30** | `P9-serving.md` |
-| P5 | 收尾 | sha256、ISSUES(I29 收口/I30 新开)、PLAN、本文、服务器清零 | `P9-nightly.md` |
-
-## 2. 未完成 + 原因(不要当成"没试过")
-
-| 项 | 状态 | 原因 |
+| 项 | 判决 | 关键数字 |
 |---|---|---|
-| 8B TP2 paged 楔死确认 | 未跑(有意) | 0.6B 已是 3/3 最小复现,8B 预期同楔、边际信息量低;时间让给 P2–P4 |
-| 30B 图 A/B | 维持否决 | I29 在 0.6B 即楔死,双轨门结构性阻断(红线:前置门不过禁止 30B 图 A/B) |
-| 分段图(attention eager + linear/MoE 进图) | 未实现 | 周级工程;I29 复活的第一候选路径 |
-| I30 mixed-split 在线 A/B | 未跑 | 需一发 30B 加载;P10 第一优先之一 |
-| chunk-2048 短 prompt 矩阵 + 默认切换 | 未跑 | 需一发 30B 加载;与 I30 A/B 可合并同加载 |
-| Poisson >1.0 饱和 bracketed | 未跑 | 四档全 100% 使容量上界未定;P8 v5 并发曲线(~2.14 req/s)可参照 |
-| I28 最小 repro 存档 | 未做 | 低优先,沿用 P9 遗留 |
+| I30 混步税假设 | **否定,关闭该路径**;split=1 默认维持 | split=0 时 0.5 档 TPOT p95 0.335–0.348 ≈ 基线 0.332–0.350(拿不回);0.75+ 档 SLO 崩塌(1.0 档 23–62% vs 基线 100%);attempt1 服务器段错误失稳 |
+| chunk-2048 默认化 | **不过门,默认维持 256**;1k 场景推荐配置不变 | 短 prompt TPOT p95 中位 +5.3~9.5%、TTFT p95 高负载 +5~7%(SLO 仍全 100%);C 门 ≤+5% 未过 |
+| I29 分段图原型 | **有希望的 WIP**:TP2 捕获可行 + **引擎级 replay 首次稳定**(LB 下 3×3×8 零楔死、token 与整图一致);异步捕获偶发/双引擎 illegal access 未解;0.6B paged GB 门未跑 | `benchmarks/P10-graph.md` |
 
-## 3. 下一轮 Top-5(按信息量排序)
+## 2. 已判决不要再碰(累计)
 
-1. **I30 判定 + chunk-2048 短 prompt 验证(合并一发加载)**:api_server 起 `NANOVLLM_MIXED_SPLIT=0` 跑 P4 同矩阵 → 判"混步税"真伪;再 `--prefill-chunk-size 2048` 跑同矩阵 → 判默认切换。两个决策都只需一次加载(重启 flag 即可,不用重载权重…… 若用 api_server env/flag 热切换则一次加载两实验;不行就两次启动,权重热缓存 ~6 min)。
-2. **I29 分段图原型(若要做图)**:attention 走 eager、linear/MoE 进图(SGLang 式);先 0.6B TP2(本轮最小复现口径)验证不楔,再 8B、30B。或者等厂商 MUSAGraph+MCCL 修复,用 `tests/p9_mccl_graph_probe.py` 回归。
-3. **Poisson 饱和 bracketed**:fractions 1.2/1.4(或 --max-qps 提高)找到 slo_standard ≥99% 的上界,补全容量曲线(×3 repeats)。
-4. **TTFT 下一层**:chunk-2048 后 50% 档 TTFT p50 1.036 s,若想逼近空闲单请求 0.368 s,剩余空间在混步排队与 prefill kernel(profile 1k prefill 哪层贵——P9 未做的 kernel 级 profile)。
-5. **E1 paged autotune / E2 fused_moe 配置**:仍低优,预算富余再做。
+投机解码 NO-GO;I19 "融合换步时"因果链否定;**整图 graph TP2 否决**(I29,0.6B 最小复现;barrier 无效);**split=0 与 chunk-2048 默认化均否决**(P10);profiled placement 不采用;fused RMSNorm/容量收缩不采用;host-sync 移除与 mixed-split 已采纳;paged 已按五层门转正。
 
-## 4. 本轮新 SOP(P9 血泪,继承 P8 全部)
+## 3. 未完成 + 下轮 Top-N
 
-1. **pgrep/pkill 自匹配**:远端 shell 命令行里含模式字符串时 `pgrep/pkill -f` 会匹配到执行命令的 shell 自身(本轮两次自杀:一次 pkill -f "p8_graph_padfix"、一次 spawn_main 模式)。**一律用 `[p]`/`[s]` 括号技巧或按 PID**。
-2. **观测管道会吞掉崩溃现场**:`ssh ... | grep | tail` 的缓冲在连接被杀时丢弃 stderr——**长任务一律 nohup 全量日志落盘,再从日志 grep**;楔死排查前先确认"[graph]/[padfix] 进度行是否还在新增"。
-3. **楔死三形态**:双卡 100% 对称自旋 / rank0 死+rank1 旋 / rank1 死+rank0 旋——都是 I29/I12 家族,处理统一:记录现场(mthreads-gmi + top + 最后日志行)→ 按 PID kill → rm shm → 双卡 0 MiB 再继续。
-4. **MUSA launch watchdog 10 min 自杀会污染现场**:楔死后 rank 会收到 "the launch timed out and was terminated" 然后 DistBackendError teardown——**要在 watchdog 触发前(≤8 min)抓现场**;这同时说明"楔死 10 分钟"是可恢复的(设备会 reset),但 rank 状态已毁。
-5. **placement 是加载期配置**:A/B 必须跨加载;跨加载 A/B 的口径 = 同一冻结工作负载 + 臂内 CV 门 + 解析式指标(如 imbalance 由 counts×ownership 计算)替代 interleaved。
-6. **P0 单测环境**:本地 Mac 无 pytest/tqdm,三套单测都在服务器跑;`p2_grouped_mm.py`/`p6_bmm_dense_tiny.py` 用 `/tmp/tiny_moe`;v3 单测需要 `benchmarks/data/p6d/online-v4-paged.json` 在服务器 repo 内(已补)。
-7. (继承)运行时切换走 `runner.call`;加载窗口只做测量;一次一个 GPU 任务;A/B 交错/中位数/CV≤5%;失败 init 先 destroy_process_group。
+| 优先 | 项 | 说明 |
+|---|---|---|
+| 1 | **分段图续推**(I29 唯一在手的活路线) | ① padfix 双引擎上下文 illegal memory access 根因(LB 下稳定复现,便宜);② 异步捕获偶发对策(捕获重试/启动慢化,I3 老经验"加 print 都能好"提示时序敏感);③ 过门后 0.6B TP2 **paged** GB bitwise 5/5(S2);④ 性能:分段 vs eager decode 步时(判决 I19 ~20–30 ms 固定等待的关键实验);⑤ 8B → 30B 双轨门 |
+| 2 | **I30 剩余路径** | 先补 v4 口径复核(v4 TPOT p95 0.327 是单跑,同矩阵 ×3 重测);再决定是否做 P8 改动二分 |
+| 3 | Poisson 饱和 bracketed | `--fractions 1.2,1.4 --repeats 3`(容量上界仍未定) |
+| 4 | 1k prefill kernel 级 profile | TTFT 下一层的靶子(1.036 s vs 空闲 0.368 s) |
+| 5 | I20 KV 量化(周级)/ E1 autotune / E2 fused_moe | 低优 |
 
-## 5. 红线(继承 + 本轮未变)
+## 4. 本轮新 SOP/坑
 
-不 push;不 reset;远端 `.git` 伪仓库;不改 site-packages;不改 `p5_decide.py` 阈值;不用 `vllm_fused`/`mp22` 默认;不全局 `bmm_dense`;pgrep 锚定+括号技巧;一次一个 GPU 任务;陌生进程不杀只记录;长任务 nohup+lock+落盘;不留自动重启 waiter;30B 加载窗口 ≥20 min(冷);代码先行;不重跑已定案实验(P8 §1 + P9 §1)。
+1. **改引擎后同步代码到正在运行的服务器是安全的**(已 import 的进程不受影响),但**同仓库后续启动的新进程会用新代码**——重实验前确认服务器代码版本。
+2. **`MUSA_LAUNCH_BLOCKING=1` 是捕获期疑难的定位利器**(P10:把异步掩掉的 "operation not permitted" 暴露为可复现的 illegal memory access 直建即成功)——异步偶发与确定性 bug 要分开。
+3. **f-string/单引号经 ssh heredoc 会被剥**——远端脚本内用双引号或 % 格式化。
+4. spawn 脚本必须有 `if __name__ == "__main__"`(又踩一次)。
+5. 模型属性路径:embed/norm/layers 都在 `model.model.` 下(ForCausalLM 包一层)。
+6. (继承全部 P8/P9 SOP:锚定 pgrep 括号技巧、nohup 全量日志、watchdog 8 min 抓现场、按 PID kill、[p] 自匹配等)
 
-## 6. 证据索引(本地 `benchmarks/data/p9/`,sha256 见 `benchmarks/P9-nightly.md` §3)
+## 5. 红线
 
-P0:`p9_p0_regressions.log`、`p9_grouped_mm.log`;P1:`p9_mccl_graph_probe*.json`、`p9_mccl_probe3.json`、`p9_padfix_tiny_tp2.json`、`p9_06b_padfix.log`、`p9_06b_sdpa_outer.log`、`p9_barrier_exp.log`、`p9_barrier2.log`;P2:`p9_placement_{linear,profiled}.json`、`p9_expert_map.json`、`p9_place_*.log`;P3:`p9_long_context_c2048.json`、`p9_l3_*`;P4:`p9_serving_v5_ci.json`、`p9_l4_*`。
+见 [AGENTS.md](../AGENTS.md)(全部集中处);重申一条:分段图 flag 默认关,**只有 P10-graph.md 的 S2/S3 门全过才允许改默认**;30B 图整体 A/B 仍被 I29 整图楔死阻断(分段路线若过 0.6B/8B 门则按双轨门解锁 30B)。
 
-## 7. 如果只能做三件事
+## 6. 证据索引(本地 `benchmarks/data/p10/`,sha256 见 `benchmarks/P9-nightly.md` 风格,本轮见 P10 报告内引用)
 
-1. **I30 混步税 A/B + chunk-2048 短 prompt 验证**(一到两发加载,两个默认值决策,I19 之谜的又一切面)。
-2. **Poisson 饱和 bracketed**(把容量曲线闭合,四档全 100% 说明上界还没到)。
-3. **I29 分段图原型或等厂商**(图是 63→40 ms 的现成收益,但只走 attention-eager 路线,别再整体进图)。
+`p10_serving_split0.json`(Run B)、`p10_serving_c2048.json`(Run C)、`p10_server_b_attempt1.log`(split=0 段错误现场)、`p10_seg.log`/`p10_s1*.log`(分段捕获与 wedge 现场)、`tests/p10_segment_smoke.py`(replay 冒烟)。

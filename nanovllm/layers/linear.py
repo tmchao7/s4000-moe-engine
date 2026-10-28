@@ -151,6 +151,10 @@ class RowParallelLinear(LinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
-        if self.tp_size > 1:
+        # defer_reduce (P10 segment-graph prototype): the collective moves out
+        # of the module so segment graphs capture with ZERO in-graph all_reduces;
+        # run_model replays the segment then all_reduces eagerly.  Absent in
+        # every other path — production behaviour is unchanged.
+        if self.tp_size > 1 and not getattr(self, "defer_reduce", False):
             dist.all_reduce(y)
         return y

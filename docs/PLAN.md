@@ -7,19 +7,17 @@
 
 **生产栈**:`attention=triton_paged`(默认)、`moe_backend=grouped_mm`(prefill)、`decode_moe_backend=bmm_dense`、`enforce_eager=True`、`scheduler=stall_free`(在线)/`fcfs`(离线)、TP2/EP2、chunk-256。30B eager b1 decode 步时 **142.06 ms**;离线 b32 133 tok/s;短 prompt 四档 Poisson ×3 全 100% SLO;1k 长上下文 chunk-2048 下 50% 档 TTFT p50 1.036 s、SLO 100%。
 
-**已判决(负结果也是结论)**:投机解码 NO-GO(α≈0 且 c=0.39);I19 "launch-bound→融合换步时"因果链否定(步时由 ~20–30 ms/未解释固定等待主导);整图 graph 否决(I29:TP2 引擎级间歇性 MCCL replay 楔死,0.6B TP2 最小复现,barrier 无效);profiled placement 不采用(imbalance −99.5% 但吞吐 +0.01%);fused RMSNorm / bmm 容量收缩不采用(数值 PASS 性能 FAIL,默认关 opt-in 保留);host-sync 移除与 mixed-split 已采纳默认开。
+**已判决(负结果也是结论)**:投机解码 NO-GO(α≈0 且 c=0.39);I19 "launch-bound→融合换步时"因果链否定(步时由 ~20–30 ms/未解释固定等待主导);整图 graph 否决(I29:TP2 引擎级间歇性 MCCL replay 楔死,0.6B TP2 最小复现,barrier 无效);**split=0 与 chunk-2048 默认化均否决(P10 实测)**;profiled placement 不采用(imbalance −99.5% 但吞吐 +0.01%);fused RMSNorm / bmm 容量收缩不采用(数值 PASS 性能 FAIL,默认关 opt-in 保留);host-sync 移除与 mixed-split 已采纳默认开;算子融合在 decode 侧被实测否定(fused RMSNorm −33% device 但步时 −0.76%),I29 分段图是"融合"的正确形态(进行中)。
 
-## 1. P10 迭代内容(按优先级)
+## 1. P10 迭代内容(按优先级;1/2 已完成,见 `benchmarks/P10-serving.md`)
 
-| # | 项 | 方法 | 门 / 产出 |
-|---|---|---|---|
-| 1 | **I30 混步税判定** | 30B 加载 `NANOVLLM_MIXED_SPLIT=0` 跑 P9-P4 同矩阵(Poisson 0.5/0.75/0.9/1.0 ×128,prompt-words 128)与 =1 对照 | TPOT p95 @0.87 档:0 回到 ≤0.343 → 确认 I23 短 prompt 税,权衡"关混步 vs 保混步";仍 0.39 → I30 转向 P8 期累积改动二分 |
-| 2 | **chunk-2048 短 prompt 验证 + 默认切换决策** | 同矩阵 `--prefill-chunk-size 2048` 一发 | TTFT p95/TPOT p95 不劣化于 chunk-256 → 建议默认切 2048(改 `config.py:37` + api_server 默认);劣化 → 只留 1k 场景推荐 |
-| 3 | **Poisson 饱和 bracketed** | `--fractions 1.2,1.4`(或更高 --max-qps)×3 repeats | 找到 slo_standard ≥99% 的最大达成 QPS 上界,补全容量曲线 |
-| 4 | (条件)**I29 分段图原型** | attention 走 eager、linear/MoE 进图(SGLang 式);先 0.6B TP2(本轮最小复现口径)验证不楔 | 不楔 + token 一致性 → 才允许 8B → 30B;楔 → 归档等厂商 |
-| 5 | (低优)E1 paged autotune / E2 fused_moe 配置 / I20 KV 量化 | 见 ISSUES 各条 | 预算富余再排 |
-
-加载预算:1、2 可合并为同一次加载(env + 服务器重启即可,热缓存 ~7 min/发);每发前照 AGENTS.md 核验清场。
+| # | 项 | 状态 |
+|---|---|---|
+| 1 | I30 混步税判定(split=0 同矩阵) | ✅ **假设否定**:split=0 低负载 TPOT p95 重合、高负载 SLO 崩塌+失稳;split=1 维持;I30 转向"v4 口径复核→P8 二分" |
+| 2 | chunk-2048 短 prompt 默认化 | ✅ **不过门**:TPOT p95 +5.3~9.5% 超 +5%;默认 256 维持,1k 推荐配置不变 |
+| 3 | **分段图原型(续,见 `benchmarks/P10-graph.md`)** | 🟡 WIP:TP2 捕获可行、replay 首稳(LB 下);下一步 = 双引擎 illegal access 根因 → 异步偶发对策 → 0.6B paged GB 门 → 性能判决 I19 → 8B/30B 双轨 |
+| 4 | Poisson 饱和 bracketed(`--fractions 1.2,1.4 --repeats 3`) | 未跑 |
+| 5 | (低优)1k prefill kernel profile / I20 KV 量化 / E1 / E2 | 未排 |
 
 ## 2. 冻结门汇总(集中一处,**均不可改**)
 
