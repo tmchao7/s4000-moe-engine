@@ -11,11 +11,13 @@
 
 ## 1. P12 迭代内容(按优先级;门与判定树见 `benchmarks/P11-serving.md` 与本节)
 
+> P12 执行状态(10-29 早):P0 两臂口径修正后重跑,臂 B'(生产栈+maxseq64+段图)init 768 图零失败、在线前 4 点 100% SLO;**07:35 服务器失联(ssh 认证层拒绝),判定未产出**,详见 `benchmarks/P12-serving.md`。下轮续作 = 恢复访问 → 取回臂 B 数据 → 补臂 A' → 判定 → P1/P2。
+
 | # | 项 | 门/判定 | 状态 |
 |---|---|---|---|
-| 1 | **segment 在线 L3 A/B + 转正决策**(最大收益) | SLO 双门不劣化 + 1.0 档 TPOT p95 不劣于 eager 臂 + 低载档改善可见;过门 → 翻默认(flag→config 默认)+ 4 单测套件 + 0.6B S2 快速复验 | 未跑(下轮首项) |
-| 2 | I30 v4 口径复核重跑(pre-P8 树重放) | 判定树冻结于 P11-serving.md:旧栈 ×3 ≈0.33 → 回退真实(P8 二分);≈0.39 → v4 假象关闭 I30;预算按旧栈实速(0.5 档 ~12 min/跑;两档 ×3 ≈ 50 min) | 中止于 P11(数据不足),重跑 |
-| 3 | Poisson 饱和 bracketed(`--fractions 1.2,1.4 --repeats 3`) | 报告 slo_standard ≥99% 的最大达成 QPS | 未跑(与 #1 顺路) |
+| 1 | **segment 在线 L3 A/B + 转正决策**(最大收益) | SLO 双门不劣化 + 1.0 档 TPOT p95 不劣于 eager 臂 + 低载档改善可见;过门 → 翻默认 + 4 单测套件 + 0.6B S2 快速复验。**前提(I32):两臂带 `--decode-moe-backend bmm_dense --max-num-seqs 64`** | **中断于基础设施失联**(臂 B 数据疑在服务器未取回,臂 A' 未跑) |
+| 2 | I30 v4 口径复核重跑(pre-P8 树重放) | 判定树冻结于 P11-serving.md:旧栈 ×3 ≈0.33 → 回退真实(P8 二分);≈0.39 → v4 假象关闭 I30;预算按旧栈实速(0.9/1.0 两档 ×3 ≈ 50 min) | 未跑(P6D 树已预部署于 `/root/moe-server-p6d`) |
+| 3 | Poisson 饱和 bracketed(`--fractions 1.2,1.4 --repeats 3`) | 报告 slo_standard ≥99% 的最大达成 QPS | 疑随臂 B 链已在服务器完成(未验证) |
 | 4 | b32 +3.8% 回退归因/缓解(可选) | AR/replay 重叠或高载自动降级 eager;收益上限 3.8% | 未排 |
 | 5 | (低优)mixed-step segment 化预研 / 1k prefill kernel profile / I20 KV 量化 / E1 / E2 | — | 未排 |
 

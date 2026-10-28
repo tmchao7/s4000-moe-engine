@@ -254,11 +254,24 @@ def main():
     parser.add_argument("--prefill-chunk-size", type=int, default=256)
     parser.add_argument("--metrics-path")
     parser.add_argument("--max-queue-size", type=int, default=1024)
-    parser.add_argument(
-        "--max-model-len",
+    parser.add_argument("--max-model-len",
         type=int,
         default=4096,
         help="context limit; also bounds warmup and the KV block table width",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help="override Config.max_num_seqs (default 512); bounds the decode "
+             "batch and, with --no-enforce-eager, the graph bucket set",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="production default keeps decode eager; --no-enforce-eager enables "
+             "the segment-graph decode path (requires NANOVLLM_SEGMENT_GRAPH=1, I29)",
     )
     args = parser.parse_args()
 
@@ -269,6 +282,8 @@ def main():
 
     import uvicorn
 
+    if args.max_num_seqs is not None:
+        print(f"[init] max_num_seqs={args.max_num_seqs}", flush=True)
     engine = AsyncLLMEngine(
         args.model,
         tensor_parallel_size=2,
@@ -283,7 +298,8 @@ def main():
         metrics_path=args.metrics_path,
         max_queue_size=args.max_queue_size,
         max_model_len=args.max_model_len,
-        enforce_eager=True,
+        enforce_eager=args.enforce_eager,
+        **({"max_num_seqs": args.max_num_seqs} if args.max_num_seqs is not None else {}),
     )
     flip_backend = os.environ.get("NANOVLLM_ATTENTION_FLIP_AFTER_INIT")
     if flip_backend:
