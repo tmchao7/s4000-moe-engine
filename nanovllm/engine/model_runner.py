@@ -48,6 +48,10 @@ _MIXED_SPLIT = [os.environ.get("NANOVLLM_MIXED_SPLIT", "1") == "1"]
 # in-graph collectives) never do — this tests whether removing in-graph MCCL
 # from the ENGINE replay path dodges the wedge.  Default off.
 _SEGMENT_GRAPH = [os.environ.get("NANOVLLM_SEGMENT_GRAPH", "0") == "1"]
+# P11: capture-time instrumentation for the two-engine illegal-access
+# bisect (P2) and capture-flake slow-start (P1).  Both default inert.
+_SEG_DEBUG = os.environ.get("NANOVLLM_SEG_DEBUG", "0") == "1"
+_SEG_SLOW = float(os.environ.get("NANOVLLM_SEG_SLOW", "0"))
 
 
 def set_mixed_split(enabled: bool) -> None:
@@ -690,6 +694,8 @@ class ModelRunner:
         per-layer all_reduces run eagerly between replays in
         _run_model_segment, so the captured graphs never touch MCCL — the
         TP1-style shape that has never wedged (I29)."""
+        dbg = (lambda msg: print(f"[graph-seg-dbg] rank{self.rank} {msg}", flush=True)) if _SEG_DEBUG else (lambda msg: None)
+        dbg("entry")
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
@@ -707,6 +713,7 @@ class ModelRunner:
             positions=positions, slot_mapping=slot_mapping,
             context_lens=context_lens, block_tables=block_tables,
         )
+        dbg("graph_vars ready")
         layers = self._segment_layers()
         self._defer_modules = []
         for layer in layers:
@@ -722,6 +729,7 @@ class ModelRunner:
             self.set_moe_backend(capture_backend)
         self.captured_moe_backend = capture_backend
         self._set_segment_defer(True)
+        dbg("defer on")
         self.seg_a = {li: {} for li in range(len(layers))}
         self.seg_b = {li: {} for li in range(len(layers))}
         self.seg_bufs = {}
@@ -737,8 +745,12 @@ class ModelRunner:
                 r=torch.zeros(bs, hidden, dtype=dtype, device=self.device),
             )
             bufs = self.seg_bufs[bs]
+            dbg(f"bucket={bs} bufs allocated")
             if self.world_size > 1:
+                dbg(f"bucket={bs} barrier 1")
                 dist.barrier()
+                dbg(f"bucket={bs} barrier 1 done")
+            dbg(f"bucket={bs} warmup start")
             # Warmup every module once per bucket (collectives deferred, values
             # garbage, launches/JIT real), mirroring the whole-graph warmup;
             # same degenerate-but-valid decode context as the engine capture.
@@ -750,9 +762,11 @@ class ModelRunner:
                 torch.zeros(bs, dtype=torch.int64, device=self.device),
                 positions[:bs],
             )
+            dbg(f"bucket={bs} warmup launches done")
             if self.world_size > 1:
                 dist.barrier()
                 self.acc.synchronize()
+            dbg(f"bucket={bs} warmup synced")
             print(f"[graph-seg] rank{self.rank} bucket={bs} warmup done "
                   f"({len(layers)} layers)", flush=True)
             for li, layer in enumerate(layers):
@@ -799,6 +813,9 @@ class ModelRunner:
                     self.acc.synchronize()
                 print(f"[graph-seg] rank{self.rank} bucket={bs} layer={li} captured",
                       flush=True)
+            if _SEG_SLOW > 0:
+                dbg(f"bucket={bs} slow-start sleep {_SEG_SLOW}s")
+                time.sleep(_SEG_SLOW)
         self._set_segment_defer(False)
         self.graph_pool = pool
         if capture_backend != eager_backend:

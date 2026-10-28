@@ -160,31 +160,63 @@ def main():
     parser.add_argument("--max-model-len", type=int, default=1024)
     parser.add_argument("--gpu-mem", type=float, default=0.3)
     parser.add_argument("--output", default="/root/p8_graph_padfix.json")
+    parser.add_argument(
+        "--phase", choices=["eager", "graph", "both"], default="both",
+        help="eager: reference only, write JSON; graph: compare against "
+             "--eager-from JSON (two-process split, sidesteps the two-engine "
+             "illegal access); both: legacy single-process flow",
+    )
+    parser.add_argument("--eager-from", default=None,
+                        help="eager-phase JSON to compare against (--phase graph)")
+    parser.add_argument("--attempts", type=int, default=2,
+                        help="graph-engine build attempts (async capture flake retry)")
     args = parser.parse_args()
 
     from nanovllm import SamplingParams
 
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "graph_padfix",
         "model": args.model,
-        "gates_frozen": "docs/NIGHTLY-LOG.md P2.2 (GA-GD)",
+        "phase": args.phase,
+        "gates_frozen": "benchmarks/P11-graph.md P0-S2 (GA-GD)",
         "started": time.time(),
     }
     vocab = 128 if args.model == TINY_MODEL else 151936
 
-    # Phase 1: eager reference.
-    print("[padfix] phase 1: eager reference", flush=True)
-    llm = build_llm(args, enforce_eager=True)
-    eager_reference = collect_tokens(llm, PROMPTS, args.max_tokens)
-    payload["eager_probe"] = slot0_probe(llm, max_tokens=4)
-    shared_eager_tokens = collect_tokens(llm, shared_pair(vocab), args.max_tokens)
-    exit_llm(llm)
+    eager_reference = shared_eager_tokens = None
+
+    if args.phase in ("eager", "both"):
+        # Phase 1: eager reference.
+        print("[padfix] phase 1: eager reference", flush=True)
+        llm = build_llm(args, enforce_eager=True)
+        eager_reference = collect_tokens(llm, PROMPTS, args.max_tokens)
+        payload["eager_probe"] = slot0_probe(llm, max_tokens=4)
+        shared_eager_tokens = collect_tokens(llm, shared_pair(vocab), args.max_tokens)
+        exit_llm(llm)
+        payload["eager_reference"] = eager_reference
+        payload["shared_eager_tokens"] = shared_eager_tokens
+        if args.phase == "eager":
+            payload["finished"] = time.time()
+            with open(args.output, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, indent=2, default=str)
+            print(f"[padfix] eager phase written to {args.output}", flush=True)
+            return
+
+    if args.phase == "graph":
+        if not args.eager_from:
+            raise SystemExit("phase graph requires --eager-from <eager.json>")
+        with open(args.eager_from, encoding="utf-8") as stream:
+            reference_payload = json.load(stream)
+        eager_reference = reference_payload["eager_reference"]
+        shared_eager_tokens = reference_payload["shared_eager_tokens"]
+        payload["eager_from"] = args.eager_from
+        payload["eager_probe_reference"] = reference_payload.get("eager_probe")
 
     # Phase 2: graph engine (capture failures counted separately).
     print("[padfix] phase 2: graph engine", flush=True)
     llm = None
-    for attempt in (1, 2):
+    for attempt in range(1, args.attempts + 1):
         try:
             llm = build_llm(args, enforce_eager=False)
             break
@@ -203,7 +235,10 @@ def main():
             except Exception:  # noqa: BLE001
                 pass
     if llm is None:
-        payload["verdict"] = {"GD_capture": "FAIL (both attempts)", "overall": "FAIL"}
+        payload["verdict"] = {
+            "GD_capture": f"FAIL (all {args.attempts} attempts)",
+            "overall": "FAIL",
+        }
         with open(args.output, "w", encoding="utf-8") as stream:
             json.dump(payload, stream, indent=2, default=str)
         return
