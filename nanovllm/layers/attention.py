@@ -122,8 +122,11 @@ class Attention(nn.Module):
         return self._forward_decode(q, k_cache, v_cache, context)
 
     def _forward_prefill(self, q, k, v, k_cache, v_cache, context):
-        cu_q = context.cu_seqlens_q.tolist()
-        cu_k = context.cu_seqlens_k.tolist()
+        cu_q = context.cu_seqlens_q_list
+        cu_k = context.cu_seqlens_k_list
+        if cu_q is None or cu_k is None:
+            cu_q = context.cu_seqlens_q.tolist()
+            cu_k = context.cu_seqlens_k.tolist()
         outs = []
         for i in range(len(cu_q) - 1):
             sq, sk = cu_q[i + 1] - cu_q[i], cu_k[i + 1] - cu_k[i]

@@ -1,5 +1,7 @@
 # HANDOFF-P8 — 24h 任务开跑前交接（2026-10-27 23:00）
 
+> **状态:已被 [HANDOFF-P9.md](./HANDOFF-P9.md) 取代**(2026-10-28 收官)。本文仅作起点快照保留;当前状态以 P9 为准。
+
 > **本文是 P8 执行轮次的起点交接**，写给即将接手 24h 的 Agent。上一轮交接是 [`HANDOFF-P6e.md`](./HANDOFF-P6e.md)（P0–P2 已完成）。
 > 执行手册：[`P8-24h-plan.md`](./P8-24h-plan.md)。架构与差距：[`P8-architecture-review.md`](./P8-architecture-review.md)。复制给 Agent 的提示词：[`PROMPT-P8.md`](./PROMPT-P8.md)。
 > 规则：每个实验先写门再跑；一次只跑一个 GPU 任务；失败/负结果照样记录；默认本地 commit、不 push。

@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -17,6 +19,39 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.models.qwen3 import Qwen3Attention
 from nanovllm.utils.compat import is_capturing
 from nanovllm.utils.context import get_context
+
+
+# Runtime-switchable for interleaved A/B (docs/P8-moe-fusion-and-balance.md §3).
+# Capacity shrink packs only owned (token, slot) pairs and sizes the dense bmm
+# at counts.max() instead of the T*K worst case; it uses one host sync per
+# layer and a data-dependent shape, so it is eager-only and defaults off.
+_CAPACITY_SHRINK = [os.environ.get("NANOVLLM_MOE_CAPACITY_SHRINK", "0") == "1"]
+
+
+def set_capacity_shrink(enabled: bool) -> None:
+    _CAPACITY_SHRINK[0] = bool(enabled)
+
+
+def capacity_shrink_enabled() -> bool:
+    return _CAPACITY_SHRINK[0]
+
+
+# Opt-in (max_load, n_owned) observations from the shrink path, for the P3.1
+# S_max workload statistics.  Capped to keep long runs bounded.
+_SHRINK_STATS = []
+_SHRINK_STATS_ENABLED = [False]
+
+
+def set_shrink_stats(enabled: bool) -> None:
+    if not enabled:
+        _SHRINK_STATS_ENABLED[0] = False
+        return
+    _SHRINK_STATS.clear()
+    _SHRINK_STATS_ENABLED[0] = True
+
+
+def shrink_stats():
+    return list(_SHRINK_STATS)
 
 
 class _ExpertView:
@@ -111,6 +146,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             torch.zeros(config.num_experts, dtype=torch.int64),
             persistent=False,
         )
+        # Fold-aware load stats (P3.1): counted BEFORE the backend folds
+        # non-owned slots onto local expert 0, so expert 0's true load (its own
+        # traffic plus every non-owned slot it silently absorbs) is visible.
+        self.register_buffer(
+            "owned_expert_counts",
+            torch.zeros(self.experts_per_rank, dtype=torch.int64),
+            persistent=False,
+        )
+        self.owned_slot_total = 0
+        self.folded_slot_total = 0
 
         # Runtime orientation is [expert, input, output], exactly what
         # torch._grouped_mm consumes.  Keeping this as the only expert storage
@@ -286,6 +331,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         Weights are consumed in their native layout -- no transposed copy.
         """
+        if _CAPACITY_SHRINK[0] and not is_capturing():
+            return self._forward_bmm_dense_shrunk(hidden_states, topk_ids, topk_weights)
         num_tokens = hidden_states.size(0)
         slots = num_tokens * self.top_k
         device = hidden_states.device
@@ -313,6 +360,84 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         with self._profile("moe.bmm_1"):
             x_slots = hidden_states.index_select(0, sorted_token)
             x_pad = x_slots.new_zeros(self.experts_per_rank, slots, self.hidden_size)
+            x_pad[sorted_ids, ranks] = x_slots
+            gate_up = torch.bmm(x_pad, self.gate_up_proj)
+        with self._profile("moe.activation"):
+            activated = self.act_fn(gate_up)
+        with self._profile("moe.bmm_2"):
+            expert_out = torch.bmm(activated, self.down_proj)
+        with self._profile("moe.weighted_combine"):
+            contribution = expert_out[sorted_ids, ranks] * sorted_weights.unsqueeze(-1)
+            dense = contribution.new_zeros(num_tokens, self.top_k, self.hidden_size)
+            dense.view(slots, -1)[sorted_slot] = contribution
+            return dense.sum(dim=1)
+
+    def _forward_bmm_dense_shrunk(self, hidden_states, topk_ids, topk_weights):
+        """bmm_dense with owned-only packing and S = counts.max().
+
+        The default path pads every local expert to the T*K worst case, so at
+        b32 each expert computes 256 rows of which ~4 are owned.  Here the
+        non-owned slots (folded onto expert 0 with weight 0) are compacted away
+        with a dump-slot scatter (no boolean indexing, no data-dependent
+        kernel), and the dense bmm runs at S = max per-expert owned load.
+
+        Cost: one stacked host sync per layer (S and n_owned travel together).
+        Not capturable (data-dependent shape); graph mode keeps the padded
+        path.  Numerics: same per-row K-dim reduction, rows only change their
+        M-position, so results match the padded path up to bmm tiling order
+        (verified by the L2 soft gate, not bitwise).
+        """
+        num_tokens = hidden_states.size(0)
+        slots = num_tokens * self.top_k
+        device = hidden_states.device
+        E = self.experts_per_rank
+        with self._profile("moe.local_map"):
+            local_raw = self.global_to_local[topk_ids].reshape(-1)
+            owned = local_raw >= 0
+        with self._profile("moe.route_pack"):
+            flat_token = torch.arange(num_tokens, device=device).unsqueeze(1).expand_as(topk_ids).reshape(-1)
+            flat_slot = torch.arange(slots, device=device)
+            flat_weights = topk_weights.reshape(-1) * owned.to(topk_weights.dtype)
+            # Compaction without boolean indexing: owned rows keep their
+            # compacted position, non-owned rows scatter into one dump slot
+            # (duplicate indices land there; the slot is never read back).
+            owned_i32 = owned.to(torch.int64)
+            pos = torch.cumsum(owned_i32, 0) - 1
+            pos = torch.where(owned, pos, torch.full_like(pos, slots))
+            buf_local = torch.zeros(slots + 1, dtype=torch.int64, device=device)
+            buf_token = torch.zeros(slots + 1, dtype=torch.int64, device=device)
+            buf_slot = torch.zeros(slots + 1, dtype=torch.int64, device=device)
+            buf_weight = torch.zeros(slots + 1, dtype=flat_weights.dtype, device=device)
+            buf_local.scatter_(0, pos, local_raw.clamp(min=0))
+            buf_token.scatter_(0, pos, flat_token)
+            buf_slot.scatter_(0, pos, flat_slot)
+            buf_weight.scatter_(0, pos, flat_weights)
+            # Owned per-expert histogram; the dump bucket (id E) is dropped.
+            counts = torch.zeros(E + 1, dtype=torch.int32, device=device)
+            counts.scatter_add_(
+                0, local_raw.clamp(min=0) + (~owned).to(torch.int64) * E,
+                torch.ones_like(local_raw, dtype=torch.int32),
+            )
+            counts = counts[:E]
+            # The single host sync of this path: S and n_owned together.
+            host = torch.stack([counts.max(), counts.sum()]).to("cpu", non_blocking=False)
+            max_load = int(host[0])
+            n_owned = int(host[1])
+            if _SHRINK_STATS_ENABLED[0] and len(_SHRINK_STATS) < 100000:
+                _SHRINK_STATS.append((num_tokens, max_load, n_owned))
+        if n_owned == 0:
+            return torch.zeros_like(hidden_states)
+        with self._profile("moe.bmm_1"):
+            local_ids = buf_local[:n_owned]
+            order = torch.argsort(local_ids, stable=True)
+            sorted_ids = local_ids[order]
+            sorted_token = buf_token[:n_owned][order]
+            sorted_slot = buf_slot[:n_owned][order]
+            sorted_weights = buf_weight[:n_owned][order]
+            starts = counts.cumsum(0).to(torch.int64) - counts.to(torch.int64)
+            ranks = torch.arange(n_owned, device=device) - starts[sorted_ids]
+            x_slots = hidden_states.index_select(0, sorted_token)
+            x_pad = x_slots.new_zeros(E, max_load, self.hidden_size)
             x_pad[sorted_ids, ranks] = x_slots
             gate_up = torch.bmm(x_pad, self.gate_up_proj)
         with self._profile("moe.activation"):
@@ -367,6 +492,19 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.expert_counts.add_(
                 torch.bincount(topk_ids.reshape(-1), minlength=self.expert_counts.numel())
             )
+            if not is_capturing():
+                local_raw = self.global_to_local[topk_ids].reshape(-1)
+                owned = local_raw >= 0
+                # fold-前 per-local-expert owned load; expert_counts above is
+                # the global view (same on both ranks), this is the rank view.
+                self.owned_expert_counts.add_(
+                    torch.bincount(
+                        local_raw.clamp(min=0)[owned],
+                        minlength=self.experts_per_rank,
+                    )
+                )
+                self.owned_slot_total += int(owned.sum())
+                self.folded_slot_total += int((~owned).sum())
         if self.norm_topk_prob:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights.to(hidden_states.dtype)
@@ -461,6 +599,18 @@ class Qwen3MoeForCausalLM(nn.Module):
     def reset_expert_stats(self):
         for layer in self.model.layers:
             layer.mlp.expert_counts.zero_()
+            layer.mlp.owned_expert_counts.zero_()
+            layer.mlp.owned_slot_total = 0
+            layer.mlp.folded_slot_total = 0
 
     def expert_stats(self):
         return torch.stack([layer.mlp.expert_counts for layer in self.model.layers])
+
+    def owned_expert_stats(self):
+        return {
+            "owned_counts": torch.stack(
+                [layer.mlp.owned_expert_counts for layer in self.model.layers]
+            ),
+            "owned_slot_total": [layer.mlp.owned_slot_total for layer in self.model.layers],
+            "folded_slot_total": [layer.mlp.folded_slot_total for layer in self.model.layers],
+        }

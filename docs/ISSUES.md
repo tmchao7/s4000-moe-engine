@@ -98,17 +98,20 @@
 - **下一步（按 ROI）**：① **纯 eager 的 norm/rope 融合**（消掉每层几十次 launch，不依赖图，可逐项 A/B）——新发现的可执行方向；② 图路径（I1/I2）仍是 63.2→40.0 ms 的现成 23 ms，但被 replay 漂移卡住；③ 30B TP2 抽查一次，确认 launch-bound 在 MCCL 下仍成立。
 - **证据**：`benchmarks/P6-layer-timing.md`、`benchmarks/data/p6d/p6_layer_timing_06.json`（sha256 `ec7e02078d8bb9695737f91c5bb7f9fa8739a4259ff7119f740806db9377eef3`）、`/root/p7_step_overhead_06.json`、`benchmarks/P7-phase0.md` §2
 
-### P8 规划新增（尚未执行；编号在 P8 报告中定稿）
+### P8 规划新增(2026-10-28 执行轮更新;结论标注在每条)
 
-> 来源：`docs/P8-architecture-review.md`、`docs/P8-moe-fusion-and-balance.md`、`docs/P8-benchmark-spec.md`。执行排期见 `docs/P8-24h-plan.md`。
+> 来源:`docs/P8-architecture-review.md`、`docs/P8-moe-fusion-and-balance.md`、`docs/P8-benchmark-spec.md`。执行排期见 `docs/P8-24h-plan.md`;本轮证据见 `benchmarks/P8-*.md` 与 `docs/NIGHTLY-LOG.md`(P8 段)。
 
-- **I20 KV 量化（🟢 周级）**：现状零（KV bf16，12 MiB/block，730 blocks ≈ 8.55 GiB/rank）；目标容量约 ×2、decode KV 带宽减半；门 = L1–L4 数值门 + 容量/带宽测量；触发 = I19 与长上下文收口后。
-- **I21 per-rank KV 容量不一致（🟢 0.5 h）**：rank0 730 / rank1 728（`model_runner.py:436-449`），块表只由 rank0 分配 → 高 block id 可能越界；修法 = 广播 `min(num_blocks)`。
-- **I22 graph replay padding 写 KV slot 0（🟡，P8-P2）**：`model_runner.py:563-571` 把 padding 行 `slot_mapping` 填 0，整桶执行时每次 replay 覆写 KV slot 0；是"首个 replay 漂移"的最强嫌疑。验证 = scratch slot + tiny/8B 5/5。
-- **I23 mixed step 走 prefill MoE 后端（🟡，P8-P3）**：`model_runner.py:579` 对 mixed 走 `prepare_prefill`，`is_prefill=True` 使 `bmm_dense`/paged 不生效（`qwen3_moe.py:374-385`）；需量化在线 TPOT 影响。
-- **I24 host sync 浪费（🟢，P8-P1）**：prefill 每层 2 次 `.tolist()`（96 次/步，`attention.py:125-126`）+ sampler 2 次 `bool()`（`sampler.py:11,16`，b32 sample 36.6 ms / 13.7%）。
-- **I25 benchmark v3（🟢，P8-P0/P5）**：SLO 两套、token goodput、queue/prefill/decode、timeout/drop 分桶、重复与 CI、固定并发曲线；规范见 `docs/P8-benchmark-spec.md`。
-- **I26 KV admission/backpressure（🟡，P8-P4）**：整段预留（`block_manager.py:66, 96-97`）+ 容量不足 assert（`scheduler.py:125, 203`）；长 prompt 应返回 429 而不是崩。
+- **I20 KV 量化(🟢 周级)**:现状零(KV bf16,12 MiB/block,730 blocks ≈ 8.55 GiB/rank);目标容量约 ×2、decode KV 带宽减半;门 = L1–L4 数值门 + 容量/带宽测量;触发 = I19 与长上下文收口后。
+- **I21 per-rank KV 容量不一致(✅ 本轮修复)**:`allocate_kv_cache` 后 `dist.all_reduce(MIN)` 统一两 rank 的 `num_kvcache_blocks`;tiny TP2 六配置回归全等 rc=0,两 rank `[kvcache] blocks=` 一致(343080/343080、341994/341994;本轮加载内启发式恰好相同,真 divergence 钳制待 30B 长上下文确认)。
+- **I22 graph replay padding 写 KV slot 0(✅ 根因确认 + 修复 + TP1 验证;TP2 另有独立故障)**:scratch-slot 修复(`allocate_kv_cache` 多留 1 块 + replay 前 `slot_mapping/block_tables` 填 scratch);tiny/0.6B/8B 验证:GB 5/5 token 全等(paged)、GC 共享前缀全等、GD 捕获零失败;**30B TP2 首次 replay 楔死是独立故障**(见 I29),30B 图维持否决、默认 eager。详见 `benchmarks/P8-graph.md`。
+- **I23 mixed step 走 prefill MoE 后端(✅ 本轮修复,效果待 L3 在线复测)**:`model_runner.run` 对 mixed 拆 prefill/decode 子批,decode 行走 `prepare_decode`+paged+bmm_dense(`NANOVLLM_MIXED_SPLIT`,默认开);调度器 mixed-batch 契约有单测(`tests/p8_scheduler_gaps.py`)。
+- **I24 host sync 浪费(🟡→✅ 部分,本轮实测)**:prefill 96 次 `.tolist()` 上提到 prepare(实测 0.6B 512-token prefill 步时 **−11.6%** / 62.8→55.5 ms;30B 复核在 L2)+ sampler 2 次 `bool()` 改 host 侧 `all_greedy`(0.6B b32-mixed sample 段 −13.5%,30B L2 复核)。**重大副发现:launch −960/步 + device −10.7 ms 但步时仅 −0.8%(fused RMSNorm A/B)→ decode 步时对 launch 数与 host sync 均不敏感,I19 的"launch-bound→融合换步时"因果链被实测否定**;每步仍有 ~20–30 ms 未解释的固定等待,图 replay(P2)本应是判决实验,被 TP2 wedge 阻断(见 I29)。
+- **I25 benchmark v3(✅ 本轮落地)**:`benchmarking.py` 增 wilson_ci/token_goodput/classify_error/conforming/linear percentile;客户端 schema v3(双 SLO、error 分桶、timeout→服务端 cancel、--repeats+CI、--mode concurrency、mixed 3:4:3、GPU 采样、p99_reference_only);服务端 final-chunk 带 metrics;单测 15 绿 + v2/v4 JSON 回放不抛异常。
+- **I26 KV admission/backpressure(✅ 本轮修复,端到端待 L3)**:`add_request` 校验 `prompt+max_tokens > max_model_len → 400`、`> KV 容量 → 429 + requests_rejected 计数`;scheduler 容量不足返空批次(mode="empty")不 assert;HOL `can_allocate==-1` 改跳过候选继续尝试 + `kv_admission_skips_total` 计数(FIFO 序保持);单测 6/6(`tests/p8_scheduler_gaps.py`)。
+- **I27 sdpa-decode 图的烘焙形状数值限制(🆕 本轮定位)**:capture 时 context_lens=256 固化 kv 窗口形状,SDPA 归约切分随 shape 变 → 1-ulp 级漂移与近平局翻转(tiny MoE graph 5/5 自洽但不等于 eager);paged kernel 循环边界在 device 上,不受影响 → 生产路径(paged)graph==eager bitwise。sdpa 模型要用图需按运行时窗口分桶捕获。
+- **I28 torch.musa 跨块步长视图 D2H 拷贝返回不一致数据(🆕 平台 bug 嫌疑)**:`kv_cache[:, :, blk, 0]`([2,L,kh,d] strided view)的 `.cpu()` 返回 NaN 垃圾,同位置 K/V 分读与 device 侧逐层扫描干净,`.contiguous()` 后仍复现;workaround = contiguous 化或分 K/V 读;影响所有"整读跨块切片"的诊断代码。
+- **I29 30B TP2 图 replay 首次楔死(🆕,独立于 I22)**:双卡 100% util 对称自旋、host CPU 0%;TP1(0.6B/8B)同代码 replay 正常 → 嫌疑为图内 96 次 MCCL all-reduce 的 rendezvous 失败;与 I22 的漂移类故障分离。复活条件:MCCL-in-graph 支持性探针(扩展 `tests/p6_mccl_capture_multi.py`)+ 双 rank 同步 replay 协议,或分段图。
 
 
 

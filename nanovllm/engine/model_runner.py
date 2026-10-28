@@ -26,6 +26,26 @@ def _model_cls(hf_config):
 
 _TRACE_INIT = os.environ.get("NANOVLLM_TRACE_INIT") == "1"
 
+# Runtime-switchable for interleaved A/B of the host-sync removals (sampler
+# all_greedy + prefill cu_seqlens lists).  Defaults on; set
+# NANOVLLM_HOST_SYNC_FIX=0 or call set_host_sync_fix(False) to restore the
+# per-step device->host syncs.
+_SYNC_FIX = [os.environ.get("NANOVLLM_HOST_SYNC_FIX", "1") == "1"]
+
+
+def set_host_sync_fix(enabled: bool) -> None:
+    _SYNC_FIX[0] = bool(enabled)
+
+
+# Mixed steps used to run the whole batch through the prefill path, so decode
+# rows lost paged attention and bmm_dense (I23).  The split runs each part
+# through its own prepare/forward; runtime-switchable for A/B.
+_MIXED_SPLIT = [os.environ.get("NANOVLLM_MIXED_SPLIT", "1") == "1"]
+
+
+def set_mixed_split(enabled: bool) -> None:
+    _MIXED_SPLIT[0] = bool(enabled)
+
 
 def _trace_init(rank, stage, started=None):
     """Print init milestones when NANOVLLM_TRACE_INIT=1.
@@ -304,7 +324,7 @@ class ModelRunner:
         """
         assert self.enforce_eager, "attention probe requires eager decode"
         input_ids, positions = self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        temperatures, all_greedy = self.prepare_sample(seqs) if self.rank == 0 else (None, True)
         context = get_context()
         slot_mapping = context.slot_mapping
         original_slots = self._snapshot_kv_slots(slot_mapping)
@@ -357,7 +377,7 @@ class ModelRunner:
                 diagnostics = self._logit_probe_summary(
                     baseline_logits, candidate_logits, baseline_layers, candidate_layers
                 )
-                token_ids = self.sampler(baseline_logits, temperatures).tolist()
+                token_ids = self.sampler(baseline_logits, temperatures, all_greedy).tolist()
 
             self._restore_kv_slots(slot_mapping, baseline_slots)
             succeeded = True
@@ -451,6 +471,13 @@ class ModelRunner:
             f"no KV cache memory: total={total / 2**30:.2f} GiB used={used / 2**30:.2f} GiB "
             f"peak={peak / 2**30:.2f} GiB utilization={config.gpu_memory_utilization}"
         )
+        if self.world_size > 1:
+            # Block tables come from rank 0 only; a rank whose KV tensor is
+            # smaller than the largest issued block id indexes out of bounds
+            # (seen 730 vs 728 on 30B TP2).  Unify on the minimum.
+            blocks_t = torch.tensor(config.num_kvcache_blocks, dtype=torch.int64, device=self.device)
+            dist.all_reduce(blocks_t, op=dist.ReduceOp.MIN)
+            config.num_kvcache_blocks = int(blocks_t.item())
         print(
             f"[kvcache] rank{self.rank} blocks={config.num_kvcache_blocks} "
             f"block_bytes={block_bytes} kv={config.num_kvcache_blocks * block_bytes / 2**30:.2f} GiB "
@@ -458,7 +485,12 @@ class ModelRunner:
             f"peak={peak / 2**30:.2f} GiB current={current / 2**30:.2f} GiB free={free / 2**30:.2f} GiB",
             flush=True,
         )
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        # One extra block the BlockManager never sees: graph replay points the
+        # padding rows' slot_mapping and block_tables at it, so the whole-bucket
+        # replay cannot overwrite KV slot 0 of a live request.
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks + 1, self.block_size, num_kv_heads, head_dim)
+        self.scratch_block_id = config.num_kvcache_blocks
+        self.scratch_slot = config.num_kvcache_blocks * self.block_size
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -513,10 +545,13 @@ class ModelRunner:
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
+        cu_q_list, cu_k_list = list(cu_seqlens_q), list(cu_seqlens_k)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
+                    cu_seqlens_q_list=cu_q_list if _SYNC_FIX[0] else None,
+                    cu_seqlens_k_list=cu_k_list if _SYNC_FIX[0] else None)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -545,9 +580,12 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = [seq.temperature for seq in seqs]
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).to(self.device, non_blocking=True)
-        return temperatures
+        temperatures_list = [seq.temperature for seq in seqs]
+        temperatures = torch.tensor(temperatures_list, dtype=torch.float32, pin_memory=True).to(self.device, non_blocking=True)
+        # Host-side greedy decision: replaces the sampler's two bool() device
+        # reads (2 host syncs per step).
+        all_greedy = all(value < 1e-3 for value in temperatures_list) if _SYNC_FIX[0] else None
+        return temperatures, all_greedy
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, mode: str):
@@ -561,27 +599,64 @@ class ModelRunner:
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             # Padding rows (``bs:`` up to the bucket) still execute inside the
-            # graph.  Fill their slots with 0, not -1: the captured index_put
-            # writes every row of the bucket, and a -1 slot would index the
-            # *last* KV element.  context_lens=1 keeps those rows on a valid
-            # one-token attention instead of a 0/0 division.
-            graph_vars["slot_mapping"].fill_(0)
+            # graph.  Their slot_mapping points at the reserved scratch block,
+            # never at slot 0: the captured index_put writes every row of the
+            # bucket, and a 0 slot overwrites the first KV slot of whichever
+            # request owns block 0 -- the observed replay drift.  context_lens=1
+            # keeps those rows on a valid one-token attention instead of a 0/0
+            # division, and their block_tables point at the scratch block so
+            # they read only their own just-written slot, never a live block.
+            graph_vars["slot_mapping"].fill_(self.scratch_slot)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"].fill_(1)
             graph_vars["context_lens"][:bs] = context.context_lens
+            graph_vars["block_tables"].fill_(self.scratch_block_id)
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    def _run_mixed(self, seqs: list[Sequence], temperatures, all_greedy):
+        """Split a mixed step so decode rows keep paged attention + bmm_dense.
+
+        Each part runs through its own prepare_* / run_model (the global
+        context only holds one batch at a time), then tokens are re-assembled
+        in the scheduler's seqs order for postprocess.
+        """
+        prefill_idx = [i for i, seq in enumerate(seqs) if seq.is_prefill]
+        decode_idx = [i for i, seq in enumerate(seqs) if not seq.is_prefill]
+        token_ids: list[int | None] = [None] * len(seqs)
+        if prefill_idx:
+            input_ids, positions = self.prepare_prefill([seqs[i] for i in prefill_idx])
+            logits = self.run_model(input_ids, positions, "prefill")
+            if self.rank == 0:
+                sampled = self.sampler(
+                    logits, temperatures[prefill_idx], all_greedy
+                ).tolist()
+                for row, index in enumerate(prefill_idx):
+                    token_ids[index] = sampled[row]
+        if decode_idx:
+            input_ids, positions = self.prepare_decode([seqs[i] for i in decode_idx])
+            logits = self.run_model(input_ids, positions, "decode")
+            if self.rank == 0:
+                sampled = self.sampler(
+                    logits, temperatures[decode_idx], all_greedy
+                ).tolist()
+                for row, index in enumerate(decode_idx):
+                    token_ids[index] = sampled[row]
+        reset_context()
+        return token_ids
+
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], mode: str) -> list[int]:
         with self.profiler.range("runner.prepare", mode=mode):
+            temperatures, all_greedy = self.prepare_sample(seqs) if self.rank == 0 else (None, True)
+            if mode == "mixed" and _MIXED_SPLIT[0]:
+                return self._run_mixed(seqs, temperatures, all_greedy)
             input_ids, positions = self.prepare_decode(seqs) if mode == "decode" else self.prepare_prefill(seqs)
-            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         with self.profiler.range("runner.forward", mode=mode):
             logits = self.run_model(input_ids, positions, mode)
         with self.profiler.range("runner.sample", mode=mode):
-            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            token_ids = self.sampler(logits, temperatures, all_greedy).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 

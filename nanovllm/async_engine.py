@@ -1,5 +1,6 @@
 """Single-model background engine used by the OpenAI-compatible server."""
 import asyncio
+import time
 from dataclasses import dataclass
 from queue import Empty, Queue
 from threading import Lock, Thread
@@ -97,6 +98,24 @@ class AsyncLLMEngine:
                     self._bump(requests_rejected=1)
                     self.prometheus.rejected.inc()
                     raise OverflowError("engine request queue is full")
+                if isinstance(prompt, list):
+                    # Admission control (I26): requests that can never be served
+                    # are rejected here instead of stalling the scheduler.
+                    total = len(prompt) + sampling_params.max_tokens
+                    runner = self.engine.model_runner
+                    if total > runner.config.max_model_len:
+                        raise ValueError(
+                            f"prompt({len(prompt)}) + max_tokens({sampling_params.max_tokens}) "
+                            f"exceeds max_model_len({runner.config.max_model_len})"
+                        )
+                    kv_token_capacity = runner.config.num_kvcache_blocks * runner.block_size
+                    if total > kv_token_capacity:
+                        self._bump(requests_rejected=1)
+                        self.prometheus.rejected.inc()
+                        raise OverflowError(
+                            f"request needs {total} tokens but KV capacity is "
+                            f"{kv_token_capacity} tokens"
+                        )
                 seq_id = self.engine.add_request(prompt, sampling_params)
                 self.handles[seq_id] = events
                 self._bump(requests_total=1, active_requests=1)
@@ -153,7 +172,12 @@ class AsyncLLMEngine:
 
             try:
                 self.engine.step()
-                self.prometheus.observe_step(self.engine.last_step_metrics)
+                if self.engine.last_step_metrics.get("mode") == "empty":
+                    # Nothing schedulable (KV exhausted, waiting on cancels):
+                    # park briefly instead of spinning the engine thread.
+                    time.sleep(0.005)
+                else:
+                    self.prometheus.observe_step(self.engine.last_step_metrics)
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"
                 for seq_id, events in list(self.handles.items()):

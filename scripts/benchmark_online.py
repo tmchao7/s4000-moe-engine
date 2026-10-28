@@ -1,18 +1,38 @@
-"""Industrial-style open-loop benchmark for the streaming chat endpoint."""
+"""Industrial-style open-loop benchmark for the streaming chat endpoint.
+
+Schema v3 (docs/P8-benchmark-spec.md): adds request error buckets, a client
+request timeout that lets the server cancel the engine sequence, dual SLO
+reporting (request-level TPOT and per-token max-ITL), token goodput, Wilson
+confidence intervals with repeats, a fixed-concurrency mode, prompt-length
+calibration with a mixed short/medium/long distribution, prefix-cache hit
+accounting, and GPU sampling.  Percentiles use linear interpolation and the
+payload records ``percentile_method``; p99 on <500 requests is marked
+``p99_reference_only``.
+"""
 
 import argparse
 import asyncio
+import itertools
 import json
 import random
+import re
+import subprocess
+import threading
 import time
+import uuid
 from pathlib import Path
 
 from nanovllm.benchmarking import (
+    classify_error,
     coefficient_of_variation,
+    conforming,
     distribution,
+    error_bucket_counts,
     goodput,
     percentile,
     request_tpot,
+    token_goodput,
+    wilson_ci,
 )
 
 
@@ -60,6 +80,67 @@ class ConcurrencyTracker:
         self.current -= 1
 
 
+class GpuSampler:
+    """Sample `mthreads-gmi` on a background thread while the benchmark runs."""
+
+    _LINE = re.compile(r"^([01])\s+.*\|\s*(\d+)%\s+(\d+)MiB\((\d+)MiB\)")
+
+    def __init__(self, interval_s: float = 2.0, enabled: bool = True):
+        self.interval_s = interval_s
+        self.enabled = enabled
+        self.samples = []
+        self.phase = "idle"
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if not self.enabled:
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            sample = {"ts": time.perf_counter(), "wall": time.time(), "phase": self.phase, "gpus": []}
+            try:
+                out = subprocess.run(
+                    ["mthreads-gmi"], capture_output=True, text=True, timeout=15
+                ).stdout
+                for line in out.splitlines():
+                    match = self._LINE.match(line.strip())
+                    if match:
+                        sample["gpus"].append({
+                            "id": int(match.group(1)),
+                            "util_pct": int(match.group(2)),
+                            "mem_mib": int(match.group(3)),
+                            "mem_total_mib": int(match.group(4)),
+                        })
+            except Exception as exc:
+                sample["error"] = f"{type(exc).__name__}: {exc}"
+            self.samples.append(sample)
+            self._stop.wait(self.interval_s)
+
+    def stop(self):
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=15)
+
+    def max_in_window(self, t0: float, t1: float):
+        """Per-GPU max memory/util over measure-phase samples inside [t0, t1]."""
+        windows = {}
+        for sample in self.samples:
+            if sample["phase"] != "measure" or not (t0 <= sample["ts"] <= t1):
+                continue
+            for gpu in sample["gpus"]:
+                entry = windows.setdefault(gpu["id"], {"mem_mib": 0, "util_pct": 0})
+                entry["mem_mib"] = max(entry["mem_mib"], gpu["mem_mib"])
+                entry["util_pct"] = max(entry["util_pct"], gpu["util_pct"])
+        return [
+            {"id": gpu_id, **windows[gpu_id]}
+            for gpu_id in sorted(windows)
+        ]
+
+
 def _token_count(tokenizer, text):
     if tokenizer is None:
         return None
@@ -81,6 +162,19 @@ def _prompt_token_count(tokenizer, messages):
     if ids and isinstance(ids[0], (list, tuple)):
         ids = ids[0]
     return len(ids)
+
+
+MIXED_BUCKETS = ("short", "medium", "long")
+
+
+def mixed_bucket(request_id: int) -> str:
+    """Deterministic 3:4:3 short/medium/long assignment over request ids."""
+    slot = request_id % 10
+    if slot < 3:
+        return "short"
+    if slot < 7:
+        return "medium"
+    return "long"
 
 
 def build_prompt(prompt_word, prompt_words, prompt_mode, seed, request_id):
@@ -127,9 +221,32 @@ def calibrate_prompt_words(tokenizer, prompt_word, prompt_mode, seed, target_tok
     return best
 
 
+def calibrate_mixed(tokenizer, prompt_word, prompt_mode, seed, target_tokens):
+    """Calibrate word counts for the 3:4:3 short/medium/long distribution.
+
+    short = target/4 (floor 64 tokens), medium = target, long = 2x target.
+    """
+    targets = {
+        "short": max(64, target_tokens // 4),
+        "medium": target_tokens,
+        "long": target_tokens * 2,
+    }
+    calibration = {}
+    for bucket, bucket_target in targets.items():
+        words, measured = calibrate_prompt_words(
+            tokenizer, prompt_word, prompt_mode, seed, bucket_target
+        )
+        calibration[bucket] = {
+            "target_tokens": bucket_target,
+            "prompt_words": words,
+            "measured_tokens": measured,
+        }
+    return calibration
+
+
 async def one_request(
     client, url, model, prompt, max_tokens, request_id, due, tracker,
-    tokenizer=None,
+    tokenizer=None, request_timeout_s=None, include_metrics=True,
 ):
     await asyncio.sleep(max(0.0, due - time.perf_counter()))
     start = time.perf_counter()
@@ -137,13 +254,18 @@ async def one_request(
     first = None
     end = start
     error = None
+    timed_out = False
+    http_status = None
     done_received = False
     content_times = []
     generated_text = ""
     usage = None
     finish_reason = None
+    server_metrics = None
     messages = [{"role": "user", "content": prompt}]
-    try:
+
+    async def consume():
+        nonlocal first, end, error, done_received, usage, finish_reason, server_metrics, generated_text
         async with client.stream(
             "POST",
             url,
@@ -153,7 +275,7 @@ async def one_request(
                 "temperature": 0,
                 "max_tokens": max_tokens,
                 "stream": True,
-                "stream_options": {"include_usage": True},
+                "stream_options": {"include_usage": True, "include_metrics": include_metrics},
             },
             timeout=None,
         ) as response:
@@ -167,6 +289,8 @@ async def one_request(
                 payload = json.loads(line[6:])
                 if payload.get("usage"):
                     usage = payload["usage"]
+                if payload.get("metrics"):
+                    server_metrics = payload["metrics"]
                 choices = payload.get("choices") or []
                 if not choices:
                     continue
@@ -178,8 +302,22 @@ async def one_request(
                     content_times.append(now)
                     if first is None:
                         first = now
+
+    try:
+        # wait_for cancellation closes the stream mid-flight; the server sees
+        # the disconnect and runs engine.cancel, freeing the KV slot.
+        if request_timeout_s:
+            await asyncio.wait_for(consume(), timeout=request_timeout_s)
+        else:
+            await consume()
+    except asyncio.TimeoutError:
+        error = f"request timeout after {request_timeout_s}s"
+        timed_out = True
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
+        response = getattr(exc, "response", None)
+        if response is not None:
+            http_status = getattr(response, "status_code", None)
     finally:
         end = time.perf_counter()
         tracker.exit()
@@ -194,7 +332,7 @@ async def one_request(
     latency = end - start
     ttft = None if first is None else first - start
     tpot = request_tpot(latency, ttft, output_tokens or 0)
-    return {
+    row = {
         "request_id": request_id,
         "scheduled_s": due,
         "started_s": start,
@@ -211,7 +349,17 @@ async def one_request(
         "finish_reason": finish_reason,
         "ok": error is None,
         "error": error,
+        "timed_out": timed_out,
+        "http_status": http_status,
+        "error_kind": "none",
     }
+    if server_metrics:
+        row["server_queue_s"] = server_metrics.get("queue_s")
+        row["server_ttft_s"] = server_metrics.get("ttft_s")
+        row["server_e2e_s"] = server_metrics.get("e2e_s")
+        row["server_tpot_s"] = server_metrics.get("tpot_s")
+    row["error_kind"] = classify_error(row)
+    return row
 
 
 def arrival_offsets(count, qps, pattern, seed):
@@ -242,6 +390,7 @@ async def warmup(client, args, prompt_for_request, tokenizer, point_index):
             start + index * 0.05,
             tracker,
             tokenizer,
+            args.request_timeout_s,
         )
         for index in range(args.warmup_requests)
     ])
@@ -250,7 +399,7 @@ async def warmup(client, args, prompt_for_request, tokenizer, point_index):
         raise RuntimeError(f"warmup failed: {failures[0]['error']}")
 
 
-async def run_point(client, args, fraction, point_index, prompt_for_request, tokenizer):
+async def run_point(client, args, fraction, point_index, repeat, prompt_for_request, tokenizer):
     qps = args.max_qps * fraction
     await warmup(client, args, prompt_for_request, tokenizer, point_index)
     metrics_before = await scrape_metrics(client, args.base_url)
@@ -270,65 +419,168 @@ async def run_point(client, args, fraction, point_index, prompt_for_request, tok
             start + offsets[request_id],
             tracker,
             tokenizer,
+            args.request_timeout_s,
         )
         for request_id in range(args.requests)
     ]
     rows = await asyncio.gather(*tasks)
     metrics_after = await scrape_metrics(client, args.base_url)
     for row in rows:
-        row.update({"load_fraction": fraction, "target_qps": qps})
+        row.update({"load_fraction": fraction, "target_qps": qps, "repeat": repeat})
     return rows, metrics_before, metrics_after, tracker.maximum
 
 
-def summarize(rows, max_concurrency, metrics_delta, args, fraction):
+async def run_point_concurrency(client, args, concurrency, point_index, repeat,
+                                prompt_for_request, tokenizer):
+    """Fixed in-flight concurrency: each worker sends the next request on completion."""
+    concurrency = int(concurrency)  # --fractions parses as float
+    await warmup(client, args, prompt_for_request, tokenizer, point_index)
+    metrics_before = await scrape_metrics(client, args.base_url)
+    start = time.perf_counter() + 0.2
+    deadline = start + args.duration if args.duration else None
+    tracker = ConcurrencyTracker()
+    rows = []
+    counter = itertools.count()
+
+    async def worker():
+        for request_id in counter:
+            if deadline is not None and time.perf_counter() > deadline:
+                return
+            if request_id >= args.requests:
+                return
+            row = await one_request(
+                client,
+                f"{args.base_url.rstrip('/')}/v1/chat/completions",
+                args.model,
+                prompt_for_request(point_index * args.requests + request_id),
+                args.max_tokens,
+                request_id,
+                start,
+                tracker,
+                tokenizer,
+                args.request_timeout_s,
+            )
+            row.update({"concurrency": concurrency, "repeat": repeat})
+            rows.append(row)
+
+    await asyncio.gather(*[
+        worker() for _ in range(min(concurrency, args.requests))
+    ])
+    metrics_after = await scrape_metrics(client, args.base_url)
+    return rows, metrics_before, metrics_after, tracker.maximum
+
+
+def summarize(rows, max_concurrency, metrics_delta, args, label, gpu_max=None):
     good = [row for row in rows if row["ok"]]
     if not rows:
         raise ValueError("benchmark point produced no requests")
     duration = max(row["ended_s"] for row in rows) - min(row["started_s"] for row in rows)
+    duration_success = (
+        max(row["ended_s"] for row in good) - min(row["started_s"] for row in good)
+    ) if good else None
+    for row in rows:
+        row["conforming_standard"], row["conforming_strict"] = conforming(
+            row, args.slo_ttft_ms / 1000, args.slo_tpot_ms / 1000, args.strict_max_itl_s
+        )
     ttfts = [row["ttft_s"] for row in good]
     tpots = [row["tpot_s"] for row in good]
     itls = [value for row in good for value in row["itls_s"]]
     e2es = [row["e2e_s"] for row in good]
+    server_queues = [row["server_queue_s"] for row in rows if row.get("server_queue_s") is not None]
     input_tokens = sum(row["prompt_tokens"] or 0 for row in good)
     output_tokens = sum(row["output_tokens"] or 0 for row in good)
     prompt_token_counts = [row["prompt_tokens"] for row in good if row["prompt_tokens"] is not None]
+    standard_count = sum(1 for row in rows if row["conforming_standard"])
+    strict_count = sum(1 for row in rows if row["conforming_strict"])
+    standard_ci = wilson_ci(standard_count, len(rows))
+    strict_ci = wilson_ci(strict_count, len(rows))
+    prefix_hit_tokens = metrics_delta.get("kv_prefix_hit_tokens_total", 0.0)
     result = {
-        "load_fraction": fraction,
-        "target_qps": args.max_qps * fraction,
+        **label,
         "achieved_qps": len(good) / duration,
         "request_throughput_per_s": len(good) / duration,
         "input_tokens_per_s": input_tokens / duration,
         "output_tokens_per_s": output_tokens / duration,
         "total_tokens_per_s": (input_tokens + output_tokens) / duration,
         "success_rate": len(good) / len(rows),
-        "goodput_per_s": goodput(good, duration, args.slo_ttft_ms / 1000, args.slo_tpot_ms / 1000),
-        "slo_success_rate": sum(
-            1
-            for row in rows
-            if row["ok"]
-            and row["ttft_s"] is not None
-            and row["tpot_s"] is not None
-            and row["ttft_s"] <= args.slo_ttft_ms / 1000
-            and row["tpot_s"] <= args.slo_tpot_ms / 1000
-        ) / len(rows),
+        "goodput_per_s": standard_count / duration,
+        "goodput_tokens_per_s": token_goodput(rows, duration, "conforming_standard"),
+        "slo_success_rate": standard_count / len(rows),
+        "slo_standard_rate": standard_count / len(rows),
+        "slo_standard_rate_ci95": list(standard_ci),
+        "slo_strict_rate": strict_count / len(rows),
+        "slo_strict_rate_ci95": list(strict_ci),
+        "counts": {
+            "attempted": len(rows),
+            "ok": len(good),
+            "conforming_standard": standard_count,
+            "conforming_strict": strict_count,
+            **error_bucket_counts(rows),
+        },
+        "error_buckets": error_bucket_counts(rows),
         "slo_ttft_ms": args.slo_ttft_ms,
         "slo_tpot_ms": args.slo_tpot_ms,
+        "strict_max_itl_s": args.strict_max_itl_s,
         "max_concurrency": max_concurrency,
+        "duration_s": duration,
+        "duration_success_s": duration_success,
         "e2e_cv": coefficient_of_variation(e2es),
+        "p99_reference_only": len(rows) < 500,
         "mixed_steps": metrics_delta.get("engine_mixed_steps_total", 0.0),
         "prefill_steps": metrics_delta.get("engine_prefill_steps_total", 0.0),
         "decode_steps": metrics_delta.get("engine_decode_steps_total", 0.0),
+        "preemptions": metrics_delta.get("scheduler_preemptions_total", 0.0),
     }
     if prompt_token_counts:
         result.update({
             "prompt_tokens_min": min(prompt_token_counts),
-            "prompt_tokens_p50": percentile(prompt_token_counts, 0.50),
+            "prompt_tokens_p50": percentile(prompt_token_counts, 0.50, method="linear"),
             "prompt_tokens_max": max(prompt_token_counts),
         })
+    if prefix_hit_tokens and input_tokens:
+        result["prefix_cache_hit_rate"] = prefix_hit_tokens / sum(
+            row["prompt_tokens"] or 0 for row in rows if row["prompt_tokens"]
+        )
+    else:
+        result["prefix_cache_hit_rate"] = 0.0
+    if gpu_max:
+        result["gpu_mem_mib_max"] = [entry["mem_mib"] for entry in gpu_max]
+        result["gpu_util_pct_max"] = [entry["util_pct"] for entry in gpu_max]
     result.update(distribution(ttfts, "ttft"))
     result.update(distribution(tpots, "tpot"))
     result.update(distribution(itls, "itl"))
     result.update(distribution(e2es, "e2e"))
+    if server_queues:
+        result["queue_p50_s"] = percentile(server_queues, 0.50, method="linear")
+        result["queue_p95_s"] = percentile(server_queues, 0.95, method="linear")
+        result["queue_samples"] = len(server_queues)
+    return result
+
+
+def aggregate(summaries, key_fields):
+    """Pooled SLO rates + Wilson CI and run-to-run spread across repeats."""
+    groups = {}
+    for row in summaries:
+        groups.setdefault(tuple(row[field] for field in key_fields), []).append(row)
+    result = []
+    for key, rows in sorted(groups.items(), key=lambda item: str(item[0])):
+        label = dict(zip(key_fields, key))
+        repeats = [row["repeat"] for row in rows]
+        total_attempted = sum(row["counts"]["attempted"] for row in rows)
+        total_standard = sum(row["counts"]["conforming_standard"] for row in rows)
+        total_strict = sum(row["counts"]["conforming_strict"] for row in rows)
+        entry = {
+            **label,
+            "repeats": repeats,
+            "slo_standard_rate_per_repeat": [row["slo_standard_rate"] for row in rows],
+            "slo_strict_rate_per_repeat": [row["slo_strict_rate"] for row in rows],
+            "slo_standard_rate_ci95": list(wilson_ci(total_standard, total_attempted)),
+            "slo_strict_rate_ci95": list(wilson_ci(total_strict, total_attempted)),
+            "achieved_qps_median": percentile(
+                [row["achieved_qps"] for row in rows], 0.50, method="linear"
+            ),
+        }
+        result.append(entry)
     return result
 
 
@@ -339,78 +591,131 @@ def fmt_seconds(value, digits):
 async def async_main(args):
     import httpx
 
+    gpu_sampler = GpuSampler(interval_s=args.gpu_sample_interval_s, enabled=not args.no_gpu_sample)
+    gpu_sampler.start()
     tokenizer = None
     if args.tokenizer:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
     prompt_words = args.prompt_words
     calibration = None
+    mixed_words = None
     if args.prompt_tokens:
         if tokenizer is None:
             raise SystemExit("--prompt-tokens requires --tokenizer")
-        prompt_words, measured = calibrate_prompt_words(
-            tokenizer, args.prompt_word, args.prompt_mode, args.seed, args.prompt_tokens
-        )
-        calibration = {
-            "target_tokens": args.prompt_tokens,
-            "prompt_words": prompt_words,
-            "measured_tokens": measured,
-        }
+        if args.prompt_mode == "mixed":
+            calibration = calibrate_mixed(
+                tokenizer, args.prompt_word, "unique", args.seed, args.prompt_tokens
+            )
+            mixed_words = {bucket: entry["prompt_words"] for bucket, entry in calibration.items()}
+            prompt_words = mixed_words["medium"]
+        else:
+            prompt_words, measured = calibrate_prompt_words(
+                tokenizer, args.prompt_word, args.prompt_mode, args.seed, args.prompt_tokens
+            )
+            calibration = {
+                "target_tokens": args.prompt_tokens,
+                "prompt_words": prompt_words,
+                "measured_tokens": measured,
+            }
         print(f"[online] prompt calibration={calibration}", flush=True)
+
     def prompt_for_request(request_id):
+        if args.prompt_mode == "mixed":
+            bucket = mixed_bucket(request_id)
+            return build_prompt(
+                args.prompt_word, mixed_words[bucket], "unique", args.seed, request_id
+            )
         return build_prompt(
             args.prompt_word, prompt_words, args.prompt_mode, args.seed, request_id
         )
+
     limits = httpx.Limits(
-        max_connections=args.requests + args.warmup_requests,
-        max_keepalive_connections=args.requests + args.warmup_requests,
+        max_connections=args.requests + args.warmup_requests + 64,
+        max_keepalive_connections=args.requests + args.warmup_requests + 64,
     )
     async with httpx.AsyncClient(limits=limits) as client:
         all_rows = []
         points = []
+        summaries = []
+        gpu_sampler.phase = "measure"
         for point_index, fraction in enumerate(args.fractions):
-            rows, before, after, max_concurrency = await run_point(
-                client, args, fraction, point_index, prompt_for_request, tokenizer
-            )
-            all_rows.extend(rows)
-            delta = _delta(before, after)
-            points.append({
-                "load_fraction": fraction,
-                "metrics_before": before,
-                "metrics_after": after,
-                "metrics_delta": delta,
-                "max_concurrency": max_concurrency,
-            })
-            print(
-                f"[online] load={fraction:.0%} "
-                f"ok={sum(row['ok'] for row in rows)}/{len(rows)}",
-                flush=True,
-            )
+            for repeat in range(1, args.repeats + 1):
+                if args.mode == "concurrency":
+                    rows, before, after, max_concurrency = await run_point_concurrency(
+                        client, args, fraction, point_index, repeat,
+                        prompt_for_request, tokenizer,
+                    )
+                else:
+                    rows, before, after, max_concurrency = await run_point(
+                        client, args, fraction, point_index, repeat,
+                        prompt_for_request, tokenizer,
+                    )
+                all_rows.extend(rows)
+                delta = _delta(before, after)
+                point_end = max(row["ended_s"] for row in rows)
+                point_start = min(row["started_s"] for row in rows)
+                gpu_max = gpu_sampler.max_in_window(point_start, point_end)
+                points.append({
+                    "load_fraction": fraction if args.mode != "concurrency" else None,
+                    "concurrency": fraction if args.mode == "concurrency" else None,
+                    "repeat": repeat,
+                    "metrics_before": before,
+                    "metrics_after": after,
+                    "metrics_delta": delta,
+                    "max_concurrency": max_concurrency,
+                    "gpu_mem_util_max": gpu_max,
+                })
+                label = (
+                    {"load_fraction": fraction, "target_qps": args.max_qps * fraction, "repeat": repeat}
+                    if args.mode != "concurrency" else
+                    {"concurrency": fraction, "repeat": repeat}
+                )
+                summary = summarize(
+                    rows, max_concurrency, delta, args, label, gpu_max
+                )
+                summaries.append(summary)
+                print(
+                    f"[online] mode={args.mode} load={fraction} repeat={repeat} "
+                    f"ok={sum(row['ok'] for row in rows)}/{len(rows)} "
+                    f"slo_std={summary['slo_standard_rate']:.1%} "
+                    f"slo_strict={summary['slo_strict_rate']:.1%}",
+                    flush=True,
+                )
 
-    summaries = []
-    for point in points:
-        fraction = point["load_fraction"]
-        rows = [row for row in all_rows if row["load_fraction"] == fraction]
-        summaries.append(summarize(
-            rows, point["max_concurrency"], point["metrics_delta"], args, fraction
-        ))
+    key_fields = ["load_fraction"] if args.mode != "concurrency" else ["concurrency"]
+    aggregates = aggregate(summaries, key_fields)
 
     payload = {
-        "schema_version": 2,
-        "arrival_pattern": args.arrival_pattern,
+        "schema_version": 3,
+        "run_id": f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}",
+        "mode": args.mode,
+        "arrival_pattern": args.arrival_pattern if args.mode != "concurrency" else None,
         "seed": args.seed,
         "prompt_mode": args.prompt_mode,
         "prompt_words": prompt_words,
+        "prompt_words_mixed": mixed_words,
         "prompt_tokens_target": args.prompt_tokens or None,
         "prompt_calibration": calibration,
         "warmup_requests": args.warmup_requests,
+        "warmup_done": args.warmup_requests > 0,
+        "repeats": args.repeats,
+        "percentile_method": "linear",
+        "slo_definition": {
+            "standard": f"ttft_s <= {args.slo_ttft_ms / 1000} and tpot_s <= {args.slo_tpot_ms / 1000}",
+            "strict": f"standard and max(itl_s) <= {args.strict_max_itl_s}",
+        },
+        "request_timeout_s": args.request_timeout_s,
         "prompt_tokens": _prompt_token_count(
             tokenizer, [{"role": "user", "content": prompt_for_request(0)}]
-        ),
+        ) if tokenizer else None,
         "summary": summaries,
+        "aggregates": aggregates,
         "points": points,
         "records": all_rows,
+        "gpu_samples": gpu_sampler.samples,
     }
+    gpu_sampler.stop()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -418,18 +723,21 @@ async def async_main(args):
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in all_rows),
         encoding="utf-8",
     )
+    load_key = "load_fraction" if args.mode != "concurrency" else "concurrency"
     markdown = [
-        "| Load | QPS | Req/s | Out tok/s | Success | Goodput | TTFT p95 | TPOT p95 | ITL p95 | E2E p95 | Max conc |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        f"| {load_key} | rep | QPS | Req/s | Out tok/s | Goodput tok/s | SLO std | SLO strict | TTFT p95 | queue p95 | TPOT p95 | ITL p95 | E2E p95 | Max conc |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summaries:
+        load_value = row.get(load_key)
         markdown.append(
-            f"| {row['load_fraction']:.0%} | {row['target_qps']:.3f} | "
+            f"| {load_value} | {row['repeat']} | {row.get('target_qps', float('nan')):.3f} | "
             f"{row['request_throughput_per_s']:.3f} | {row['output_tokens_per_s']:.2f} | "
-            f"{row['success_rate']:.1%} | {row['goodput_per_s']:.3f} | "
-            f"{fmt_seconds(row['ttft_p95_s'], 3)} | {fmt_seconds(row['tpot_p95_s'], 4)} | "
-            f"{fmt_seconds(row['itl_p95_s'], 4)} | {fmt_seconds(row['e2e_p95_s'], 3)} | "
-            f"{row['max_concurrency']} |"
+            f"{row['goodput_tokens_per_s']:.2f} | "
+            f"{row['slo_standard_rate']:.1%} | {row['slo_strict_rate']:.1%} | "
+            f"{fmt_seconds(row['ttft_p95_s'], 3)} | {fmt_seconds(row.get('queue_p95_s'), 3)} | "
+            f"{fmt_seconds(row['tpot_p95_s'], 4)} | {fmt_seconds(row['itl_p95_s'], 4)} | "
+            f"{fmt_seconds(row['e2e_p95_s'], 3)} | {row['max_concurrency']} |"
         )
     output.with_suffix(".md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
 
@@ -439,11 +747,21 @@ def main():
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", required=True)
     parser.add_argument("--tokenizer", help="local tokenizer path for usage validation/fallback")
-    parser.add_argument("--max-qps", type=float, required=True)
+    parser.add_argument("--mode", choices=("poisson", "concurrency"), default="poisson")
+    parser.add_argument(
+        "--concurrency",
+        type=lambda value: [int(x) for x in value.split(",")],
+        default=None,
+        help="convenience alias for --mode concurrency --fractions <list>; "
+             "concurrency levels are absolute, not QPS multipliers",
+    )
+    parser.add_argument("--max-qps", type=float, default=0.87,
+                        help="target arrival rate for poisson mode (unused in concurrency mode)")
     parser.add_argument(
         "--fractions",
         type=lambda value: [float(x) for x in value.split(",")],
         default=[0.25, 0.5, 0.75, 0.9],
+        help="poisson: multipliers on --max-qps; concurrency: fixed concurrency levels",
     )
     parser.add_argument("--requests", type=int, default=128)
     parser.add_argument("--warmup-requests", type=int, default=4)
@@ -457,20 +775,32 @@ def main():
     )
     parser.add_argument("--prompt-word", default="benchmark")
     parser.add_argument(
-        "--prompt-mode", choices=("shared", "unique"), default="shared",
-        help="shared preserves the historic prefix-sharing workload; unique disables full-block reuse",
+        "--prompt-mode", choices=("shared", "unique", "mixed"), default="shared",
+        help="shared preserves the historic prefix-sharing workload; unique disables "
+             "full-block reuse; mixed sends 3:4:3 short/medium/long prompts",
     )
     parser.add_argument("--arrival-pattern", choices=("fixed", "poisson"), default="poisson")
     parser.add_argument("--seed", type=int, default=20261026)
     parser.add_argument("--slo-ttft-ms", type=float, default=2000.0)
     parser.add_argument("--slo-tpot-ms", type=float, default=500.0)
-    parser.add_argument("--output", default="benchmarks/data/online-v2.json")
+    parser.add_argument("--strict-max-itl-s", type=float, default=1.0)
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--request-timeout-s", type=float, default=120.0)
+    parser.add_argument("--duration", type=float, default=None,
+                        help="concurrency mode: stop submitting after this many seconds")
+    parser.add_argument("--gpu-sample-interval-s", type=float, default=2.0)
+    parser.add_argument("--no-gpu-sample", action="store_true")
+    parser.add_argument("--output", default="benchmarks/data/online-v5.json")
     args = parser.parse_args()
     assert args.max_qps > 0 and args.requests > 0 and args.warmup_requests >= 0
     assert args.slo_ttft_ms > 0 and args.slo_tpot_ms > 0
-    # fraction is a multiplier on --max-qps; values > 1 are legitimate for
-    # exploring saturation beyond the nominal single-stream ceiling.
+    assert args.repeats >= 1 and args.request_timeout_s > 0
+    # fraction is a multiplier on --max-qps (poisson) or an absolute concurrency
+    # level; values > 1 are legitimate for exploring saturation.
     assert all(0 < fraction for fraction in args.fractions)
+    if args.concurrency is not None:
+        args.mode = "concurrency"
+        args.fractions = [float(value) for value in args.concurrency]
     asyncio.run(async_main(args))
 
 

@@ -75,6 +75,21 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        total = len(prompt) + sampling_params.max_tokens
+        config = self.model_runner.config
+        kv_token_capacity = config.num_kvcache_blocks * self.model_runner.block_size
+        if total > config.max_model_len:
+            raise ValueError(
+                f"prompt({len(prompt)}) + max_tokens({sampling_params.max_tokens}) "
+                f"exceeds max_model_len({config.max_model_len})"
+            )
+        if total > kv_token_capacity:
+            # Recompute-only preemption can never admit a sequence that does not
+            # fit the KV pool; reject instead of queueing it forever.
+            raise OverflowError(
+                f"request needs {total} tokens but KV capacity is "
+                f"{kv_token_capacity} tokens"
+            )
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
         return seq.seq_id
@@ -87,6 +102,14 @@ class LLMEngine:
         batch = self.scheduler.schedule()
         schedule_elapsed = perf_counter() - schedule_start
         seqs, mode = batch
+        if not seqs:
+            # Scheduler found nothing runnable (e.g. KV exhausted, requests
+            # waiting for a cancel): report an empty step instead of feeding an
+            # empty batch to the model.
+            self.last_step_metrics = {
+                "mode": "empty", "schedule_s": schedule_elapsed, "forward_s": 0.0,
+            }
+            return [], 0
         self.schedule_mode_counts[mode] += 1
         prefill_tokens = sum(
             seq.num_scheduled_tokens for seq in seqs if seq.is_prefill

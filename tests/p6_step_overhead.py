@@ -58,12 +58,12 @@ def install_timed_run(runner):
         input_ids, positions = (
             runner.prepare_decode(seqs) if mode == "decode" else runner.prepare_prefill(seqs)
         )
-        temperatures = runner.prepare_sample(seqs) if runner.rank == 0 else None
+        temperatures, all_greedy = runner.prepare_sample(seqs) if runner.rank == 0 else (None, True)
         prepared = time.perf_counter()
         logits = runner.run_model(input_ids, positions, mode)
         forwarded = time.perf_counter()
         token_ids = (
-            runner.sampler(logits, temperatures).tolist() if runner.rank == 0 else None
+            runner.sampler(logits, temperatures, all_greedy).tolist() if runner.rank == 0 else None
         )
         sampled = time.perf_counter()
         reset_context()

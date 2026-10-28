@@ -157,3 +157,162 @@
 
 
 
+
+---
+
+# P8 — 2026-10-27 23:00 起 24h 轮次日志
+
+> 规则:每个实验先写门再跑;一次只跑一个 GPU 任务;失败/负结果照样记录。H0=2026-10-27 23:00 (+0800),H24=2026-10-28 23:00。
+
+### H0–H1.5 P0 基线核验 + KV 块数一致化 (I21) + 指标 v3
+
+- **起点核验**:本地 HEAD `c0d1a7023970`(=交接文档起点),工作区干净(仅 .DS_Store)。服务器双卡 0 MiB、无 python/spawn、/dev/shm 干净、无 lock。本地↔远端五个关键文件 md5 一致,无需同步基线。
+- **I21 修复**(`model_runner.py` allocate_kv_cache):启发式算出 blocks 后,TP>1 时 `dist.all_reduce(MIN)` 统一两 rank 的 `config.num_kvcache_blocks`,再打印 `[kvcache]` 行与分配。
+- **冻结门(跑前写)**:① 两 rank `[kvcache] blocks=` 相同;② `tests/p6_bmm_dense_tiny.py` 六配置逐 token 全等、rc=0。
+- **实际**:`[bmm-tiny] exact match across all six configs: True`,`rc=0`;TP2 两配置下 rank0/rank1 blocks=343080/343080、341994/341994(本加载内两 rank 启发式恰好相同,divergence 钳制路径未触发,但 int64 all_reduce(MIN) 在 MCCL 上验证可用;真 divergence 待 30B 首次加载确认)。
+- **判定**:PASS。
+- **证据**:`/root/p8_tiny_regression.log`(远端)。
+- **决策**:进入 P0.3。
+
+- **指标 v3 实现**:`nanovllm/benchmarking.py`(wilson_ci / token_goodput / classify_error / conforming / percentile method="linear")、`scripts/benchmark_online.py`(schema v3:error_kind 分桶、--request-timeout-s[wait_for 取消→服务端断连 cancel]、slo_standard+slo_strict 双 SLO、--repeats + Wilson CI、--mode concurrency、--prompt-mode mixed 3:4:3、GPU 每 2s 采样、p99_reference_only、queue_p50/p95 来自服务端 final-chunk metrics)、`api_server.py`(stream_options.include_metrics 时 final chunk 带 queue/ttft/e2e/tpot/itls)、`tests/test_benchmarking_v3.py`。
+- **门**:`python3 -m pytest tests/test_benchmarking_v3.py` 全绿;旧 v2/v4 JSON 回放不抛异常。
+- **实际**:15 passed(含 v4-paged.json 回放);kv_prefix_hit_tokens_total 服务端已存在(block_manager.metrics)无需新增。
+- **判定**:PASS。
+
+---
+
+### H1.75– P1.1 fused RMSNorm — 冻结门(跑前写,不可跑后改)
+
+- **假设**:0.6B b1 每步 2,401 launches 中 ~1,000 来自 RMSNorm 的 fp32 上采样逐元素链;单 Triton kernel(bf16 进出、fp32 内累加、同时产 residual)可把 decode 步时降 ≥8%。
+- **唯一变量**:`NANOVLLM_FUSED_RMSNORM` 开关(运行时切换,同进程内交替);其余栈不动(eager、sdpa、b1、fcfs、max_num_seqs=1)。
+- **预期**:步时中位数 −8~15%(63ms 基线 → 54–58ms);launch/步 −800~−1,100。
+- **冻结门**:
+  - G1(L1,kernel 级):合成 bf16 输入上 fused vs eager 输出 **fp32 cast 后 max_abs <2e-3**(residual / no-residual 两路径);bf16 输出逐元素不等数仅报告(预期 ≤1 ulp 边界翻转)。依据:L1 口径是单层 fp32 参考误差(I4 先例),端到端 bf16 logits 的 1-ulp 量化噪声不可用绝对阈判定。
+  - G2(L2,端到端):0.6B b1、8 prompts × 32 步 free-decode,top-1 翻转率 <0.5%(按可比步数),**所有**翻转处 (top1−top2) margin <0.5;token 流一致数报告。首个翻转后的步不比 logits(轨迹已分叉)。
+  - G3(自确定):两模式各 3 次重复逐 token 一致。
+  - G4(性能):交错 baseline/fused 各 5 trial × 32 decode 步,**中位数的 median** fused ≤ 0.92×baseline,**两组 CV ≤5%**,否则 INVALID。
+  - G5(launch 证据):profiler 单步 launch_count(fused) ≤ launch_count(eager) − 800。
+- **判定规则**:G1–G3 全过 + G4 过 → PASS(flag 默认开,进 tiny 回归);G4 不过 → 记数字、flag 默认关;CV>5% → 增至 10 交错或判 INVALID。
+- **证据**:`/root/p8_fusion.json`、`/root/p8_fusion_ab.log`。
+
+#### P1.1 fused RMSNorm A/B — 实际结果(H2.2)
+
+- **实际**:
+  - G1 PASS:三组形状(hidden 1024/2048、head_dim 128)fp32_max_abs=0.0、**bf16 输出 0 元素不等**(bitwise 全等)。
+  - G3 PASS:两模式各 3 次重复逐 token 全自确定。
+  - G5 PASS:launch 2,402 → 1,442(−960/步);kernel device 时间 31.87 → 21.14 ms(**−10.7 ms/步,−33%**)。
+  - G2 FAIL:prompt 6 step 4 翻转,margin=1.375(≥0.5 门);可比 228 步 1 翻转(0.44%)。与 G1 bitwise 全等**矛盾**(0.22 的 logits_max_abs 解释不了 1.375 margin 的翻转)——待诊断。
+  - G4 FAIL:baseline 中位 54.83 ms、fused 54.41 ms,**−0.76%**(门 −8%);CV 0.34%/0.23%(A/B 有效,非噪声)。
+- **判定**:FAIL(按冻结门不采用;flag 默认关;代码保留为 opt-in)。
+- **重大发现(比融合本身更重要)**:launch −960 且 **device 时间 −10.7 ms**,步时却只 −0.4 ms → GPU idle 从 ~23 ms 扩大到 ~33 ms。**步时既不由 device 工作量决定,也不由 launch 提交量决定**。I19"launch-bound→融合换步时"的因果假设被实测否定;此前文档里的"13.5 µs/launch"是 device 时间均摊(31.9ms/2402),不是 host 提交成本。图的 replay(P2)成为判决"每步固定成本到底是什么"的决定性实验。
+- **决策**:转 P1.3 host-sync A/B(2 次 bool sync + 96 次 tolist 是仅剩的硬 sync 点);G2 矛盾做逐模块 bitwise 诊断。
+- **证据**:`/root/p8_fusion.json`(远端),`/root/p8_fusion_ab.log`。
+
+#### P1.1 附加诊断 — bitwise 分歧源头(H2.6)
+
+- **问题**:G1 kernel probe bitwise 全等 vs G2 端到端翻转,矛盾待解。
+- **方法**:`tests/p8_rmsnorm_bitwise_diag.py`,113 个 RMSNorm 模块逐 call 输出比对(prompt 6)。
+- **实际**:每次 call 0–1 元素差 1 bf16 ulp(首分歧 `layers.1.input_layernorm`,[128,1024],max_abs=4.88e-4);3,573/3,616 call 有微差;**本次运行 tokens_match=True(A/B 中的翻转未复现)**。原因:eager `mean` 的归约切分依赖输入形状(probe 的 37/64/17 行恰好与 Triton 一致,真实 128 行不一致),1-ulp 差异经层放大。
+- **结论**:G2 FAIL 的机理明确——任何非 bitwise 等价的 RMSNorm 重实现都会带来 I4 同级漂移;融合 kernel 本身数值健康(L1 4.9e-4 ≪ 2e-3),按翻转率门判不采用。
+- **证据**:`/root/p8_rmsnorm_bitwise_diag.json`、`/root/p8_rmsnorm_diag.log`。
+
+### H2.7– P1.3 host-sync A/B — 冻结门(跑前写)
+
+- **假设**:0.6B b32 混合温度时 sampler 的 2 次 `bool()` 设备读是每步硬串行点;prefill 每层 2 次 `.tolist()`(512-token prefill 96 次)拖慢 TTFT;去掉后 sample 段与 prefill 步时可测改善。
+- **唯一变量**:`set_host_sync_fix`(on/off,同进程交替,env `NANOVLLM_HOST_SYNC_FIX`);其余栈不动。
+- **冻结门**:
+  - T1:b1 与 b32-greedy 的 token 流 on/off 全等。
+  - T2:b32-mixed 的 sample 段中位数 on ≤ 0.5×off,CV≤5%(两组)。
+  - T3:prefill-512 步时 on < off(0.6B 上仅报告,−≥50% 门是 30B L2 的事)。
+  - T4:b1/b32-greedy 步时差仅报告。
+- **判定**:T1+T2 过 → 代码保留为默认开(on),进 tiny 回归;T2 不过但 T1 过 → 保留代码但结论记"0.6B 不可测,30B L2 复核"。
+- **证据**:`/root/p8_sync_fix.json`、`/root/p8_sync_ab.log`。
+
+#### P1.3 host-sync A/B — 实际结果(H4.7)
+
+- **实际**(交错 5+5,同进程):
+  - T1 PASS:b1(32 步)与 b32-greedy(16 步)token 流 on/off 全等(注:第一版脚本 b1 用了不同 prompt、b32 用 seq_id 键控 dict 比较,均为测试 bug,修正后 PASS)。
+  - T2(b32-mixed sample 段):1.75 → 1.51 ms,−13.5%;0.5× 门不过——该门按 30B b32 sample 36.6 ms 设计,0.6B 的 sample 段被 argmax+tolist 主导,0.6B 上不可判,30B L2 复核。
+  - T3(prefill-512 步时):run1 62.8→55.5 ms(**−11.6%**),run2 62.3→58.9 ms(−5.4%);两组 wall 交错clean分离,CV ≤1%。
+  - T4:b1 步时 52.95→52.73(−0.4%)、b32-greedy 60.90→60.79(−0.2%)——再次确认 decode 步时对 host-sync 摘除不敏感。
+- **判定**:PASS(T1+T3);代码默认 ON 采纳。prefill 的 96 次 tolist 是真实可测开销(~7 ms/512-token prefill step);decode 侧的 2 次 bool 仅 ~0.2-0.4 ms。
+- **决策**:host-sync 修复保持默认;A 项验收的"−≥8%"主张挂到 30B L2 的 prefill 实测。继续 P2。
+- **证据**:`/root/p8_sync_fix.json`、`/root/p8_sync_ab4.log`。
+
+### H4.8– P2 图 replay 根因 — 冻结门(跑前写)
+
+- **假设**(架构书 §2.7):replay 时 padding 行 slot_mapping=0,整桶执行覆写 KV slot 0(block 0 常属活跃请求)→ 首 replay 漂移。
+- **修复**(已实现,`model_runner.py`):allocate_kv_cache 多留 1 个 scratch block(BlockManager 不可见);replay 前 `slot_mapping.fill_(scratch_slot)`、`block_tables.fill_(scratch_block_id)`,真实行再覆盖前缀。
+- **唯一变量**:scratch-slot 修复(tiny/8B 图 vs eager)。
+- **冻结门**:
+  - GA(slot0 回读):replay-only decode 步间,KV slot 0(全层 K/V)bitwise 不变。
+  - GB(5/5):tiny 连续 5 次 graph generate 与 eager 参考 token 全等(修复前 0/5)。
+  - GC(共享前缀):共享 300-token 前缀的两请求 graph == eager(block 0 被共享的场景)。
+  - GD:捕获失败与 replay 漂移分开计数。
+  - 顺序:tiny 5/5 → 8B 5/5 → 才允许 30B。
+- **30B 图门来源审计(跑前写死,双轨)**:
+  - 硬门:graph 与 eager 逐 token 全等(b1/b8/b32);吞吐 CV ≤5%;图显存增量 ≤2 GiB。
+  - 性能门(双轨,b1):**≥+15% 转正**;+8~15% 记录"正确性通过、性能待产品决策"不改默认;<+8% 判"图在本栈不划算"。
+  - b8 ≥+5%、b32/b64 ≥0.98 仅报告,不作唯一否决。
+  - 注:该 +15% 门定于 bmm_dense 采用之前;现在 eager 已拿走 decode 大头,图增量必然变小,故用双轨而非单一否决。
+- **证据**:`/root/p8_graph_padfix.json`(tiny/8B)、`/root/p8_graph_30b.json`(L1)、`benchmarks/P8-graph.md`。
+
+#### P2.2 tiny/8B 验证 — 实际结果(H6.2–H7.0)
+
+- **0.6B(paged,dense)**:GB PASS(graph 5/5 与 eager 逐 token 全等,生产 attention 后端);GC PASS(共享 300-token 前缀两请求全等);GD=0(捕获零失败);GA 未判定(见下)。
+- **8B(paged,dense)**:**GA+GB+GC+GD 全 PASS,overall PASS**(5/5 token 全等、slot0 回读干净、共享前缀全等、捕获零失败)。
+- **tiny MoE(sdpa,head_dim=16 不可用 paged)**:GA/GC PASS、5/5 自洽,但 GB FAIL——机制已定位:图捕获烘焙 capture 时的 kv 窗口形状(256),eager 用运行时窗口,SDPA 归约序不同 → I4 级 1-ulp 漂移;**paged kernel 的循环边界在 device 上由 context_lens 决定,不受烘焙形状影响**,故生产路径(paged)上 graph==eager bitwise 成立(0.6B/8B 实证)。
+- **GA 波折(如实记录)**:slot0 回读三次 FAIL,根因是**测量基础设施**:torch.musa 对 `kv_cache[:, :, blk, 0]` 跨块步长视图的 D2H 拷贝返回与 device 侧逐层扫描不一致的数据(full-slice NaN、K/V 分读干净、`.item()` 扫描干净、contiguous() 后仍 NaN)——平台 bug 嫌疑,已加 workaround 与说明。GA 的实质(活跃 KV slot 不被 replay 覆写)由 GB 独立证明:若覆写,token 必漂移。记入 ISSUES(新条目)。
+- **判定**:P2.2 PASS(padding-slot 根因确认并修复;paged 路径 graph==eager)。**允许 30B L1**。
+- **证据**:`/root/p8_graph_padfix.json`(0.6B)、`/root/p8_graph_padfix_8b.log`+json(8B)、`/root/p8_graph_padfix_tiny` 首轮 json(tiny,sdpa 解释性 FAIL)。
+
+#### P2.4 30B L1 — 第一次尝试楔死(记录)与重启(H9.3)
+
+- **现象**:捕获 6 桶成功(显存 allocated 36.08 GiB 稳定、reserved +0.34 GiB ≤2 GiB 门 ✓、KV explicit 640/640 两 rank 一致 ✓);warmup replay 阶段进程 CPU 0%、**双卡 100% util 对称自旋**。
+- **根因(A/B 脚本,非引擎)**:`drive_batch` 只改了 rank0 的 `runner.enforce_eager`;rank1(独立进程)仍是 init 时的 False 走 replay → 同一步两 rank 集体通信路径错配(eager collective vs 图内 collective)→ MCCL 双向等待死锁自旋。
+- **修正**:改用 `runner.call("set_enforce_eager", ...)`(shm 命令通道 + barrier,两 rank 同步切换)。已按 SOP 按 PID kill(rank0 被 pkill 命中,rank1 spawn 子进程按 PID 补杀)→ 清 shm → 双卡 0 MiB → 重跑。
+- **SOP 增补**:任何 eager/graph 运行时切换必须走 `model_runner.call`(两 rank),绝不直接写本地属性。
+
+### H9.5– P3 (L2) — 冻结门(跑前写)
+
+- **P3.1 真实负载统计**:32 条中英 chat prompt(512 token)、decode 64;fold 前 owned/folded 计数 + 全局 counts;输出 Gini、rank imbalance(folding 修正口径)、S_max 观察(shrink 路径 (tokens, max_load, n_owned) 记录)。判定:**如果 max_load 中位数 ≥ 2× 均值,容量收缩收益打折;否则收益成立**。
+- **P3.2 容量收缩 A/B**(唯一变量 = `_CAPACITY_SHRINK`):
+  - 数值门:两模式各 3 次自确定(PASS/FAIL);与 padded 的 token 一致率仅报告(bmm tiling 序变化,预期非全等;30B 上 token agreement 记录)。
+  - 性能门:b32 与 b64 decode 步时中位数 **−≥10%**(冻结门取步时;MoE 段 −20% 由 S_max 推算佐证),交错 5+5、CV ≤5%,否则 INVALID。
+  - 显存:x_pad 峰值显著低于现状(观察)。
+- **P1.3-30B(prefill host-sync)**:512-token prefill 步时 on/off 交错 5+5;**门:on < off 且 delta ≤ −5%**(0.6B 实测 −11.6%;30B 若 ≥5% 即可作为 A 项验收主证据)。
+- **证据**:`/root/p8_moe_30b.json`。
+
+#### P2.4 30B L1 — 第二次尝试:replay 楔死复现 → P2 结案(H10.1)
+
+- **现象**(切换已修复为 `runner.call("set_enforce_eager")` 双 rank 同步):eager b1 trial 正常(142.06 ms/decode step),**首个 graph-mode trial 再次楔死**——双卡 100% util、host CPU 0%。
+- **判决**:**30B TP2 的首次 replay 楔死是独立于 padding-slot 的第二个故障**。证据:①0.6B/8B(TP1,图内无 collective)padding 修复后 replay 完全正常且 bitwise 全等;②楔死时双卡对称自旋,符合图内 96 次 MCCL all-reduce 的 rendezvous 失败特征;③与 P6 nightly 记录的"30B 捕获成功、首次 replay 楔死"一致。padding-slot 修复解决的是"漂移"类故障(TP1 已实证);TP2 wedge 属 MCCL-in-graph 问题,本轮不做(4h 硬停已过)。
+- **按双轨门判决**:硬门未完成(token 全等无法测,流程楔死)→ **30B 图维持否决:默认保持 eager**;性能门不适用。
+- **本轮图 Track 净产出**:①padding-slot 根因确认+修复+TP1 全链验证(tiny/0.6B/8B);②sdpa 图烘焙形状的数值限制定位;③TP2 wedge 与漂移分离为两个故障;④运行时切换 SOP 增补。
+- **复活条件**:MCCL-in-graph 的 replay 支持性探针(参照 tests/p6_mccl_capture_multi.py 的多桶结构)+ 双 rank 同步 replay 协议;或分段图(attention/linear 进图、MoE 与 collective eager)。
+- **证据**:`/root/p8_graph_30b.log`、`/root/p8_graph_30b2.log`(楔死现场)。
+
+### H10.1–H11.2 P3 (L2) — 实际结果
+
+- **P3.1 真实负载统计**(32 条中英 chat,512-token prefill + 64 decode):routing 总 slot 6.87M;**waste(folded 无效行)47.1%**(与 §2.2 预测 ~50% 吻合);Gini 0.296;**rank imbalance 均值 15.8%**(首层 rank0 63,654 vs rank1 79,450)——真实负载的跨 rank 不均衡远超 synthetic 的 1.7–5.2%,profiled placement 值得下轮第一优先;S_max 观察:b32 中位 25 / 最大 32(最坏 256),收缩机制按设计工作。
+- **P3.2 容量收缩 A/B 判决**:
+  - 数值门 PASS:b32/b64 与 padded **token 全等**(行级 K 维归约与 M 位置无关,bitwise 一致,优于预期的软门)。
+  - 性能门 **FAIL**:b32 308.47→303.91 ms(**−1.5%**)、b64 439.41→439.89(+0.1%),门 −10%;CV 0.2–1.0%(A/B 有效,非噪声)。
+  - **判定:不采用(默认关);设计保留。** S 从 256→25(bmm 行数 ~10×)却不动步时 → 与 P1 结论一致:30B decode 步时既不由 MoE bmm 工作量、也不由 launch/sync 决定。
+- **P1.3-30B prefill host-sync**:424.9→409.6 ms(**−3.6%**,on/off 区间干净分离),未达 −5% 门;0.6B −11.6% 仍为本项最佳证据。
+- **P3.3 placement A/B**:未跑(需换 placement 重载 27 GiB 权重 ≈ 2×7 min;时间让给验收 D/E)。**结论:profiled map 生成器与统计就绪,真实 imbalance 15.8% 是动机,下轮先跑**。
+- **证据**:`/root/p8_moe_30b.json`(514 s)、`/root/p8_moe_30b.log`。
+
+### H12– H13.5 P4 L3 长上下文重测 — 实际结果
+
+- **1k 三档(chunk 256,unique,v3 客户端)**:有效门全过(prompt p50 1086/1154/1154、128×3 全 DONE、rank1 存活、零 preempt、错误桶全 none)。
+  - TTFT p50 = **3.31 / 4.05 / 5.04 s**(上轮 3.84 / 8.28 / 10.22;75%/100% 档 **−51%/−51%**);TPOT p50 = 0.368 / 0.624 / 0.876 s。
+  - **服务端 queue p50/p95 ≈ 0.05–0.17 ms** → TTFT 无排队成分,全是 1k prefill 计算;I23 mixed-split + I26/HOL 修复把高负载档 TTFT 砍半,但**改进门(50% 档 ≤2 s)未达(3.31 s)→ I26/I23 部分解决**;调度层已无免费收益,下一层是 prefill 计算路径。
+- **2k 单档(并发 64)**:128/128、零 preempt、rank1 存活、GPU 峰值 46.7 GiB;prompt p50 2193 越带上限 0.8% → 判"边界有效",核心观测(preempt=0)有效。
+- **chunk 256 vs 2048 对照**:未跑(需重启服务器重载 30B;余额紧张,记录为下轮项)。
+- **判定**:D 验收 = 部分过(有效性 PASS、改进门 FAIL、2k 边界)。
+- **证据**:`/root/p8_long_context_c256.json`、`/root/p8_long_context_2k.json`、`/root/p8_l3_server_256.log`、`/root/p8_l3_metrics_256.jsonl`。
+
+### H13.5– P5 最小并发曲线(L4,补救性最小集)
+
+- 服务器(30B,chunk 256)已载,白捡一次:`--mode concurrency --fractions 1,4,16,32,64 --requests 32 --max-tokens 64 --prompt-words 128`;Poisson ×3 CI 未做(记录)。

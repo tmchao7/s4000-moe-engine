@@ -40,6 +40,7 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.preemptions = 0
+        self.kv_admission_skips_total = 0
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -122,7 +123,11 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+        if not scheduled_seqs:
+            return ScheduledBatch(
+                sequences=[], query_lens=[], context_lens=[],
+                num_scheduled_tokens=0, mode="empty",
+            )
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, "decode"
 
@@ -170,7 +175,12 @@ class Scheduler:
                 token_budget -= 1
 
         # Each waiting sequence contributes at most one bounded chunk per step.
+        # A candidate whose KV cannot be admitted is skipped (and re-queued at
+        # the head, preserving order) instead of blocking every later, possibly
+        # smaller prompt: head-of-line blocking made one long unadmittable
+        # prompt starve the whole waiting queue (I8's TTFT collapse).
         num_waiting = len(self.waiting)
+        skipped = []
         for _ in range(num_waiting):
             if token_budget == 0 or len(decode_seqs) + len(prefill_seqs) >= seq_budget:
                 break
@@ -180,8 +190,9 @@ class Scheduler:
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
-                    self.waiting.appendleft(seq)
-                    break
+                    skipped.append(seq)
+                    self.kv_admission_skips_total += 1
+                    continue
                 self.block_manager.allocate(seq, num_cached_blocks)
             num_tokens = seq.num_tokens - seq.num_cached_tokens
             seq.num_scheduled_tokens = min(
@@ -198,9 +209,21 @@ class Scheduler:
             else:
                 self.waiting.append(seq)
 
+        for seq in reversed(skipped):
+            self.waiting.appendleft(seq)
         self.running.extendleft(reversed(decode_seqs))
         scheduled = decode_seqs + prefill_seqs
-        assert scheduled
+        if not scheduled:
+            # Nothing runnable: KV exhausted and no in-flight decode.  Returning
+            # an empty batch keeps queued requests waiting (until a cancel frees
+            # blocks) instead of crashing on an assert.
+            return ScheduledBatch(
+                sequences=[],
+                query_lens=[],
+                context_lens=[],
+                num_scheduled_tokens=0,
+                mode="empty",
+            )
         if decode_seqs and prefill_seqs:
             mode = "mixed"
         elif decode_seqs:
@@ -222,6 +245,7 @@ class Scheduler:
             "scheduler_waiting_requests": len(self.waiting),
             "scheduler_running_requests": len(self.running),
             "scheduler_preemptions_total": self.preemptions,
+            "scheduler_kv_admission_skips_total": self.kv_admission_skips_total,
         }
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], mode: str):

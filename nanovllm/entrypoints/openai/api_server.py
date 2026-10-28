@@ -71,6 +71,7 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
         if not isinstance(stream_options, dict):
             raise HTTPException(400, "stream_options must be an object")
         include_usage = bool(stream_options.get("include_usage", False))
+        include_metrics = bool(stream_options.get("include_metrics", False))
 
         try:
             prompt_ids = engine.tokenizer.apply_chat_template(
@@ -98,6 +99,8 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
             )
         except OverflowError as exc:
             raise HTTPException(429, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
 
@@ -151,6 +154,16 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
                             "model": model_name,
                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                         }
+                        if include_metrics and event.metrics:
+                            final["metrics"] = {
+                                key: event.metrics[key]
+                                for key in (
+                                    "prompt_tokens", "output_tokens", "queue_s",
+                                    "ttft_s", "e2e_s", "tpot_s", "mean_tpot_s",
+                                    "itls_s", "finish_reason",
+                                )
+                                if key in event.metrics
+                            }
                         yield f"data: {json.dumps(final)}\n\n"
                         if include_usage:
                             usage = {

@@ -19,7 +19,15 @@
 | 已转正 | I4 paged 过 L1–L5，默认已切；在线 TPOT p95 −12~18% | `benchmarks/P6-serving-v4.md` |
 | 已冻结 | I1/I2 图 0/5，`enforce_eager=True` | `benchmarks/data/p6b/p6_graph_isolation.json` |
 
-**下一个未知数**（P8 规划）：① I19 是 launch-bound 还是单 kernel 慢；② 图 replay 的 padding-slot 根因假设是否成立；③ `bmm_dense` 容量收缩能否把 decode MoE 层砍半。计划见 [`docs/P8-24h-plan.md`](./P8-24h-plan.md)。
+**P8 执行轮结果（2026-10-28 收官,详见 [`docs/HANDOFF-P9.md`](./HANDOFF-P9.md) 与 `benchmarks/P8-*.md`）**：
+
+| 未知数 | 判决 |
+|---|---|
+| I19 定性 | **"launch-bound → 融合换步时"因果链被否定**:fused RMSNorm −960 launches/步、device −33%,步时仅 −0.76%;bmm 容量收缩 bmm 行数 −10×,步时不动 → decode 步时有 ~20–30 ms/步的**未解释固定等待**(既非 device 也非 launch/sync),图 replay 是唯一判决实验,被 TP2 wedge 阻断(I29) |
+| 图 padding-slot 根因 | **成立并修复**(scratch-block);TP1(0.6B/8B)验证:5/5 token 全等、共享前缀全等、slot0 回读干净;**30B TP2 首次 replay 楔死 = 独立故障 I29**,30B 图维持否决、默认 eager |
+| bmm 容量收缩 | **数值 PASS(token 全等)、性能 FAIL(−1.5%/+0.1% vs −10% 门)→ 不采用**;设计与钩子保留;真实负载 waste 47%、rank imbalance 15.8%(profiled placement 下轮第一优先) |
+| 调度三硬缺口(I26/I23/HOL) | **修复 + 单测 6/6 + L3 在线验证**:queue 归零、零 preempt、高负载档 TTFT −51%;**改进门(50% 档 TTFT p50 ≤2 s)未达(3.31 s)→ 部分解决**;剩余瓶颈 = 1k prefill 计算成本本身 |
+| host-sync(I24) | prefill 96 次 tolist 移除:**0.6B −11.6%、30B −3.6%**,采纳默认开;sampler bool 移除仅 −0.2~0.4 ms/步 |
 
 ---
 
