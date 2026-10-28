@@ -29,6 +29,16 @@
 | 调度三硬缺口(I26/I23/HOL) | **修复 + 单测 6/6 + L3 在线验证**:queue 归零、零 preempt、高负载档 TTFT −51%;**改进门(50% 档 TTFT p50 ≤2 s)未达(3.31 s)→ 部分解决**;剩余瓶颈 = 1k prefill 计算成本本身 |
 | host-sync(I24) | prefill 96 次 tolist 移除:**0.6B −11.6%、30B −3.6%**,采纳默认开;sampler bool 移除仅 −0.2~0.4 ms/步 |
 
+**P9 执行轮结果（2026-10-28 10:40–15:00,详见 [`docs/HANDOFF-P10.md`](./HANDOFF-P10.md) 与 `benchmarks/P9-*.md`）**：
+
+| 项 | 判决 |
+|---|---|
+| I29 图 wedge | **定性收口**:TP2 引擎级 MUSAGraph+MCCL **间歇性** replay 楔死;纯张量(含引擎协议复刻)全绿、TP1 全绿;**最小复现 0.6B TP2 paged 首次 replay(3/3)**;replay barrier workaround 否定;30B 图维持否决、默认 eager;复活路径 = 分段图或厂商修复(ISSUES I29) |
+| profiled placement | **动机假设否定**:imbalance 0.1685→0.0009(−99.5%)但 decode 吞吐 +0.01% → rank 失衡不是瓶颈,**不采用为默认**;map 流程保留(`P9-moe.md`) |
+| 长上下文 TTFT | **chunk-2048 达成 P8 未过的改进门**:50% 档 TTFT p50 3.31→**1.036 s(−69%,门 ≤2 s)**;全档 −69~73%;50% 档 SLO 0.8%→100%;记为 1k 场景推荐配置,默认切换留 P10(`P9-long-context.md`) |
+| 服务化 Poisson ×3 | 四档 ×3 **全 100% SLO(std+strict)**,CI [99.0%,100%];最大 ≥99% 达成 QPS 0.713(未 bracketed);**TPOT p95 +13~16% vs v4 门 → 新开 I30**(疑 I23 混步短 prompt 税)(`P9-serving.md`) |
+| P0 harness | `p2_grouped_mm.py` 钉 `attention_backend="sdpa"`(I4 默认切 paged 后 harness 必崩,非引擎回归) |
+
 ---
 
 ## 1. 四条 Track

@@ -42,6 +42,13 @@ def set_host_sync_fix(enabled: bool) -> None:
 # through its own prepare/forward; runtime-switchable for A/B.
 _MIXED_SPLIT = [os.environ.get("NANOVLLM_MIXED_SPLIT", "1") == "1"]
 
+# I29 candidate workaround (P9 P1): TP2 engine-level graph replay wedges
+# intermittently (dual-rank spin inside an in-graph MCCL rendezvous; 0.6B TP2
+# repro: paged wedged at first replay, sdpa after two successful generates).
+# Bracket each replay with a rank barrier to force the two ranks' collective
+# cadence back in step.  Default off -- off is the production path.
+_REPLAY_BARRIER = [os.environ.get("NANOVLLM_GRAPH_REPLAY_BARRIER", "0") == "1"]
+
 
 def set_mixed_split(enabled: bool) -> None:
     _MIXED_SPLIT[0] = bool(enabled)
@@ -612,7 +619,11 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"].fill_(self.scratch_block_id)
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            if _REPLAY_BARRIER[0] and self.world_size > 1:
+                dist.barrier()
             graph.replay()
+            if _REPLAY_BARRIER[0] and self.world_size > 1:
+                dist.barrier()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def _run_mixed(self, seqs: list[Sequence], temperatures, all_greedy):

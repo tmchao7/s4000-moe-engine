@@ -316,3 +316,108 @@
 ### H13.5– P5 最小并发曲线(L4,补救性最小集)
 
 - 服务器(30B,chunk 256)已载,白捡一次:`--mode concurrency --fractions 1,4,16,32,64 --requests 32 --max-tokens 64 --prompt-words 128`;Poisson ×3 CI 未做(记录)。
+
+---
+
+# P9 — 2026-10-28 10:40 起 12h 轮次日志
+
+> 规则:每个实验先写门再跑;一次只跑一个 GPU 任务;失败/负结果照样记录。开始 2026-10-28 10:40 (+0800),收口硬停 22:40,P5 收口启动 ≤21:10。时间盒(12h 等比缩放):P0 45min / P1 3h / P2 2h15 / P3 2h15 / P4 1h45 / P5 1h30。
+> 起点:`[P9] start — HEAD ccd00d9, server 0 MiB/空闲, from 2026-10-28 10:40 +0800 (总时长 12h, 收口硬停 22:40)`。
+
+### H0–H0.4 P0 基线核验
+
+- **起点核验**:本地 HEAD `ccd00d9`、工作区仅 .DS_Store;服务器双卡 0 MiB、锚定 pgrep 无进程、shm 干净、无本轮 lock(仅 P6 遗留 stale lock 文件 `p6_*.lock`,无进程持有,不动)。本地↔远端 12 个关键文件 md5 全一致(无需同步基线)。
+- **三套单测**:
+  - `pytest tests/test_benchmarking_v3.py`:**15 passed**(首次 14+1 skipped——服务器缺 `benchmarks/data/p6d/online-v4-paged.json` 回放数据,从本地补拷后 15/15)。
+  - `tests/p8_scheduler_gaps.py`:**6/6 PASS,rc=0**。
+  - `tests/p6_bmm_dense_tiny.py`:**六配置逐 token 全等,rc=0**(graph 段 opt-in 未跑)。
+  - `tests/p2_grouped_mm.py`:**首跑 rc=1 → harness bug 修复后 rc=0 全过**。根因:自 I4 把默认 attention 切 `triton_paged` 后,该测试未钉 `attention_backend`,tiny(head_dim=16)在 paged 硬断言处崩(`paged_attention.py:106`);P8 交接文档所称"p2_grouped_mm 六配置 rc=0"实际只有 `p6_bmm_dense_tiny` 的证据(`p8_tiny_regression.log` 全是 `[bmm-tiny]` 行)。修复 = 测试 LLM 构造钉 `attention_backend="sdpa"`(与姊妹测试一致,该测试门是 MoE 后端全等,与 attention 无关)。修复后:`loop/grouped_mm/fused and TP1/TP2 all match` + `repeat determinism ok (2x)`,rc=0。
+- **判定**:P0 PASS(带一处 harness 修复,非引擎回归)。
+- **证据**:`/root/p9_p0_regressions.log`、`/root/p9_grouped_mm.log`(远端)。
+- **决策**:进入 P1(I29 图 wedge 探针)。
+
+### H0.5– P1.1 I29 分级探针 — 冻结门(跑前写)
+
+- **假设**:30B TP2 首次 replay 楔死 = MCCL collectives 在 MUSAGraph 内 rendezvous 失败,阈值随图结构复杂度变化;在 tiny/0.6B/8B 上逐级加复杂度可找到阈值,且远便宜于 30B。
+- **唯一变量**:图结构级别(纯张量 AR → 多 AR → bmm+AR → 多桶共享 pool → 引擎级 tiny TP2 → 引擎级 0.6B TP2 paged/sdpa → 8B TP2)。
+- **预期**:若嫌疑成立,某一级出现"双卡 100% 自旋、首次 replay 卡死"的楔死;捕获失败与 replay 楔死分开计数。
+- **冻结门**:每级 watchdog 180 s(纯张量)/ 1500 s(引擎),超时记 wedge;楔死 = 双卡 100% util + 进程存活 + 无新输出;PASS = 全部 replay 完成且数值/stale 检查过。
+- **证据**:`/root/p9_mccl_graph_probe*.json`、`/root/p9_padfix_*.json/.log`(远端)。
+
+#### P1.1 实际结果(11:05–12:05,逐级)
+
+- **rung0 纯张量(TP2,无模型)全绿,零楔死**:1/96 次图内 all-reduce、96 次 × b32 尺寸 [32,2048]、capture 后 100 次 eager AR 再 replay(复刻 30B A/B 顺序)、48×(bmm+AR) 交错、~2400 节点图、**六桶共享 pool + 混合顺序 replay + H2D/D2H 同步(完全复刻引擎 capture/replay 协议)** —— 全部 replay 正常、数值正确。
+  - 附带修复:探针初版 bmm stage shape bug(warmup 干净抛错,watchdog/分类机制正常工作),修正后 PASS。
+- **rung1 引擎级 tiny MoE TP2(sdpa)PASS(按预期口径)**:无楔死;GA/GC PASS、GD=0、graph 5/5 自洽;**GB FAIL = I27 已知的 sdpa 烘焙形状漂移**(tiny head_dim=16 无法 paged),非楔死。
+- **rung2 引擎级 0.6B TP2 paged:楔死复现!** 捕获全部完成(桶 [1,2,4,8],两 rank 正常)→ 首次 graph generate(prefill eager 后的首个 decode replay)→ **双卡 100% util + 两 rank CPU 忙转,4+ min 无进展**;按 PID kill 收场(I12)。第一次尝试还遇到 phase1 结束后 rank0 退出、rank1 spawn 孤儿自旋的前置故障(死因被管道缓冲吞掉,已改 nohup 全量日志;重跑即过 phase1,直接楔死在 replay)。
+  - **这是 I29 的最小复现:0.6B(非 30B)、TP2 + triton_paged 首次 replay 即楔死**。对照:rung1 tiny TP2 sdpa 不楔、rung0 纯张量(含引擎协议复刻)不楔、P8 的 0.6B TP1 paged 5/5 正常。
+- **判定(进行中)**:楔死的必要成分在 {paged attention kernel 进图 × TP2 collectives} 或 {0.6B 规模(28 层)× TP2} 之一;正在跑 0.6B TP2 **sdpa** 对照切分。
+
+#### P1.1 续:0.6B TP2 sdpa 对照 — 判定修正(12:05)
+
+- **修正**:sdpa 对照并非"通过"——graph generate **1/5、2/5 成功后,3/5 楔死**,~10 min 后被 MUSA launch watchdog 杀("the launch timed out and was terminated",MUSAGraph.cpp:313;rank0 收 `MUSA error: unknown error`,rank1 MCCL abort teardown——I12)。
+- **修正后的结论**:I29 = **TP2 引擎级 MUSAGraph replay 的间歇性楔死**(双卡自旋于图内 MCCL rendezvous),不是结构确定性阈值:paged 首次 replay 即中,sdpa 撑过 2 次;纯张量复刻引擎协议(576 ARs、六桶共享 pool、混合 replay)从未楔死;TP1 从未楔死(P8 0.6B/8B 5/5)。paged 使首次即中的概率显著更高。
+- **候选 workaround 实验(进行中)**:replay 前后加 rank barrier(`NANOVLLM_GRAPH_REPLAY_BARRIER=1`,默认关;BISECT-1 在历史重构中已移除,该实验当前开放)。依据:两 rank 的 replay 节奏由 rank0 独有的 sampler D2H 同步错开,barrier 可能强制对齐 rendezvous 节奏。
+
+#### P1.1 续:replay barrier 实验与 P1 判决(12:05–12:45)
+
+- **实验**:replay 前后加 rank barrier(`NANOVLLM_GRAPH_REPLAY_BARRIER=1`,默认关;`model_runner.run_model` graph 路径;tiny 六配置回归先行确认 flag 默认关零影响,rc=0)。
+- **实际**:0.6B TP2 paged + barrier → **仍在首次 graph generate 楔死**(p8_graph_padfix.py:223 collect_tokens;10 min 后 MUSA launch watchdog 杀 "the launch timed out and was terminated";非对称崩溃形态:rank1 死/GPU 释放、rank0 自旋等 barrier)。**barrier workaround 否定**(3/3 复现:无 barrier ×2 + 有 barrier ×1)。
+- **P1 总判决(I29 定性)**:
+  1. **I29 = TP2 引擎级 MUSAGraph replay 与 MCCL 的间歇性 rendezvous 楔死,非结构确定性阈值**;TP1 从未复现;纯张量(含完整复刻引擎 capture/replay 协议、576 次图内 AR、六桶共享 pool)从未复现 → 引擎 replay 路径的某个具体交互(H2D fill 视图 / scratch 填充 / eager compute_logits 紧贴 replay / 采样 D2H 节奏)是必要成分。
+  2. **最小复现从 30B 降到 0.6B TP2(2 min 加载 vs 7+ min)**:paged 首次 replay 即中(3/3);sdpa 撑 2 次 generate 后中(1/1);崩溃-自旋形态逐次不同(双卡 100% 对称自旋 / rank0 死 rank1 旋 / rank1 死 rank0 旋)。
+  3. **replay barrier(BISECT-1 复活)不是解**。
+  4. **决策**:30B 图双轨门维持结构性阻断(0.6B 即楔死,30B A/B 不允许启动);生产默认 `enforce_eager=True` 不变;探针与 harness 全部保留为厂商(E4)举证材料;下轮候选 = 分段图(attention eager + linear/MoE 进图,SGLang 式)或厂商 MUSAGraph+MCCL 修复后重验。
+- **未跑(记录)**:8B TP2 paged(预期同楔,边际信息量低,时间让给 P2);30B A/B(前置门不过,禁止)。
+- **证据**:`/root/p9_mccl_graph_probe*.json`、`/root/p9_padfix_06b_tp2.json`(缺,楔死未产出)、`/root/p9_06b_padfix.log`、`/root/p9_06b_sdpa_outer.log`、`/root/p9_barrier_exp.log`、`/root/p9_barrier2.log`(远端)。
+
+### H2.3– P2.1 profiled placement A/B — 冻结门(跑前写)
+
+- **假设**:真实 chat 负载的 per-layer balanced partition(P8 实测 imbalance 15.8% 的动机)使 rank 负载差下降 → decode/prefill 墙钟可测改善或至少 imbalance 显著下降。
+- **唯一变量**:`expert_placement`(linear vs profiled,跨加载;每臂一次 30B 加载,同一冻结工作负载 = P8 的 32 条中英 chat prompt ×512 token、decode 64)。
+- **方法**:`tests/p9_placement_ab.py`;linear 臂顺带用同负载 counts 生成 per-layer balanced map(`/root/p9_expert_map.json`,带 model config sha256);两臂各 decode b32 ×3 + prefill-512 b32 ×3(CV>5% 自动加密到 ×5);imbalance 用 A/B 负载的 global routing counts + 各臂**实际 ownership**(linear=连续块,profiled=加载的 map)解析计算;tokens 跨臂一致性仅报告。
+- **预期**:decode b32 中位墙钟 −5~15% 或 imbalance 从 ~0.158 降到 ≤0.14。
+- **判定门(冻结)**:decode b32 中位数 profiled ≤0.95×linear(吞吐 +5%)**或** imbalance_arm ≤0.90×imbalance_linear(−10%)→ 采纳转正(改 api_server 默认 placement 需另行决策,先记"采用/不采用");两门都不过 → 关闭写"不采用";臂内 CV>5%(×5 后)→ INVALID。
+
+#### P2.1 实际结果与判决(12:46–13:06,两次 30B 加载)
+
+- **实际**(两臂同一 32 条 chat×512 负载,臂内 CV 全部 ≤1%,测量有效):
+  - decode b32 中位墙钟:linear **303.28 ms**(CV 0.0003)vs profiled **303.30 ms**(CV 0.0085)→ **+0.01%**,吞吐门(−5%)远未达。
+  - prefill-512 b32 中位:2266.4 vs 2257.1 ms(−0.4%,报告项)。
+  - **rank imbalance(同负载 counts + 各臂实际 ownership)**:linear 0.1685(profiled 臂复测 0.1687,跨臂一致 ✓)vs profiled **0.0009 → −99.5%**,imbalance 门(−10%)大幅通过。
+  - tokens:臂内确定;跨臂路由相同、ownership 不同 → token 流按预期可能有 bf16 累加序差异,未设门。
+- **判定(按冻结门字面:imbalance 门过 → "采纳";科学结论优先)**:profiled map 把 rank 负载差几乎完全消除(0.1685→0.0009),**但吞吐纹丝不动** → **"imbalance 是性能瓶颈"的动机假设被否定**:30B b32 decode 的关键路径不在 MoE rank 负载差(与 I19 的"~20–30 ms 固定等待主导"互证)。**决策:不采用为默认**(避免 map 文件的运维依赖换取零收益);`--expert-placement profiled` 保留为已验证工具;若未来某个负载出现 rank--bound 特征(如 imbalance >25% 且 device-bound),此 map 流程可直接复用。
+- **证据**:`/root/p9_placement_linear.json`、`/root/p9_placement_profiled.json`、`/root/p9_expert_map.json`、`/root/p9_place_linear.log`、`/root/p9_place_profiled.log`(远端)。
+
+### H3.2– P3.1 chunk-2048 对照 — 冻结门(跑前写)与实际结果
+
+- **假设**:1k prompt 的 TTFT(queue≈0,全是 prefill 计算)对 chunk 尺寸敏感;chunk 256→2048 减少 chunk 间串行开销 → 50% 档 TTFT p50 显著下降。
+- **唯一变量**:`--prefill-chunk-size`(256 = P8 已有数据 vs 2048 = 本次重启);负载与客户端参数与 P8 L3 完全一致(1k Poisson `--max-qps 0.87 --fractions 0.5,0.75,1.0 --requests 128 --max-tokens 64 --prompt-tokens 1024 --prompt-mode unique`)。
+- **冻结门**:有效性 = prompt p50 ∈[960,1088] + ≥125/128 DONE + rank1 存活;改进门 = 50% 档 TTFT p50 ≤2 s;CV/重复:P8 同款单跑口径(对照已有数据)。
+- **实际(13:21–13:39,384/384 全 DONE、零错误、零 preempt、rank1 存活、GPU 峰值 40 GiB、prompt p50=1086)**:
+
+| 档 | TTFT p50 c256→c2048 | TTFT p95 c2048 | TPOT p50 c256→c2048 | SLO std c256→c2048 |
+|---|---|---|---|---|
+| 50% | 3.31 → **1.036 s (−69%)** | 1.63 s | 0.368→0.366 s | 0.8% → **100%** |
+| 75% | 4.05 → **1.20 s (−70%)** | 2.06 s | 0.624→0.494 s | 0% → 53.9% |
+| 100% | 5.04 → **1.36 s (−73%)** | 2.10 s | 0.876→0.586 s | 0% → 18.0% |
+
+  (c256 的 TTFT p95 未逐档并列,见 P8-long-context.md。)
+- **判定:改进门 PASS(1.036 s ≤ 2 s)。chunk-2048 是本轮最大单点收益**;TPOT 在 75%/100% 档同时改善(−21%/−33%),无可见副作用(1k–1.15k 口径)。
+- **决策**:`--prefill-chunk-size 2048` 记为长上下文场景推荐配置;**默认值改动留给 P10 决策**(需短 prompt 在线矩阵验证 chunk 变大的混步影响;P4 回归门按 v4 口径仍用默认 256)。
+- **证据**:`/root/p9_long_context_c2048.json`、`/root/p9_l3_client_c2048.log`、`/root/p9_l3_server_2048.log`(远端)。
+
+### H3.9– P4.1 Poisson ×3 服务化补全 — 实际结果与判决
+
+- **设置**:默认生产栈(chunk-256,与 v4 同口径);`--fractions 0.5,0.75,0.9,1.0 --requests 128 --prompt-words 128 --repeats 3 --request-timeout-s 120`。
+- **实际**:12/12 点(4 档 ×3)**SLO standard 与 strict 全 100%**,1536/1536 成功、错误桶全 none;合并 Wilson 95% CI [99.0%,100%];run-to-run 极差:TPOT p95 ≤0.018 s、TTFT p95 ≤0.065 s。
+- **容量判决**:slo_standard ≥99% 的最大达成 QPS = **0.713**(= 最高档 1.0;四档全过,真实饱和点未 bracketed)。
+- **回归门(vs v4,0.87 档)**:SLO 100% **PASS**;TTFT p95 1.192–1.197 ≤1.263 **PASS**;**TPOT p95 0.387–0.397 > 0.343 门 FAIL(+13~16%,跨 repeats 稳定非噪声)→ 部分回归**,新开 I30(候选:I23 mixed-split 短 prompt 税,NANOVLLM_MIXED_SPLIT 在线 A/B 转 P10)。
+- **证据**:`/root/p9_serving_v5_ci.json`、`/root/p9_l4_client.log`、`/root/p9_l4_server.log`(远端)。
+
+### H4.8– P5 收口
+
+- 报告:`benchmarks/P9-nightly.md`(总表+sha256)、`P9-graph.md`、`P9-moe.md`、`P9-long-context.md`、`P9-serving.md`;每份含 schema_version/slo_definition(适用时)/prompt_mode(适用时)/warmup_done(适用时)/percentile_method。
+- 台账:ISSUES I29 定性收口、I30 新开(TPOT p95 回归嫌疑)、I27/I28 维持;PLAN 更新 P9 判决表;`HANDOFF-P10.md` 交接,`HANDOFF-P9.md` 标记取代。
+- 服务器:全部任务退出、按 PID 清孤儿、`/dev/shm/nanovllm*` 清零、双卡 0 MiB、锚定 pgrep 无输出。
+- 本地 commit(不 push)。

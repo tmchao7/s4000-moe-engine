@@ -23,6 +23,10 @@ def run(tp: int, backend: str, max_tokens: int, placement: str = "linear"):
         expert_parallel_size=tp,
         moe_backend=backend,
         expert_placement=placement,
+        # tiny head_dim=16 cannot run triton_paged (the default since I4);
+        # this test gates MoE-backend equality, so pin sdpa like its sibling
+        # tests/p6_bmm_dense_tiny.py.
+        attention_backend="sdpa",
         max_model_len=256,
         gpu_memory_utilization=0.5,
     )
