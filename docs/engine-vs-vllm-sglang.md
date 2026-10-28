@@ -14,10 +14,10 @@
 | 前缀缓存 | ✅ **block-hash** + 最长前缀 admission + 饥饿保护 | ✅ hash 前缀缓存 | ✅ **radix tree** | 我们不是 radix tree（已知差距） |
 | 抢占（preemption） | ✅ 重算式 | ✅ 重算/交换 | ✅ | 有 `scheduler_preemptions_total` 指标 |
 | TP / EP | ✅ TP2 + EP2（attention TP、专家 EP、all-reduce） | ✅ | ✅ | `qwen3_moe.py` |
-| MoE 专家后端 | ✅ loop / grouped_mm / fused_grouped_mm / vllm_fused（opt-in） | ✅ 多种 fused kernel | ✅ 多种 fused kernel | 见 `benchmarks/P2-moe-tp2.md`、`docs/P5-moe-optimization-survey.md` |
+| MoE 专家后端 | ✅ loop / grouped_mm / fused_grouped_mm / vllm_fused（opt-in） | ✅ 多种 fused kernel | ✅ 多种 fused kernel | 见 `benchmarks/archive/P2-moe-tp2.md` |
 | 量化加载 | ✅ FP8(e4m3+block scale)→bf16 反量化（无 FP8 运行时） | ✅ 多种 | ✅ 多种 | S4000 无 FP8 算力 |
 | Attention 后端 | ✅ SDPA / Triton paged decode | ✅ FlashAttn/FlashInfer/Triton | ✅ FlashInfer/Triton | `kernels/paged_attention.py`；prefill 仍 SDPA |
-| CUDA/MUSA Graph | ❌ **被 MUSA 阻塞** | ✅ | ✅ | `torch._grouped_mm` 与 Triton kernel 均不可捕获，见 `docs/P6-graph-capture.md` |
+| MUSA Graph | ⚠️ 捕获可行但 TP2 replay 间歇楔死(I29),整图否决 | ✅ | ✅ | TP1 graph==eager bitwise;0.6B TP2 最小复现见 ISSUES I29 |
 | 请求级指标（TTFT/TPOT/ITL/E2E） | ✅ 每请求返回 | ✅ | ✅ | `benchmarking.py` + `Sequence.metrics()` |
 | 引擎/调度/KV 指标 | ✅ + Prometheus histogram | ✅ | ✅ | `prometheus_metrics.py` |
 | 步级 trace | ✅ `--metrics-path` JSONL | ✅ | ✅ | 可拆 schedule/forward |
@@ -50,7 +50,7 @@
 | Radix tree 前缀缓存 | 当前 block-hash 已能命中整块前缀；在单实例、短对话负载下收益不足以抵消复杂度，留作后续。 |
 | 投机解码 / LoRA / 多模态 / 分离式部署 | 与"双卡 MoE 推理引擎"主线无关，面试项目里属于堆功能。 |
 | 多实例/多节点调度 | 硬件只有 2 卡单机；分布式调度无法验证。 |
-| 用 CUDA 生态的 CUDA Graph / cutlass kernel 直接套 | S4000 无对应能力（graph capture 被 MUSA 阻塞、无 FP8 算力），套了也跑不动。 |
+| 用 CUDA 生态的 CUDA Graph / cutlass kernel 直接套 | S4000 无对应能力（MUSA graph TP2 replay 间歇楔死 I29、无 FP8 算力），套了也跑不动。 |
 | 引入 MoonEP / UniEP / DeepGEMM 源码 | 前提是几十卡 all-to-all 或 SM90+FP8，与 2 卡 replicated-hidden + all-reduce 不匹配；只借鉴融合划分。 |
 
 ## 4. 结论

@@ -1,7 +1,7 @@
 # P9 — 12h 轮次总表与证据索引(2026-10-28 10:40 → 15:0x 收官)
 
 > schema_version 3(在线)/ 1(离线 JSON);percentile_method `linear`;slo_definition 双口径(standard/strict)见各分报告;prompt_mode 与 warmup_done 见各分报告。
-> 执行日志(逐实验冻结门→判定):`docs/NIGHTLY-LOG.md` P9 段;交接:`docs/HANDOFF-P10.md`。
+> 执行日志(逐实验冻结门→判定):git 历史 `docs/NIGHTLY-LOG.md` P9 段;交接:`docs/HANDOFF.md`。
 > 时间盒 12h(硬停 22:40),实际 P0–P5 于 ~15:00 完成;服务器收官状态:双卡 0 MiB、无 python/spawn、shm 干净、无本轮 lock。
 
 ## 1. 验收 A–E(P9 计划口径)
@@ -46,6 +46,6 @@
 
 (逐 rank 探针 JSON `p9_mccl_graph_probe.json.*.rank*.json` 的 sha256 见本地目录,内容为上表主文件的分片。)
 
-## 4. 未做清单(见 HANDOFF-P10 §2)
+## 4. 未做清单(见 `docs/HANDOFF.md` §2)
 
 8B TP2 paged 楔死确认(预期同楔,边际信息量低)、分段图实现、I30 mixed-split 在线 A/B、chunk-2048 短 prompt 矩阵验证与默认切换、Poisson >1.0 饱和 bracketed、I28 最小 repro 存档。

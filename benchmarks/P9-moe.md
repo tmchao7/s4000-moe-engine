@@ -1,6 +1,6 @@
 # P9 — profiled expert placement A/B(P2)
 
-> 日期:2026-10-28 12:46–13:06(两次 30B 加载)。门冻结于 `docs/NIGHTLY-LOG.md` P2.1。
+> 日期:2026-10-28 12:46–13:06(两次 30B 加载)。门冻结于 git 历史 `docs/NIGHTLY-LOG.md` P9 段。
 > schema_version 1;prompt_mode = P8 冻结 chat 负载(32 条中英 ×512 token,unique filler);warmup_done yes;percentile_method median(墙钟中位数)。
 > 证据:`benchmarks/data/p9/p9_placement_linear.json`、`p9_placement_profiled.json`、`p9_expert_map.json`(sha256 见 P9-nightly)。
 

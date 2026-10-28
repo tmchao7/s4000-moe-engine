@@ -1,6 +1,6 @@
 # P9 — I29 图 wedge 分级探针与判决(P1)
 
-> 日期:2026-10-28 10:55–12:45。门先冻结于 `docs/NIGHTLY-LOG.md` P1.1。
+> 日期:2026-10-28 10:55–12:45。门先冻结于 git 历史 `docs/NIGHTLY-LOG.md` P9 段。
 > schema_version 1(探针 JSON);percentile_method n/a(确定性 pass/fail 计数)。
 > 证据:`benchmarks/data/p9/p9_mccl_graph_probe*.json`、`p9_mccl_probe3.json`、`p9_padfix_tiny_tp2.json`、`p9_06b_padfix.log`、`p9_06b_sdpa_outer.log`、`p9_barrier_exp.log`、`p9_barrier2.log`(sha256 见 P9-nightly)。
 

@@ -8,7 +8,7 @@
 - **算力限制**：S4000 无 FP8 算力，bf16 为主要计算精度；Triton 存在官方 mtgpu backend（已实测可用）。
 - **软件栈**：torch 2.11 + torch_musa 2.11、MCCL 2.11.4（NCCL 等价物，已实测双卡 allreduce）、Triton-mtgpu 3.2、transformers 5.13、Python 3.10。
 - **存储限制**：数据盘仅 50GB → 采用官方 FP8 checkpoint（~31.2GB），加载时反量化为 bf16（显存充裕：96GB 总量）。
-- **对照组**：实例预装 vllm-musa 0.29.1（含编译好的 MoE C 扩展），作为性能/正确性参照与动机素材（详见 `benchmarks/P0-vllm-musa-baseline.md`）。
+- **对照组**：实例预装 vllm-musa 0.29.1（含编译好的 MoE C 扩展），作为性能/正确性参照与动机素材（详见 `benchmarks/archive/P0-vllm-musa-baseline.md`）。
 
 ## 2. 模块设计（与代码一致）
 
@@ -69,7 +69,7 @@ nanovllm/
      → 输出流
 ```
 
-TP2 通信量：每层 2 次 allreduce（attention 后 + MoE 后）。PCIe Gen5 x16 下隐藏通信不是瓶颈；实测吞吐随 batch 线性扩展（见 `benchmarks/P2-moe-tp2.md`）。
+TP2 通信量：每层 2 次 allreduce（attention 后 + MoE 后）。PCIe Gen5 x16 下隐藏通信不是瓶颈；实测吞吐随 batch 线性扩展（见 `benchmarks/archive/P2-moe-tp2.md`）。
 
 ## 5. 正确性策略
 
@@ -95,14 +95,14 @@ TP2 通信量：每层 2 次 allreduce（attention 后 + MoE 后）。PCIe Gen5 
 
 ## 7. 已知局限
 
-- SDPA + gather 保留为兼容后端；P5 新增直接读取 paged KV 的 MUSA Triton decode 后端，是否设为默认只由真实 30B A/B 决定。
-- 未启用 CUDAGraph（`enforce_eager`），每步有 Python 侧调度与张量构造开销。**P6 已实测阻塞**：MUSA 上 `torch._grouped_mm` 与 Triton kernel 都不可被 graph 捕获（MCCL all-reduce 可捕获），详见 `docs/P6-graph-capture.md`。
+- SDPA + gather 保留为兼容后端；直接读取 paged KV 的 MUSA Triton decode 后端已按五层门转正为默认（I4，见 `numerics-policy.md`）。
+- 未启用 graph（`enforce_eager` 默认），每步有 Python 侧调度与张量构造开销。**捕获本身可行**（30B 六桶全捕、96 次图内 all-reduce 可 replay、TP1 graph==eager bitwise），但 **TP2 引擎级 replay 间歇性楔死**（I29，0.6B TP2 最小复现）→ 整图否决；复活路径 = 分段图或厂商修复（见 ISSUES I29）。
 - grouped-MM 的 `argsort`/`bincount`/两次 `_grouped_mm` 调用在小 batch 下固定开销占比高（b1 加速比低于 b16/b32）。
 - 在线服务为单实例、单模型、无 tokenizer 批处理；不做多副本与负载均衡。
 
 ## 8. P5/P6 优化路线与边界（证据驱动，先冻结阈值再测量）
 
-### 8.1 观测结论（真实 30B，`benchmarks/P5-profiling.md`）
+### 8.1 观测结论（真实 30B，`benchmarks/archive/P5-profiling.md`）
 
 decode 阶段、48 层累计：长上下文 batch 32 时 attention 的 gather+mask 与 SDPA 合计占 forward **58.56%**；MoE 计算最高 **53.48%**（其中 route+combine 最高 44.93%，该数字可能被短段 event 开销放大）；EP all-reduce 最高 **5.45%**；两 rank 路由不平衡最高 **5.19%**。按预先冻结的门槛（30% / 35% 或 10% / 20% / 10%）自动得到：
 
@@ -124,7 +124,7 @@ decode 阶段、48 层累计：长上下文 batch 32 时 attention 的 gather+ma
 - 本项目的 MoE 是 **EP2 + hidden replicated + 一次 all-reduce**：每 rank 只持有 64 个本地专家，非本地专家贡献为 0。
 - 允许的实验后端：`loop`（数值参考）、`grouped_mm`（默认）、`fused_grouped_mm`（手写 SiLU+combine 融合）、`vllm_fused`（直接复用安装版 vllm-musa 的 Triton `fused_experts`，opt-in）。
 - **不声称**移植 MegaMoE：S4000 无 FP8 算力/SM90 TMA；只借"dispatch→GEMM→act→combine"的融合划分。MoonEP（动态冗余专家）与 UniEP（集群级 EP）依赖多卡 all-to-all，与本项目拓扑不匹配，且实测通信/不平衡都远低于门槛（见 8.1）。
-- 实测（`docs/P5-moe-optimization-survey.md`）：上游 Triton fused MoE 与 grouped_mm **token 24/24 一致**（bf16 tiny），但默认配置下比 grouped_mm 慢（1024 token 时 262 ms/层）；vllm-musa 的厂商 fast path（mp22）在 1024 token 触发 illegal memory access，故集成时强制走 generic Triton 路径并保持 opt-in。
+- 实测（git 历史 `docs/P5-moe-optimization-survey.md`）：上游 Triton fused MoE 与 grouped_mm **token 24/24 一致**（bf16 tiny），但默认配置下比 grouped_mm 慢（1024 token 时 262 ms/层）；vllm-musa 的厂商 fast path（mp22）在 1024 token 触发 illegal memory access，故集成时强制走 generic Triton 路径并保持 opt-in。
 
 ### 8.4 Graph capture 边界（P6）
 

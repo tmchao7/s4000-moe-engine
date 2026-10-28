@@ -2,7 +2,7 @@
 
 > 建立于 2026-10-27，起因：I4（triton_paged vs sdpa）长期被"≥99% token 一致"卡住，而该阈值**严于业界实践**。
 > 本文档定义：不同 attention 后端之间**什么算等价**、**怎么验收**、**基线怎么维护**、**出问题怎么回退**。
-> 相关：`docs/ISSUES.md` I4、`docs/P6-I4-attention-logits.md`（诊断）、`scripts/p6_decide_attention_equivalence.py`（门实现）。
+> 相关：`docs/ISSUES.md` I4、git 历史 `docs/P6-I4-attention-logits.md`（诊断）、`scripts/p6_decide_attention_equivalence.py`（门实现）。
 
 ---
 

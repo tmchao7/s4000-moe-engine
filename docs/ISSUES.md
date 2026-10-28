@@ -1,7 +1,7 @@
 # ISSUES — 全项目问题台账（唯一清单）
 
-> 更新：2026-10-27（文档融合定稿）。**本文档是问题清单的唯一权威**，取代 `docs/P6-open-issues.md`（已收敛为指针）。
-> 计划与排期见 [`docs/PLAN.md`](./PLAN.md)；状态快照与证据索引见 [`docs/HANDOFF-P6c.md`](./HANDOFF-P6c.md) §0 与 [`benchmarks/P6-nightly.md`](../benchmarks/P6-nightly.md)。
+> **本文档是问题清单的唯一权威**（滚动更新,无日期后缀;历史版本与被取代的 `P6-open-issues.md` 见 git 历史）。
+> 计划与冻结门见 [`docs/PLAN.md`](./PLAN.md);当前状态见 [`docs/HANDOFF.md`](./HANDOFF.md);历史报告在 `benchmarks/archive/`。
 > 规则：**文档与代码/实测冲突时以代码和实测为准**；每个实验先写门再跑；失败/负结果照样登记。
 
 ## 0. 状态速览
@@ -39,7 +39,7 @@
 - **已排除**：rank 间 replay 错位（8B 上 barrier 有效）；跨桶 pool 复用（8B 上私有池有效）——两者在 30B 都不够。
 - **候选路径（当前一律不做）**：① 分段捕获（attention/linear 进图、MoE eager，SGLang 式）；② 图内去 MCCL；③ 厂商 MUSAGraph 规模/依赖链限制清单；④ 8B+MoE 中间档隔离变量。
   **前置条件**：仅在拿到厂商 runtime 限制/诊断证据或单一可验证代码根因后才允许重开；在此之前不做猜测性 patch、不做 30B A/B、不烧加载。
-- **参考**：`docs/P6-musa-graph-survey.md`（上游如何用"按桶捕获+padding"处理 MoE 图；摩尔 vLLM 分叉在 S4000 上默认对 MoE 开 MUSA Graph——这条线索值得向厂商举证）。
+- **参考**：git 历史 `docs/P6-musa-graph-survey.md`（上游如何用"按桶捕获+padding"处理 MoE 图；摩尔 vLLM 分叉在 S4000 上默认对 MoE 开 MUSA Graph——这条线索值得向厂商举证）。
 - **影响**：decode 图 1.1–1.2× 拿不到（eager 已由 bmm_dense 拿到大头，图增量本就变小）。
 
 ### I2 🟡 图 replay 首轮即漂移（已定界，与 I1 同源）
@@ -79,7 +79,7 @@
 
 ### I12 🟢 崩溃进程 teardown 卡死
 - **现状**：rank 间 DistBackendError 后主进程挂在退出路径（bmmdense 回归、30B graph A/B 均遇到），需人工按 PID kill。
-- **下一步**：engine `exit()` 加 barrier 超时 + `os._exit` 兜底；短期靠 SOP（HANDOFF-P6c §4）。
+- **下一步**：engine `exit()` 加 barrier 超时 + `os._exit` 兜底；短期靠 SOP（AGENTS.md 红线节）。
 - **10-27 第三类现场已澄清（不是挂死）**：`api_server --attention-backend triton_paged` 启动时两 rank 各占 29.5 GiB、零日志、0% util、`/health` 无响应，曾被记为"启动挂死"。加 `NANOVLLM_TRACE_INIT=1` + `faulthandler` 后实测：`load_model` 的 FP8 逐 expert 反量化占 **351.4 s（rank0）/354.0 s（rank1）**，warmup 16 s，KV 分配 0.08 s，**到 `/health` 共 377 s**；faulthandler 栈全部落在 `loader.py:103/108`。冷页缓存时该段 11–12 min（本轮参考基线生成实测）。**与 paged 无关**：warmup 只跑 prefill（恒 SDPA），paged 模块首次 decode 才 import，`allocate_kv_cache` 无 backend 分支。**运维修正**：启动窗口按 ≥20 min（冷）设置；判活用 `NANOVLLM_TRACE_INIT=1`，不要用"显存已占"推断"权重已加载完"。
 - **10-27 另一个 SOP 漏洞**：rank1 的 spawn 子进程 argv 是 `/usr/bin/python3 -c ...`，`pgrep -fa "^python3"` **匹配不到**；`pgrep -f "nanovllm...api_server"` 又会匹配到发起命令的 bash 自身（曾把执行 kill 的 ssh shell 一起杀掉）。正确写法：`pgrep -fa "^/usr/bin/python3|^python3|^[s]pawn_main"`，kill 前先列 PID。
 ### I14 🟢 BISECT-1/2 补丁去留未决
@@ -100,11 +100,11 @@
 
 ### P8 规划新增(2026-10-28 执行轮更新;结论标注在每条)
 
-> 来源:`docs/P8-architecture-review.md`、`docs/P8-moe-fusion-and-balance.md`、`docs/P8-benchmark-spec.md`。执行排期见 `docs/P8-24h-plan.md`;本轮证据见 `benchmarks/P8-*.md` 与 `docs/NIGHTLY-LOG.md`(P8 段)。
+> 来源文档(P8-architecture-review 等)见 git 历史;P8/P9 证据见 `benchmarks/archive/` 与 `benchmarks/P9-*.md`。
 
 - **I20 KV 量化(🟢 周级)**:现状零(KV bf16,12 MiB/block,730 blocks ≈ 8.55 GiB/rank);目标容量约 ×2、decode KV 带宽减半;门 = L1–L4 数值门 + 容量/带宽测量;触发 = I19 与长上下文收口后。
 - **I21 per-rank KV 容量不一致(✅ 本轮修复)**:`allocate_kv_cache` 后 `dist.all_reduce(MIN)` 统一两 rank 的 `num_kvcache_blocks`;tiny TP2 六配置回归全等 rc=0,两 rank `[kvcache] blocks=` 一致(343080/343080、341994/341994;本轮加载内启发式恰好相同,真 divergence 钳制待 30B 长上下文确认)。
-- **I22 graph replay padding 写 KV slot 0(✅ 根因确认 + 修复 + TP1 验证;TP2 另有独立故障)**:scratch-slot 修复(`allocate_kv_cache` 多留 1 块 + replay 前 `slot_mapping/block_tables` 填 scratch);tiny/0.6B/8B 验证:GB 5/5 token 全等(paged)、GC 共享前缀全等、GD 捕获零失败;**30B TP2 首次 replay 楔死是独立故障**(见 I29),30B 图维持否决、默认 eager。详见 `benchmarks/P8-graph.md`。
+- **I22 graph replay padding 写 KV slot 0(✅ 根因确认 + 修复 + TP1 验证;TP2 另有独立故障)**:scratch-slot 修复(`allocate_kv_cache` 多留 1 块 + replay 前 `slot_mapping/block_tables` 填 scratch);tiny/0.6B/8B 验证:GB 5/5 token 全等(paged)、GC 共享前缀全等、GD 捕获零失败;**30B TP2 首次 replay 楔死是独立故障**(见 I29),30B 图维持否决、默认 eager。详见 `benchmarks/archive/P8-graph.md`。
 - **I23 mixed step 走 prefill MoE 后端(✅ 本轮修复,效果待 L3 在线复测)**:`model_runner.run` 对 mixed 拆 prefill/decode 子批,decode 行走 `prepare_decode`+paged+bmm_dense(`NANOVLLM_MIXED_SPLIT`,默认开);调度器 mixed-batch 契约有单测(`tests/p8_scheduler_gaps.py`)。
 - **I24 host sync 浪费(🟡→✅ 部分,本轮实测)**:prefill 96 次 `.tolist()` 上提到 prepare(实测 0.6B 512-token prefill 步时 **−11.6%** / 62.8→55.5 ms;30B 复核在 L2)+ sampler 2 次 `bool()` 改 host 侧 `all_greedy`(0.6B b32-mixed sample 段 −13.5%,30B L2 复核)。**重大副发现:launch −960/步 + device −10.7 ms 但步时仅 −0.8%(fused RMSNorm A/B)→ decode 步时对 launch 数与 host sync 均不敏感,I19 的"launch-bound→融合换步时"因果链被实测否定**;每步仍有 ~20–30 ms 未解释的固定等待,图 replay(P2)本应是判决实验,被 TP2 wedge 阻断(见 I29)。
 - **I25 benchmark v3(✅ 本轮落地)**:`benchmarking.py` 增 wilson_ci/token_goodput/classify_error/conforming/linear percentile;客户端 schema v3(双 SLO、error 分桶、timeout→服务端 cancel、--repeats+CI、--mode concurrency、mixed 3:4:3、GPU 采样、p99_reference_only);服务端 final-chunk 带 metrics;单测 15 绿 + v2/v4 JSON 回放不抛异常。
@@ -116,13 +116,13 @@
 
 
 
-> 详细论证见 [`docs/P7-speculative-decoding-survey.md`](./P7-speculative-decoding-survey.md)（必要性、选型、判决表）与 [`docs/P7-implementation-plan.md`](./P7-implementation-plan.md)（代码方案、算法、测试门）。排期见 PLAN §1 Track B。
+> 详细论证见 git 历史 `docs/P7-speculative-decoding-survey.md`(必要性、选型、判决表)与 `docs/P7-implementation-plan.md`(代码方案、算法、测试门);判决报告见 `benchmarks/archive/P7-*.md`。
 
 ### S1 ✅ 已判决 NO-GO（10-27 Phase 0 实测）：朴素 draft 路线不成立
-- **实测**（`benchmarks/P7-phase0.md`）：α(0.6B→30B) = **0.0056**、α(1.7B→30B) = **0.0068**（32 条 prompt，LCP 均值 0.72/0.88，最大 4/7，零条完全一致）；c = **0.384/0.386**。最优 k=1 的加速 **0.725×/0.741×** —— **比基线慢 26–28%**，与冻结门 1.3× 相差 44%。
+- **实测**（`benchmarks/archive/P7-phase0.md`）：α(0.6B→30B) = **0.0056**、α(1.7B→30B) = **0.0068**（32 条 prompt，LCP 均值 0.72/0.88，最大 4/7，零条完全一致）；c = **0.384/0.386**。最优 k=1 的加速 **0.725×/0.741×** —— **比基线慢 26–28%**，与冻结门 1.3× 相差 44%。
 - **两个独立否决原因**：① draft 太慢（c≈0.39，源于每步固定成本，见 I19）；② 接受率≈0（0.6B/1.7B 是 Qwen3 初代思考型后训练，target 是 2507 非思考；跨代组合导致首 token 分布即分叉）。
 - **已排除的伪因**：tokenizer 三模型逐 token 一致（14/14/14）；引擎收 raw encode 无模板差异；草稿输出连贯非退化（48 token 34 个不同，与 target 前 2 token 相同）。
-- **决策**：`P7-implementation-plan.md` 的 M1–M4 **不启动**；S6（EAGLE3/PARD 训练头）成为唯一可能路线，且**前置条件是先解决 I19**（否则 α=0.8 也只有 ~1.1×）。
+- **决策**：git 历史 `P7-implementation-plan.md` 的 M1–M4 **不启动**；S6（EAGLE3/PARD 训练头）成为唯一可能路线，且**前置条件是先解决 I19**（否则 α=0.8 也只有 ~1.1×）。
 - **证据**：`/root/p7_target_ref.json`、`/root/p7_draft_steps.jsonl`、`/root/p7_alpha_06_tp2.json`、`_17_tp2.json`、`/root/p7_step_overhead_06.json`
 
 ### S2 🟡 M1：双模型加载 + 多位置 logits（Phase 0 通过后开工）
@@ -162,7 +162,7 @@
 
 ### E2 🟢 手搓 vLLM fused_moe 的 S4000 配置（原 I16 重新归类）
 - **纠正**：此前记为"⚪ 厂商侧不可修"——**不准确**。缺的是 `configs/E=64,N=768,device_name=MTT_S4000.json` 这个**文件**，而生成它是我们的工作。
-- **两条搓法**：A（零代码）`VLLM_TUNED_CONFIG_FOLDER` 指向自生成 JSON，扫 `BLOCK_M/N/K × GROUP_M × warps × stages` 按 M 桶取最优（`docs/P5-moe-optimization-survey.md:64` 已规划，30–45 min 一发）；B（进程内）走 `nanovllm/kernels/vendor_moe.py:29-45` 的 source-rebind 注入 config dict。
+- **两条搓法**：A（零代码）`VLLM_TUNED_CONFIG_FOLDER` 指向自生成 JSON，扫 `BLOCK_M/N/K × GROUP_M × warps × stages` 按 M 桶取最优（git 历史 `docs/P5-moe-optimization-survey.md:64` 已规划）；B（进程内）走 `nanovllm/kernels/vendor_moe.py:29-45` 的 source-rebind 注入 config dict。
 - **低优先理由**：decode 侧 bmm_dense（1.27–2.86 ms/层）已快于厂商 kernel 调好后的水平；只有 autotune 后的厂商 kernel 在 **prefill 大批（2k–4k）** 明显快于 grouped_mm 时才值得（用 `p6_moe_microbench.py --batches 512,2048` 判）。
 - **附带小项**：`nanovllm/kernels/moe_fusion.py:61-64,80-85` 两个手写 fusion 的 block/warps 也有微调面，价值更低。
 
@@ -172,7 +172,7 @@
 
 ### E4 ⚪ MUSAGraph 的规模/依赖链限制（I1 的厂商侧）
 - **现状**：控制组 0/5、无单一代码根因；driver 层不可修。
-- **要问厂商**：MUSAGraph replay 在"48 层 × 96 次图内 all-reduce + 图内 bmm"规模下的已知限制；是否有 graph-level debug/dump；以及**为什么摩尔自家 vLLM 分叉在 S4000 上默认对 MoE 开 MUSA Graph**（`docs/P6-musa-graph-survey.md`，可作举证材料）。
+- **要问厂商**：MUSAGraph replay 在"48 层 × 96 次图内 all-reduce + 图内 bmm"规模下的已知限制；是否有 graph-level debug/dump；以及**为什么摩尔自家 vLLM 分叉在 S4000 上默认对 MoE 开 MUSA Graph**（git 历史 `docs/P6-musa-graph-survey.md`；核心事实已并入 I29）。
 - **我们侧**：`enforce_eager=True` 保持；不猜、不试。
 
 ### E5 ⚪ 厂商 mp22 fast path 数值错误（原 I17）

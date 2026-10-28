@@ -33,29 +33,24 @@
 │   ├── models/          # qwen3.py（上游）→ + qwen3_moe.py（本项目）
 │   ├── layers/          # attention / linear / layernorm / rope / sampler
 │   └── ...
-├── docs/                # 架构设计与 Roadmap
-├── benchmarks/          # 基线与优化收益记录
-└── scripts/             # 服务器侧下载 / 基准脚本
+├── docs/                # 交接 / 计划 / 问题台账 / 架构（活文档仅 7 个,见 AGENTS.md）
+├── benchmarks/          # 当前轮报告;历史轮次在 benchmarks/archive/
+└── scripts/             # 压测 / 基准 / 决策脚本;一次性实验脚本在 scripts/archive/
 ```
 
-详细设计见 [docs/architecture.md](docs/architecture.md)，阶段计划与验收标准见 [docs/roadmap.md](docs/roadmap.md)。
+Agent/新人入口见 [AGENTS.md](AGENTS.md)(常用命令、红线、SOP);详细设计见 [docs/architecture.md](docs/architecture.md);当前迭代计划见 [docs/PLAN.md](docs/PLAN.md)。
 
-## 当前进度
+## 当前进度(截至 P9 轮,判决详见 [docs/HANDOFF.md](docs/HANDOFF.md))
 
 | 阶段 | 状态 | 关键数字 |
 |---|---|---|
-| P0 基线 | 完成 | vllm-musa 0.29.1 + Qwen3-8B TP2：8.4 tok/s（c=32，不随并发扩展） |
-| P1 MUSA 移植 | 完成 | Qwen3-8B 单卡：113.5 tok/s（batch 64），首 token 与 HF 100% 对齐 |
-| P2 MoE 双卡 | **完成** | 30B-A3B TP2+EP2：**74.0 tok/s @batch 32、120.4 tok/s @batch 64**；单流 3.38 tok/s |
-| P2 优化 | **完成** | packed experts + `torch._grouped_mm` 比 loop 后端快 **3.0–3.2×**（b16–64），TPOT p95 降至 0.31× |
-| P3 调度 | 完成 | FCFS vs stall-free（decode-first mixed prefill）在线对比，见 [benchmarks/P3-scheduler.md](benchmarks/P3-scheduler.md) |
-| P4 服务化 | 完成 | OpenAI 兼容 API（SSE 流式 / 取消 / `/metrics`）+ 开放环压测，见 [benchmarks/P4-serving.md](benchmarks/P4-serving.md) |
-| P5 指标与内核 | **进行中** | schema v2 + Prometheus + 真实 30B profiling；attention 占 forward 最高 58.6%（paged attention 第一优先）；上游 MoE 复用评估为**负结果**；graph capture 被 MUSA 阻塞 |
-| P5 方法论 | 完成 | 指标口径与工业界逐项对照（[metrics-audit](docs/P5-metrics-audit.md)）、能力矩阵（[engine-vs-vllm-sglang](docs/engine-vs-vllm-sglang.md)）、MoE 调研与实测（[moe-survey](docs/P5-moe-optimization-survey.md)）、[graph 结论](docs/P6-graph-capture.md) |
+| P0–P1 基线与 MUSA 移植 | 完成 | vllm-musa 8.4 tok/s → 自研引擎单卡 113.5 tok/s(b64);首 token 与 HF 100% 对齐 |
+| P2–P2e MoE 双卡 + 优化 | 完成 | 30B TP2+EP2 packed experts + grouped_mm 比 loop 快 3.0–3.2×;离线 b32 133 tok/s、b64 141 tok/s |
+| P3–P4 调度与服务化 | 完成 | stall-free 混步调度;OpenAI 兼容 SSE API;短 prompt 四档 Poisson ×3 全 100% SLO(std+strict) |
+| P5–P6 指标/后端/长上下文 | 完成 | 指标 v3(双 SLO/Wilson CI);**triton_paged 按五层门转正**(TPOT p95 −12~18%);I8 长上下文重测 + 调度三缺口修复 |
+| P7–P9 优化探索 | 完成 | 投机解码 NO-GO(α≈0);I19 因果链否定(~20–30 ms/步未解释固定等待);整图否决(I29,TP2 replay 楔死);chunk-2048 把 1k TTFT 砍 −69~73%(50% 档 1.036 s、SLO 100%) |
 
-正确性上，tiny 模型 TP1/TP2 × loop/grouped/fused 四路逐 token 一致；30B 四组中英文 prompt 输出连贯，loop 与 grouped **4/4 条 prompt 逐 token 相同**（为此修掉了 grouped-MM 原子累加导致的贪心不可复现，详见 `benchmarks/P2-moe-tp2.md`）。P5 进一步测到 **MUSA SDPA 在 b32/c512 自身不可复现**，因此跨后端比较采用"候选确定性 + ≥99% token 一致"的冻结门（见 `scripts/p5_decide.py`）。
-
-详细数字与结论见 [benchmarks/](benchmarks/)：`P2-moe-tp2.md`（吞吐/显存/后端消融）、`P3-scheduler.md`（调度）、`P4-serving.md`（在线机制验证）、`P5-profiling.md`（指标校准与真实 30B profiling）。
+正确性门:tiny TP1/TP2 × loop/grouped/bmm 六配置逐 token 全等;跨后端比较采用"候选确定性 + 五层等价门"(数值契约见 [docs/numerics-policy.md](docs/numerics-policy.md))。历史轮次报告(P0–P8)在 [benchmarks/archive/](benchmarks/archive/),当前轮在 [benchmarks/](benchmarks/)。
 
 ## 快速开始
 
@@ -64,23 +59,18 @@ pip install -e .
 python example.py
 ```
 
-MUSA 环境各阶段运行方式见 docs/roadmap.md。
+MUSA 环境各阶段运行方式见 [AGENTS.md](AGENTS.md) 常用命令节。
 
-双卡正确性回归（按顺序，任何一步失败都不要往下跑性能）：
+双卡正确性回归(按顺序,任何一步失败都不要往下跑性能;均在服务器跑,tiny 模型在 `/tmp/tiny_moe`):
 
 ```bash
-PYTHONPATH=. python3 tests/p2_ground_truth.py     # 手写参考 vs tiny TP1
-PYTHONPATH=. python3 tests/p2_tp_check.py         # TP1 == TP2
-PYTHONPATH=. python3 tests/p2_grouped_mm.py       # TP1/TP2 × loop/grouped + round_robin + 重复确定性
-PYTHONPATH=. python3 tests/p2_determinism.py      # 反复重建引擎，解码确定性
-PYTHONPATH=. python3 tests/p3_scheduler.py        # FCFS vs stall-free（mixed step）
-PYTHONPATH=. python3 tests/p3_metrics.py          # ScheduledBatch / KV 计数器
-PYTHONPATH=. python3 tests/p4_api.py              # API 契约（含 BatchEncoding 模板）
-PYTHONPATH=. python3 tests/p4_async_engine.py     # 真实异步引擎并发/取消
-PYTHONPATH=. python3 tests/p4_benchmark_client.py # 在线压测客户端（桩 SSE，纯 CPU）
+PYTHONPATH=. python3 tests/p2_grouped_mm.py       # TP1/TP2 × loop/grouped/fused + round_robin + 重复确定性(六配置全等 rc=0)
+PYTHONPATH=. python3 tests/p6_bmm_dense_tiny.py   # bmm_dense decode 后端六配置全等
+python3 -m pytest tests/test_benchmarking_v3.py   # 压测客户端单测 15/15
+PYTHONPATH=. python3 tests/p8_scheduler_gaps.py   # 调度缺口单测 6/6
 ```
 
-消融 benchmark（模型只加载一次，进程内切换 loop/grouped-MM；先跑正确性门再测性能）：
+消融 benchmark(模型只加载一次,进程内切换后端;先跑正确性门再测性能):
 
 ```bash
 PYTHONPATH=. python3 scripts/p2_benchmark.py \
@@ -88,8 +78,6 @@ PYTHONPATH=. python3 scripts/p2_benchmark.py \
   --moe-backends loop,grouped_mm --scheduler-policy fcfs \
   --verify-prompts --reference-outputs benchmarks/p2-reference-8tok.json \
   --output benchmarks/data/p2_ablation_full.json
-python3 scripts/render_benchmark.py benchmarks/data/p2_ablation_full.json \
-  --output-dir benchmarks/data --accept-batches 16,32
 ```
 
 OpenAI 兼容服务与开放环压测：

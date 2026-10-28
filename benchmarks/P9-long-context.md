@@ -1,6 +1,6 @@
 # P9 — 长上下文 TTFT:chunk 256 vs 2048 对照(P3)
 
-> 日期:2026-10-28 13:21–13:39。门冻结于 `docs/NIGHTLY-LOG.md` P3.1;对照 = P8 L3 c256(`benchmarks/data/p8/p8_long_context_c2048.json` 同名 c256 文件)。
+> 日期:2026-10-28 13:21–13:39。门冻结于 git 历史 `docs/NIGHTLY-LOG.md` P9 段;对照 = P8 L3 c256(`benchmarks/data/p8/p8_long_context_c2048.json` 同名 c256 文件)。
 > schema_version 3;slo_definition 双口径(standard: TTFT≤2s 且 TPOT≤0.5s;strict: 同上 + ITL≤1s);prompt_mode unique;warmup_done yes(4 warmup requests);percentile_method linear。
 > 证据:`benchmarks/data/p9/p9_long_context_c2048.json`(sha256 见 P9-nightly)。
 
