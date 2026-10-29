@@ -40,7 +40,7 @@
 
 Agent/新人入口见 [AGENTS.md](AGENTS.md)(常用命令、红线、SOP);详细设计见 [docs/architecture.md](docs/architecture.md);当前迭代计划见 [docs/PLAN.md](docs/PLAN.md)。
 
-## 当前进度(截至 P9 轮,判决详见 [docs/HANDOFF.md](docs/HANDOFF.md))
+## 当前进度(截至 P12 轮,判决详见 [docs/HANDOFF.md](docs/HANDOFF.md))
 
 | 阶段 | 状态 | 关键数字 |
 |---|---|---|
@@ -49,6 +49,7 @@ Agent/新人入口见 [AGENTS.md](AGENTS.md)(常用命令、红线、SOP);详细
 | P3–P4 调度与服务化 | 完成 | stall-free 混步调度;OpenAI 兼容 SSE API;短 prompt 四档 Poisson ×3 全 100% SLO(std+strict) |
 | P5–P6 指标/后端/长上下文 | 完成 | 指标 v3(双 SLO/Wilson CI);**triton_paged 按五层门转正**(TPOT p95 −12~18%);I8 长上下文重测 + 调度三缺口修复 |
 | P7–P9 优化探索 | 完成 | 投机解码 NO-GO(α≈0);I19 因果链否定(~20–30 ms/步未解释固定等待);整图否决(I29,TP2 replay 楔死);chunk-2048 把 1k TTFT 砍 −69~73%(50% 档 1.036 s、SLO 100%) |
+| P10–P12 分段图与在线判定 | 完成 | 分段图(图内零 MCCL)离线 30B b1 **−23.7%**、768 图/rank 零失败、跨臂逐位 0 翻转;**在线 A/B 判定 FAIL**(并发 14–30 撞桶 padding 税,慢 5.9–14.7%,同 session 复跑确认)→ 不转正、默认维持 eager;生产栈短 prompt 四档 100% SLO |
 
 正确性门:tiny TP1/TP2 × loop/grouped/bmm 六配置逐 token 全等;跨后端比较采用"候选确定性 + 五层等价门"(数值契约见 [docs/numerics-policy.md](docs/numerics-policy.md))。历史轮次报告(P0–P8)在 [benchmarks/archive/](benchmarks/archive/),当前轮在 [benchmarks/](benchmarks/)。
 
@@ -84,9 +85,12 @@ OpenAI 兼容服务与开放环压测：
 
 ```bash
 pip install -e '.[serve]'
+# 生产栈必须显式带 --decode-moe-backend bmm_dense:该参数默认跟随 --moe-backend(grouped_mm),
+# 漏掉则 decode 跑在 grouped_mm 上,不是本项目的生产配置(见 docs/ISSUES.md I32)。
 PYTHONPATH=. python3 -m nanovllm.entrypoints.openai.api_server \
   --model /root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8 \
-  --served-model-name qwen3-30b-a3b --scheduler-policy stall_free
+  --served-model-name qwen3-30b-a3b --scheduler-policy stall_free \
+  --decode-moe-backend bmm_dense
 
 PYTHONPATH=. python3 scripts/benchmark_online.py --model qwen3-30b-a3b \
   --max-qps 0.93 --requests 32 --max-tokens 64 --fractions 0.25,0.5,0.75,1.0 \

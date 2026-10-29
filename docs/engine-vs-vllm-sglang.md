@@ -17,7 +17,7 @@
 | MoE 专家后端 | ✅ loop / grouped_mm / fused_grouped_mm / vllm_fused（opt-in） | ✅ 多种 fused kernel | ✅ 多种 fused kernel | 见 `benchmarks/archive/P2-moe-tp2.md` |
 | 量化加载 | ✅ FP8(e4m3+block scale)→bf16 反量化（无 FP8 运行时） | ✅ 多种 | ✅ 多种 | S4000 无 FP8 算力 |
 | Attention 后端 | ✅ SDPA / Triton paged decode | ✅ FlashAttn/FlashInfer/Triton | ✅ FlashInfer/Triton | `kernels/paged_attention.py`；prefill 仍 SDPA |
-| MUSA Graph | ⚠️ 捕获可行但 TP2 replay 间歇楔死(I29),整图否决 | ✅ | ✅ | TP1 graph==eager bitwise;0.6B TP2 最小复现见 ISSUES I29 |
+| MUSA Graph | ⚠️ 整图否决(I29:TP2 图内 MCCL 间歇楔死);**分段图(图内零 MCCL)离线 b1 −23.7%、跨臂逐位 0 翻转,但在线 A/B 判定 FAIL(并发 14–30 撞桶 padding 税,慢 5.9–14.7%)→ 不转正,默认 eager** | ✅ | ✅ | TP1 graph==eager bitwise;I29/I33;`benchmarks/P11-graph.md`、`P12-serving.md` |
 | 请求级指标（TTFT/TPOT/ITL/E2E） | ✅ 每请求返回 | ✅ | ✅ | `benchmarking.py` + `Sequence.metrics()` |
 | 引擎/调度/KV 指标 | ✅ + Prometheus histogram | ✅ | ✅ | `prometheus_metrics.py` |
 | 步级 trace | ✅ `--metrics-path` JSONL | ✅ | ✅ | 可拆 schedule/forward |
