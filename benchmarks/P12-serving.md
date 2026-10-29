@@ -51,14 +51,24 @@
 **臂 B'(生产栈 + maxseq64 + 段图)**:init 全绿——**768 图/rank 捕获零失败(桶 [1,2,4,8,16,32,48,64]),捕获耗时 5.2 s,KV 723 blocks/rank(auto),捕获后 allocated 37.06 GiB(P11 口径 37.14,一致)**;api_server 首次以段图形态通过 30B 加载。在线矩阵(同一服务,后接饱和 bracketed 串行链,detached)。
 - 失联前实测(01:12 启动,01:35 最后观测):0.5 档 ×3 + 0.75 档 rep1 = **128/128 ok,SLO 100%/100%**,服务端日志零 Traceback/illegal。
 
-**🔴 基础设施中断(07:35 CST 发现,恢复后须先补测)**:本地→服务器 ssh 全部 `Permission denied (publickey,password)`;verbose 显示 **server accepts key 后 final auth 拒绝**(host key 未变 = 同一实例;端口 28036 TCP 可达)。形态指向服务端状态损坏(StrictModes/权限/实例半启动/重建),本地侧无法修复。**失联时最后已知状态**:臂 B api_server(pid 905321)在线提供段图服务;臂 B 压测链(矩阵→饱和)detached 后台运行中,按计划应在 ~02:10 前后自行完成并把 JSON 落盘 `/root/p12_data/p12_online_armB.json` 与 `p12_sat_armB.json`。**恢复访问后的第一优先动作**:① `pgrep -fa` + `mthreads-gmi` 查现场;② 取回 `/root/p12_data/`(臂 B 矩阵 + 饱和 + 服务端日志);③ 若臂 B 矩阵完整 → 补跑臂 A'(生产栈+maxseq64,~55 min)→ 判定;④ 收尾清理(双卡 0 MiB、shm、删 /root/p12.lock 与 /root/moe-server-p6d 如存在)。
+**🔴 基础设施中断(07:35 CST 发现,08:12 恢复)**:本地→服务器 ssh 全部 `Permission denied (publickey,password)`;verbose 显示 **server accepts key 后 final auth 拒绝**(host key 未变 = 同一实例,uptime 5d20h 未重启,端口 TCP 可达)。本地侧无法修复,**用户在 08:10 提供实例密码**,经 expect 密码通道重建 ssh ControlMaster 后恢复(key 通道至收口仍未修复,密码登录可用)。失联期间 detached 压测链自行完成并落盘(见下),未损失数据。
 
-**臂 A'(生产栈 + maxseq64)**:未跑(失联时臂 B 链未收)。判定未产出——P0 状态 = **数据不完整,无判定**(门①②③需要两臂同矩阵)。
+### 最终数据(P12 收口)
 
-### 五字段报告(P0,截至失联)
+**臂 B'(生产栈 + maxseq64 + 段图)**:init 全绿——**768 图/rank 捕获零失败(桶 [1,2,4,8,16,32,48,64]),捕获 5.2 s,KV 723 blocks/rank,捕获后 37.06 GiB(P11 口径 37.14,一致)**。在线矩阵 + 饱和 bracketed 在失联期间由 detached 链自行完成(12 点 + 6 点全 128/128 ok,零 Traceback)。
+- 矩阵中位(3 repeats):0.5 档 TPOT p95 **0.2111 s**、TTFT p95 0.874;0.75 档 0.2703;0.9 档 0.2720(strict 中位 0.992,单请求级波动);1.0 档 **0.2848**、TTFT p95 1.038;四档 slo_standard 全 100%。
+- **饱和 bracketed:1.2/1.4 档(目标 1.044/1.218 qps)双口径 SLO 全 100%,实测 0.924/1.036 req/s,max_conc 44/66——拐点未探到,`slo_standard ≥99%` 最大达成 QPS ≥1.218(上界未定)**,远超 I7 旧栈拐点(0.94 req/s)。
+
+**臂 A'(生产栈 + maxseq64,eager)**:**未完成**——08:31 启动矩阵,09:00 用户指令提前收口时完成 5/12 点(0.5×3 + 0.75×2 全 128/128、100%/100%),按收口协议中止并清理;部分日志 `p12_online_armA2_partial.log`。
+
+**P0 判定**:**未产出**(两臂矩阵未凑齐)。臂 B 侧证据强烈正向(全 SLO 100%、饱和 1.2 档仍 100%),但门①②③是 A/B 判定,缺臂 A' 对照即缺判定;不伪造判定。**下轮只需补臂 A'(~55 min:加载 6 min + 矩阵 40 min + 判定脚本)即可出判决**,臂 B 数据已齐。
+
+**收口核验(09:05)**:双卡 0 MiB、无进程、shm 干净、/root/p12.lock 已删;`/root/moe-server-p6d`(P2 预部署旧树)按交接保留待下轮使用,用完删。证据 sha256:armB json `a3d8e177…31026d8`、sat json `6087244b…7931cf`、首轮 armA json `49f5a0ab…8fab99c`。
+
+### 五字段报告(P0,收口版)
 
 - **门**:见上文冻结门(①②③,未改)。
-- **口径**:两臂同矩阵(0.87 qps × 四档 ×3、seed 20261026);臂 A'/臂 B' 均为 `--decode-moe-backend bmm_dense --max-num-seqs 64`,臂 B' 另加 `NANOVLLM_SEGMENT_GRAPH=1 --no-enforce-eager`。首轮两臂(漏 bmm_dense)作废,数据保留。
-- **结果(不完整)**:首轮臂 A(错误栈)12 点 100%/100%;首轮臂 B(错误栈)init 捕获崩溃;臂 B'(错误桶集)OOM 1632/3360;臂 B''(正确形态)init 768 图零失败 + 在线前 4 点 100%/100%。臂 B'' 矩阵/饱和 JSON 疑似已在服务器落盘(未验证);臂 A' 无数据。
-- **判定**:**未产出**(基础设施中断;不存在"过门"或"否决")。
-- **证据**:`benchmarks/data/p12/p12_online_armA_groupedmm_decode.*`(首轮参考)、服务器侧 `/root/p12_data/`(未取回)、`/root/p12_api_arm{A,B}.log`(未取回;本地无副本)。
+- **口径**:两臂同矩阵(0.87 qps × 四档 ×3、seed 20261026);臂 A'/臂 B' 均为 `--decode-moe-backend bmm_dense --max-num-seqs 64`,臂 B' 另加 `NANOVLLM_SEGMENT_GRAPH=1 --no-enforce-eager`。首轮两臂(漏 bmm_dense)作废留证;臂 B' 饱和 bracketed 同服务顺路。
+- **结果**:臂 B' 矩阵 12 点全 128/128、slo_standard 全 100%(0.9 档 strict 中位 0.992);TPOT p95 中位 0.211/0.270/0.272/0.285(0.5→1.0);饱和 1.2/1.4 档双口径 100%(拐点 ≥1.218 qps 未探到)。臂 A' 中止于 5/12 点(已完成点全 100%)。
+- **判定**:**未产出**(臂 A' 缺)。不存在"过门/否决";下轮补臂 A' 后用 `scripts/p12_serving_ab.py` 一发判定。
+- **证据**:`benchmarks/data/p12/`(armB 矩阵+饱和 JSON/sha256、armA2 部分日志、首轮作废数据);服务器 `/root/p12_api_armB.log`(臂 B' init 全绿日志,未拉回本地)。

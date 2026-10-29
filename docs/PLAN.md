@@ -11,13 +11,13 @@
 
 ## 1. P12 迭代内容(按优先级;门与判定树见 `benchmarks/P11-serving.md` 与本节)
 
-> P12 执行状态(10-29 早):P0 两臂口径修正后重跑,臂 B'(生产栈+maxseq64+段图)init 768 图零失败、在线前 4 点 100% SLO;**07:35 服务器失联(ssh 认证层拒绝),判定未产出**,详见 `benchmarks/P12-serving.md`。下轮续作 = 恢复访问 → 取回臂 B 数据 → 补臂 A' → 判定 → P1/P2。
+> P12 执行状态(10-29 早收官):臂 B'(生产栈+maxseq64+段图)在线矩阵 12 点全 128/128、slo_standard 全 100%,TPOT p95 中位 0.211/0.270/0.272/0.285;**饱和 bracketed 1.2/1.4 档双口径全 100%(拐点 ≥1.218 qps 未探到)**。臂 A' 因用户提前收口中止于 5/12 点,**P0 三门判定未产出(缺臂 A' 对照,~55 min 可补)**,默认未翻转。期间服务器 ssh 认证失效 6.5h(密码通道恢复,detached 链零数据损失)。详见 `benchmarks/P12-serving.md` 与 `docs/HANDOFF.md`。
 
 | # | 项 | 门/判定 | 状态 |
 |---|---|---|---|
-| 1 | **segment 在线 L3 A/B + 转正决策**(最大收益) | SLO 双门不劣化 + 1.0 档 TPOT p95 不劣于 eager 臂 + 低载档改善可见;过门 → 翻默认 + 4 单测套件 + 0.6B S2 快速复验。**前提(I32):两臂带 `--decode-moe-backend bmm_dense --max-num-seqs 64`** | **中断于基础设施失联**(臂 B 数据疑在服务器未取回,臂 A' 未跑) |
+| 1 | **segment 在线 L3 A/B + 转正决策**(最大收益) | SLO 双门不劣化 + 1.0 档 TPOT p95 不劣于 eager 臂 + 低载档改善可见;过门 → 翻默认 + 4 单测套件 + 0.6B S2 快速复验。**前提(I32):两臂带 `--decode-moe-backend bmm_dense --max-num-seqs 64`** | **臂 B 全绿(矩阵 12 点全 100% SLO);臂 A' 中止于 5/12;判定未产出,下轮 ~55 min 补齐** |
 | 2 | I30 v4 口径复核重跑(pre-P8 树重放) | 判定树冻结于 P11-serving.md:旧栈 ×3 ≈0.33 → 回退真实(P8 二分);≈0.39 → v4 假象关闭 I30;预算按旧栈实速(0.9/1.0 两档 ×3 ≈ 50 min) | 未跑(P6D 树已预部署于 `/root/moe-server-p6d`) |
-| 3 | Poisson 饱和 bracketed(`--fractions 1.2,1.4 --repeats 3`) | 报告 slo_standard ≥99% 的最大达成 QPS | 疑随臂 B 链已在服务器完成(未验证) |
+| 3 | Poisson 饱和 bracketed(`--fractions 1.2,1.4 --repeats 3`) | 报告 slo_standard ≥99% 的最大达成 QPS | **PASS:1.2/1.4 档双口径全 100%(0.924/1.036 req/s 实测),拐点 ≥1.218 qps 未探到** |
 | 4 | b32 +3.8% 回退归因/缓解(可选) | AR/replay 重叠或高载自动降级 eager;收益上限 3.8% | 未排 |
 | 5 | (低优)mixed-step segment 化预研 / 1k prefill kernel profile / I20 KV 量化 / E1 / E2 | — | 未排 |
 
