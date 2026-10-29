@@ -356,3 +356,13 @@ def test_padding_requires_repeats_valid_batches_and_tokens():
     assert judge.padding(payloads[:-1])["overall"] == "INVALID"
     payloads[0]["batches"]["16"]["actual_batch_valid"] = False
     assert judge.padding(payloads)["overall"] == "INVALID"
+
+
+@pytest.mark.parametrize("memories", [(100, 100), (0, 1000), (10000, 0)])
+def test_runner_rejects_nonzero_gpu_memory(monkeypatch, memories):
+    runner = _load_module("p13_run", "scripts/p13_run.py")
+    output = '\n'.join(f'{i} MTT S4000 |0000:00|0%    {memory}MiB(49152MiB)'
+                       for i, memory in enumerate(memories))
+    monkeypatch.setattr(runner.subprocess, 'check_output', lambda *a, **kw: output)
+    with pytest.raises(RuntimeError, match='GPU not idle'):
+        runner.idle()

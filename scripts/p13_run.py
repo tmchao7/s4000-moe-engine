@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -54,7 +55,7 @@ def launch(name, argv, cwd=ROOT, env_extra=None):
     env.update(env_extra or {})
     meta = {'argv': argv, 'cwd': str(cwd), 'started': time.time(),
             'revision': os.environ.get('P13_REVISION', 'unknown'),
-            'env': {key: env.get(key) for key in ('PYTHONPATH', 'NANOVLLM_SEGMENT_GRAPH', 'NANOVLLM_TRACE_INIT', 'MUSA_LAUNCH_BLOCKING')},
+            'env': {key: value for key, value in env.items() if key.startswith('NANOVLLM_') or key in ('PYTHONPATH', 'MUSA_LAUNCH_BLOCKING', 'CUDA_LAUNCH_BLOCKING')},
             'source_sha256': {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                               for p in list((cwd/'nanovllm').rglob('*.py')) + list((ROOT/'scripts').glob('p13*.py')) + [ROOT/'scripts/benchmark_online.py', ROOT/'tests/p11_step_ab.py']}}
     with (DATA/f'{name}.log').open('w') as stream:
@@ -80,7 +81,7 @@ def run(name, argv, cwd=ROOT, timeout=2700, env_extra=None):
 
 def idle():
     out = subprocess.check_output(['mthreads-gmi'], text=True)
-    if out.count('0MiB(49152MiB)') != 2:
+    if len(re.findall(r'\|\s*\d+%\s+0MiB\(49152MiB\)', out)) != 2:
         raise RuntimeError('GPU not idle; no unknown processes will be killed')
     leftovers = list(Path('/dev/shm').glob('nanovllm*'))
     if leftovers:
@@ -113,11 +114,19 @@ def service(name, old=False, chunk=256, max_seqs=64):
 
 
 def stop_service(proc):
+    owned_shm = set()
+    for fd in Path(f'/proc/{proc.pid}/fd').glob('*'):
+        try:
+            target = Path(os.readlink(fd))
+            if target.parent == Path('/dev/shm') and target.name.startswith('nanovllm'):
+                owned_shm.add(target)
+        except OSError:
+            pass
     clean(proc)
     time.sleep(3)
     # Only this engine was allowed to start after idle(); its group is now dead.
-    for path in Path('/dev/shm').glob('nanovllm*'):
-        path.unlink()
+    for path in owned_shm:
+        path.unlink(missing_ok=True)
     idle()
 
 
@@ -139,13 +148,7 @@ def prereq():
     ):
         idle()
         run(name, command)
-    for mode in ('eager', 'segment'):
-        idle()
-        name = f'tiny_{mode}'
-        run(name, [PY, 'tests/p11_step_ab.py', '--mode', mode, '--model', '/tmp/tiny_moe',
-            '--attention-backend', 'sdpa', '--batches', '16,17', '--prompt-tokens', '32',
-            '--decode-tokens', '16', '--rounds', '3', '--output', str(DATA/f'{name}.json'),
-            '--code-revision', os.environ.get('P13_REVISION', 'unknown')])
+    tiny_phase()
     for repeat in range(1, 6):
         for mode in ('eager', 'segment'):
             idle()
@@ -157,6 +160,16 @@ def prereq():
     run('padding_verdict', [PY, 'scripts/p13_decide.py', 'padding',
         *[str(p) for p in sorted(DATA.glob('padding_[1-5]_*.json')) if '.meta.' not in p.name and '.exit.' not in p.name],
         '--output', str(DATA/'padding_verdict.json')])
+
+
+def tiny_phase():
+    for mode in ('eager', 'segment'):
+        idle()
+        name = f'tiny32_{mode}'
+        run(name, [PY, 'tests/p11_step_ab.py', '--mode', mode, '--model', '/tmp/tiny_moe',
+            '--attention-backend', 'sdpa', '--batches', '16,17', '--prompt-tokens', '32',
+            '--decode-tokens', '16', '--rounds', '3', '--output', str(DATA/f'{name}.json'),
+            '--code-revision', os.environ.get('P13_REVISION', 'unknown')])
 
 
 def aba_phase():
@@ -190,17 +203,20 @@ def serving():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--phase', required=True, choices=['prereq', 'aba', 'serving'])
+    parser.add_argument('--phase', required=True, choices=['prereq', 'tiny', 'aba', 'serving'])
     parser.add_argument('--deadline', type=float, required=True, help='UTC Unix timestamp; reserve cleanup time')
     args = parser.parse_args()
     globals()['DEADLINE'] = args.deadline
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, terminate)
     DATA.mkdir(exist_ok=True)
     with open('/tmp/nanovllm-p13.lock', 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         lock.write(str(os.getpid())); lock.flush()
         try:
             idle()
-            {'prereq': prereq, 'aba': aba_phase, 'serving': serving}[args.phase]()
+            {'prereq': prereq, 'tiny': tiny_phase, 'aba': aba_phase, 'serving': serving}[args.phase]()
         finally:
             for proc in list(CHILDREN.values()):
                 clean(proc)
