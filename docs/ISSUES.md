@@ -14,16 +14,16 @@
 | **S** | P7 投机解码 | S1–S6 |
 | **E** | 生态与厂商（autotune 手搓边界、runtime 限制） | E1–E6 |
 
-**统计（P12 收口后重算：I 29 项 = 已关闭 17 + 未结 12；S 6 项；E 6 项）**
+**统计（P12 收口后重算：I 30 项 = 已关闭 17 + 未结 13；S 6 项；E 6 项）**
 
 | 系列 | 已关闭 | 未结 | 未结条目 |
 |---|---:|---:|---|
-| I 技术债 | 17 | 12 | I1、I2、I3、I12、I14、**I19**、I20、I27、I28、**I30**、**I31**、**I32** |
+| I 技术债 | 17 | 13 | I1、I2、I3、I12、I14、**I19**、I20、I27、I28、**I30**、**I31**、**I32**、**I33** |
 | S 投机解码 | 1 | 5 | S2–S6（S5 随 S1 搁置） |
 | E 生态厂商 | 0 | 6 | E1、E2（可手搓）、E3–E6（厂商侧） |
 
 已关闭 18 项（I 17 + S1）：I4、I5、I6、I7、I8、I9、I10、I11、I13、I15、I21、I22、I23、I24（部分修）、I25、I26、I29、S1。
-> 编号：I16–I18 已迁入 E 系列（E2/E5/E6），不再单独计数，故 I 系列实际 29 项（I1–I15、I19–I32）。
+> 编号：I16–I18 已迁入 E 系列（E2/E5/E6），不再单独计数，故 I 系列实际 30 项（I1–I15、I19–I33）。
 > I8 已用有效跑闭合（1.0–1.15k token、384/384、rank1 存活）；三档 SLO 0% 是真实容量结论（瓶颈在 TTFT），见 I8 条目。
 
 状态图例：🔴 阻塞主路径／决定立项　🟡 收益被冻结或覆盖缺口　🟢 工程债/低优　⚪ 厂商 runtime，我们不可修
@@ -111,10 +111,17 @@
 - **I27 sdpa-decode 图的烘焙形状数值限制(🆕 本轮定位)**:capture 时 context_lens=256 固化 kv 窗口形状,SDPA 归约切分随 shape 变 → 1-ulp 级漂移与近平局翻转(tiny MoE graph 5/5 自洽但不等于 eager);paged kernel 循环边界在 device 上,不受影响 → 生产路径(paged)graph==eager bitwise。sdpa 模型要用图需按运行时窗口分桶捕获。
 - **I28 torch.musa 跨块步长视图 D2H 拷贝返回不一致数据(🆕 平台 bug 嫌疑)**:`kv_cache[:, :, blk, 0]`([2,L,kh,d] strided view)的 `.cpu()` 返回 NaN 垃圾,同位置 K/V 分读与 device 侧逐层扫描干净,`.contiguous()` 后仍复现;workaround = contiguous 化或分 K/V 读;影响所有"整读跨块切片"的诊断代码。
 - **I29 TP2 引擎级图 replay 楔死(P9 定性收口,10-28)**:**间歇性 rendezvous 楔死,非结构确定性**。P9 分级探针(`tests/p9_mccl_graph_probe.py` + `p8_graph_padfix --tp 2`)实测:① 纯张量图(96 图内 AR、b32 payload、48×bmm+AR、~2400 节点、**六桶共享 pool 完整复刻引擎 capture/replay 协议**)TP2 全绿零楔死;② TP1 引擎级从未楔死(P8 0.6B/8B 5/5);③ **0.6B TP2 paged 首次 replay 即楔死(3/3 复现,最小复现,2 min 加载)**;④ 0.6B TP2 sdpa 撞过 2 次 generate 后楔死 → paged 提高首中概率但非必要;⑤ **replay 前后 barrier(`NANOVLLM_GRAPH_REPLAY_BARRIER=1`,默认关)不是解**。必要成分 = 引擎 replay 路径(graph_vars 每步 fill/scratch 填充/replay 后贴 eager compute_logits/采样节奏)× TP2 collectives。崩溃形态多变(对称自旋/单 rank 死+另一 rank 旋),均需按 PID kill(I12)。**30B 图双轨门维持结构性阻断,默认 eager 不变**。复活条件:分段图(attention eager + linear/MoE 进图)或厂商 MUSAGraph+MCCL 修复后用本探针回归。证据:`benchmarks/P9-graph.md`、`benchmarks/data/p9/p9_mccl_graph_probe*.json`、`p9_06b_padfix.log`。**P10 进展(分段图原型,`NANOVLLM_SEGMENT_GRAPH=1`,默认关)**:每层两段(AR 全部移出图)的 segment graph 在 TP2 **捕获可行**(tiny 16 图双 rank)且 **replay 首次稳定跑通**(3×3×8 token 零楔死、自洽、token 与整图一致;`tests/p10_segment_smoke.py`)——但全程 LAUNCH_BLOCKING 下;异步捕获仍撞 I3 族偶发与一次 wedge,padfix 双引擎上下文捕获 illegal memory access 未解;0.6B paged GB 门未跑。见 `benchmarks/P10-graph.md`。**P11 进展(两进程口径 + S2/S4 双过,分段路线转已验证)**:padfix 加 `--phase eager|graph` 两进程口径绕开双引擎上下文后,**0.6B TP2 paged S2 主判决 PASS**(224 图/rank 零失败、GB 5/5 bitwise、GC、GA、零楔死,LB 下)+ **异步门 PASS**(无 LB 捕获首攻成功 + GB 5/5 bitwise——分段图在生产模式数值正确且稳定)。P10 的异步偶发与双引擎 illegal access 本轮 3/3 全部未复现(含 SEG_DEBUG 打点版)——illegal access 降级为偶发未复现、打点开关保留。**P11 P4 收口(全梯子验证完成)**:8B 门 PASS(288 图零失败、GB 5/5 bitwise、异步零楔死)+ **30B 双轨门五项全 PASS**(768 图/rank 零失败、跨臂逐位 0 翻转 b1/b8/b32、显存 +0.00 GiB、b1 decode **−23.7%**(152.85→116.63 ms)超 ≥+15% 转正门;b8 持平、b32 +3.8% 真实回退)。**I19 固定等待判决:b1 的 ~36 ms/步确为逐算子 host launch 开销,replay 可回收**。**P12 终局:L3 在线 A/B 判定 FAIL**——四档 TPOT p95 比 eager 慢 5.9–14.7%(门②③均不过),B2 同 session 复跑把 B' 复现到 0.1% 内;归因见 I33。**分段图不转正,默认 eager 不变,仅单流场景可显式开**。见 `benchmarks/P11-graph.md`、`benchmarks/P12-serving.md` §P0 判定。
-### I30 🟡 短 prompt TPOT p95 相对 v4-era 回归 +13~16%（P9-P4 开，P10 收窄）:137-token Poisson 矩阵 TPOT p95 0.87 档 0.387–0.397 vs v4 门 0.343,跨 repeats 稳定非噪声;SLO/TTFT 门均 PASS。**P10 已排除候选①(mixed-split 税)**:split=0 时 0.5 档 TPOT p95(0.335–0.348)与 split=1(0.332–0.350)重合,且 split=0 高负载 SLO 崩塌(1.0 档 23–62%)、attempt1 服务器段错误失稳 → split=1 默认维持,该路径关闭(证据 `benchmarks/P10-serving.md`)。剩余候选:② P8 期累积改动二分;③ **跨轮口径复核**(v4 的 0.327 为单跑,先补同矩阵重复测量再谈回归)。下一步:③先行(零代码,一发加载),再决定是否做②。**P11 进展**:③ 已实施但中止——pre-P8 树(`d5779b6`)重放同矩阵,旧栈 0.5 档实速 ~12 min/跑(慢于预期 2.4×,I24 修复缺席所致),收尾窗口内仅得 0.5 档 ×2 SLO 数据(无 TPOT p95 判定)→ 判定未产出;下轮按旧栈实速重排预算(全矩阵 ×3 ≈ 2h,或 0.9/1.0 两档 ×3 ≈ 50 min),判定树冻结在 `benchmarks/P11-serving.md`。
+### I30 🟡 短 prompt TPOT p95 相对 v4-era 回归 +13~16%（P9-P4 开，P10 收窄）
 
-### I31 🟡 30B 进程首个 batch 与稳态逐位不同（一次性 warmup 态跃迁，P11 发现）:30B TP2 生产栈 greedy decode,进程内第一个 batch 的 token 与之后所有 batch 不同(run1–4 两两逐位相同,跨 512-token chat prompts、b1/b8、64 decode;`tests/p11_30b_flip.py` 证据 `benchmarks/data/p11/p11_30b_flip_eager.json`)。**稳态 greedy 是逐位确定的**(MoE 原子加非确定性嫌疑排除)。含义:① 所有 token 一致性门必须**丢弃首 batch**(或先跑一个 warmup batch 再比对),否则把 warmup 态跃迁误判为数值漂移(本轮 p11_30b_ab 的 tokens_consistent=False 即此假象);② 机制未查(候选:首 batch 触发 JIT/autotune/allocator 布局一次性切换)。跨臂(eager vs segment)稳态逐位 0 翻转 = 分段图数值等价的最终证据。
-### I32 🟡 api_server「默认启动」≠ 生产栈；30B 段图捕获的显存前提（P12 发现，两处）:① `--decode-moe-backend` 默认 None = 跟随 `--moe-backend`(grouped_mm),**不带 flag 的 api_server 启动 decode 跑在 grouped_mm 上**——不是文档生产栈(bmm_dense decode;P6-serving-v3/v4、P9-serving 均显式带 flag)。首轮臂 A/B 因此整体作废,臂 B 捕获嵌入 grouped_mm 直接 `operation failed during capture`。② 30B 段图捕获桶集 = `min(max_num_seqs,512)` → 512 默认 = 35 桶 3360 图,且 KV 按 0.9 包络先填满 → **1632/3360 图处 OOM**(图池 5.91 GiB 时);P11 验证形态是 max_num_seqs=64 → 8 桶 768 图、池零增量、捕获 5.2 s。**结论:段图上服务必须 `--max-num-seqs ≤ ~64`(本矩阵实测最大并发 37,饱和段 bs>64 步自动回退 eager,无失真)或先做 KV 预留改造**;转正落地的前提条件(见 P12-serving.md)。api_server 已补 `--decode-moe-backend` 之外的 `--enforce-eager/--no-enforce-eager` 与 `--max-num-seqs` 参数(默认值不动,生产栈不变)。
+137-token Poisson 矩阵 TPOT p95 0.87 档 0.387–0.397 vs v4 门 0.343,跨 repeats 稳定非噪声;SLO/TTFT 门均 PASS。**P10 已排除候选①(mixed-split 税)**:split=0 时 0.5 档 TPOT p95(0.335–0.348)与 split=1(0.332–0.350)重合,且 split=0 高负载 SLO 崩塌(1.0 档 23–62%)、attempt1 服务器段错误失稳 → split=1 默认维持,该路径关闭(证据 `benchmarks/P10-serving.md`)。剩余候选:② P8 期累积改动二分;③ **跨轮口径复核**(v4 的 0.327 为单跑,先补同矩阵重复测量再谈回归)。下一步:③先行(零代码,一发加载),再决定是否做②。**P11 进展**:③ 已实施但中止——pre-P8 树(`d5779b6`)重放同矩阵,旧栈 0.5 档实速 ~12 min/跑(慢于预期 2.4×,I24 修复缺席所致),收尾窗口内仅得 0.5 档 ×2 SLO 数据(无 TPOT p95 判定)→ 判定未产出;下轮按旧栈实速重排预算(全矩阵 ×3 ≈ 2h,或 0.9/1.0 两档 ×3 ≈ 50 min),判定树冻结在 `benchmarks/P11-serving.md`。
+
+### I31 🟡 30B 进程首个 batch 与稳态逐位不同（一次性 warmup 态跃迁，P11 发现）
+
+30B TP2 生产栈 greedy decode,进程内第一个 batch 的 token 与之后所有 batch 不同(run1–4 两两逐位相同,跨 512-token chat prompts、b1/b8、64 decode;`tests/p11_30b_flip.py` 证据 `benchmarks/data/p11/p11_30b_flip_eager.json`)。**稳态 greedy 是逐位确定的**(MoE 原子加非确定性嫌疑排除)。含义:① 所有 token 一致性门必须**丢弃首 batch**(或先跑一个 warmup batch 再比对),否则把 warmup 态跃迁误判为数值漂移(本轮 p11_30b_ab 的 tokens_consistent=False 即此假象);② 机制未查(候选:首 batch 触发 JIT/autotune/allocator 布局一次性切换)。跨臂(eager vs segment)稳态逐位 0 翻转 = 分段图数值等价的最终证据。
+
+### I32 🟡 api_server「默认启动」≠ 生产栈；30B 段图捕获的显存前提（P12 发现，两处）
+
+① `--decode-moe-backend` 默认 None = 跟随 `--moe-backend`(grouped_mm),**不带 flag 的 api_server 启动 decode 跑在 grouped_mm 上**——不是文档生产栈(bmm_dense decode;P6-serving-v3/v4、P9-serving 均显式带 flag)。首轮臂 A/B 因此整体作废,臂 B 捕获嵌入 grouped_mm 直接 `operation failed during capture`。② 30B 段图捕获桶集 = `min(max_num_seqs,512)` → 512 默认 = 35 桶 3360 图,且 KV 按 0.9 包络先填满 → **1632/3360 图处 OOM**(图池 5.91 GiB 时);P11 验证形态是 max_num_seqs=64 → 8 桶 768 图、池零增量、捕获 5.2 s。**结论:段图上服务必须 `--max-num-seqs ≤ ~64`(本矩阵实测最大并发 37,饱和段 bs>64 步自动回退 eager,无失真)或先做 KV 预留改造**;转正落地的前提条件(见 P12-serving.md)。api_server 已补 `--decode-moe-backend` 之外的 `--enforce-eager/--no-enforce-eager` 与 `--max-num-seqs` 参数(默认值不动,生产栈不变)。
 
 ### I33 🟡 桶化图的 padding 税;离线图门只测桶边界(P12 发现,已致分段图在线否决)
 
