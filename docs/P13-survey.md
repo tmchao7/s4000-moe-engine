@@ -63,13 +63,22 @@ P11(同 session,CV≤0.1%)在**桶边界**(pad=1)实测:segment b8 **+0.5%**、b
 
 **结论链**:密桶 + 回退能把 +5.9~14.7% 的在线回退**修到 ≈0%,但修不成正收益**;要拿到 b≥8 的正收益,必须把 AR 也放进图,即回到 I29。**修复(I33)的价值是把段图从"在线有害"变成"在线无害的单流开关",并顺手补上离线门的盲区**——值一轮小实验,不值得再赌转正。
 
-### 1.5 落地顺序建议(并入 PROMPT-P13 P1;⚠️ 先看 §1.6 的驱动上限)
+### 1.5 TensorRT-LLM 的桶调优数据:padding 浪费 ∝ 桶间距,128 以下细粒度是共识
 
-1. **先做回退 flag**(改动最小、零显存):`cap/bs > 阈值(建议 1.15)` 时步回退 eager;阈值做成 env 可调,SGLang 的语义=精确匹配才 replay,可直接对齐。
-2. **再做密桶**(step 4 或 8,到 64):768 图 → ~1300–1700 图/rank;捕获时间按 5.2 s 线性外推 ~10 s 级,图池增量必须实测(I32-② 的 OOM 教训:KV 先填 0.9 包络)。
-3. **门**:0.6B b6–b32 全点扫描(含 b16/b17 判别)→ 30B 单轨步时 → 30B 在线 A/B(复活门:1.0 档 ≥+3%)。
+TRT-LLM 官方技术博客《Tuning CUDA Graph Batch Sizes for Higher Output Throughput》([blog20](https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/docs/source/blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.md))给出了桶间距的量化账:
 
-### 1.6 ⚠️ 厂商硬上限:MUSA 驱动限制每进程存活图可执行文件 ~2048(torchada 披露)
+> "The wasted computation is proportional to the gap between the actual batch and the next captured size."(padding 浪费与 batch 到下一桶的间距成正比)
+> 默认 x2 配置在 128 以上"can cause up to 50% padding waste in high-concurrency scenarios"。
+
+权衡的三笔成本(都是他们实测):**显存**(每图 ~10 MB 元数据,图变多直接挤 KV →"a smaller KV cache directly caps the number of concurrent in-flight requests");**启动时间**(捕获 2.4× 但端到端只 1.17×);**收益**(+64 细化在高并发 500–600 下聚合 +1.3×/分离 +1.5×;+8 细化仅边际收益且个别模型回退 5%,**官方结论 +8 不推荐**)。
+
+**迁移到我们的口径**(注意换算,勿照抄数字):我们 max_num_seqs=64,**全部落在 TRT-LLM"128 以下保持细粒度"的共识区间**;128 以上的 x2/+64/+8 之争与我们无关。对我们,约束从"元数据挤 KV"换成 §1.6 的**驱动 ~2048 图可执行上限**:
+
+- vLLM 式梯子 `[1,2,4]+range(8,64,8)` = **11 桶 → 1056 图/rank**,padding 比 ≤1.41,距上限余量充足 → **推荐起点**;
+- step-4(18 桶 → 1728 图)贴近上限,只有当 step-8 实测仍不够时再试;
+- 我们的 768 图实测图池 +0.00 GiB(P11/P12),说明单图元数据远小于 TRT-LLM 的 671B 模型,但"图数 × 元数据 vs KV 预算"这笔账的结构相同,密桶后要复测 KV blocks。
+
+### 1.6 厂商硬上限:MUSA 驱动限制每进程存活图可执行文件 ~2048(torchada 披露)
 
 torchada(摩尔官方的 CUDA API 兼容层)README 的 CUDA Graphs 章节披露([torchada README](https://raw.githubusercontent.com/MooreThreads/torchada)):
 
@@ -85,6 +94,12 @@ torchada 的解法是保留模板 + LRU 轮换(默认上限 1900,回放被逐出
 - 我们 30B = 48 层 × 2 段 → **桶数硬上限 ≈ 1900/96 ≈ 19–21 桶**(在默认 1900 cap 下)。768 图(8 桶)安全;step-4 到 64(18 桶)= 1728 图**可行但贴近上限**;I32-② 的 maxseq-512 35 桶 3360 图 OOM 除显存外,可能还叠加了这个驱动上限(1632/3360 失败点与 2048 同量级)——**值得在工单里问厂商求证**。
 - 若做密桶,先在 tiny/0.6B 上验证桶数×层数×2 与驱动上限的关系;或确认服务器 torch_musa 2.11 是否已内置类似轮换(torchada 是独立兼容层,我们直连 torch_musa,不一定享受该修复)。
 - **同一 README 还披露图调试转储**:`TORCHADA_CUDA_GRAPH_DEBUG_DUMP_PATH` → 每次捕获自动 `enable_debug_mode()` + `debug_dump()` 写时间戳 `.dot` 文件——**这正是我们缺的 MUSA 图级可观测性**(E6 痛点、I29 诊断慢的根因)。探针实验可直接用它 dump 段图结构对照。
+
+### 1.7 落地顺序建议(最终版)
+
+1. **先做回退 flag**(改动最小、零显存):`cap/bs > 阈值(建议 1.15)` 时步回退 eager;阈值做成 env 可调,SGLang 的语义=精确匹配才 replay,可直接对齐。
+2. **再做密桶**:推荐 vLLM 式 11 桶 `[1,2,4]+range(8,64,8)` → **1056 图/rank**(padding 比 ≤1.41,距 ~1900–2048 上限余量充足);step-4(18 桶 → 1728 图)仅在 step-8 实测不够时再试。捕获时间线性外推 ~8 s;图池与 KV blocks 复测(I32-② 的 KV 先填 0.9 包络教训)。
+3. **门**:0.6B b6–b32 全点扫描(含 b16/b17 判别)→ 30B 单轨步时 → 30B 在线 A/B(复活门:1.0 档 ≥+3%)。
 
 ---
 
