@@ -234,3 +234,125 @@ def test_aggregate_pools_repeats():
     assert entry["slo_standard_rate_per_repeat"] == [1.0, 0.992]
     low, high = entry["slo_standard_rate_ci95"]
     assert low is not None and 0.97 < low < 1.0
+
+
+def test_admission_denominators_and_unknown():
+    module = _load_client_module()
+    rows = [
+        {"http_status": 200, "conforming_standard": True, "conforming_strict": True},
+        {"http_status": 200, "conforming_standard": False},  # admitted, stream failed
+        {"http_status": 429}, {"http_status": None}, {"http_status": 400},
+    ]
+    result = module.admission_summary(rows)
+    assert result["admitted_slo_standard_rate"] == .5
+    assert result["reject_429_rate"] == .2
+    assert result["admission_counts"]["unknown"] == 1
+    assert result["admission_counts"]["other_http"] == 1
+    assert module.admission_summary([])["admitted_slo_standard_rate"] is None
+    assert module.admission_summary([{"http_status": 429}])["reject_429_rate"] == 1
+    assert module.admission_summary([{"http_status": 429}])["admitted_slo_standard_rate"] is None
+
+
+def test_admission_aggregate_weights_counts():
+    module = _load_client_module()
+    rows = []
+    for repeat, statuses in enumerate(([200, 429], [200, 200, None]), 1):
+        admission = module.admission_summary([{"http_status": s, "conforming_standard": s == 200,
+                                              "conforming_strict": s == 200} for s in statuses])
+        rows.append({"load_fraction": 1, "repeat": repeat, **admission,
+                     "counts": {"attempted": len(statuses), "conforming_standard": statuses.count(200),
+                                "conforming_strict": statuses.count(200)},
+                     "slo_standard_rate": statuses.count(200) / len(statuses),
+                     "slo_strict_rate": statuses.count(200) / len(statuses), "achieved_qps": 1})
+    result = module.aggregate(rows, ["load_fraction"])[0]
+    assert result["reject_429_rate"] == .2
+    assert result["admitted_slo_standard_rate"] == 1
+    assert result["admission_counts"]["unknown"] == 1
+
+
+@pytest.mark.parametrize("failure", ["disconnect", "timeout_before", "timeout_after"])
+def test_http_status_survives_stream_failure(failure):
+    module = _load_client_module()
+
+    class Response:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        async def aiter_lines(self):
+            if failure == "timeout_after":
+                raise asyncio.TimeoutError()
+            raise RuntimeError("disconnected")
+            yield ""
+
+    class Stream:
+        async def __aenter__(self):
+            if failure == "timeout_before":
+                raise asyncio.TimeoutError()
+            return Response()
+        async def __aexit__(self, *args):
+            return False
+
+    class Client:
+        def stream(self, *args, **kwargs):
+            return Stream()
+
+    row = asyncio.run(module.one_request(Client(), "http://test", "model", "prompt", 4,
+                                        0, time.perf_counter(), module.ConcurrencyTracker()))
+    assert not row["ok"]
+    assert row["http_status"] == (None if failure == "timeout_before" else 200)
+
+
+def test_aba_decisions():
+    judge = _load_module("p13_decide", "scripts/p13_decide.py")
+    def arm(value):
+        return {"summary": [{"load_fraction": f, "repeat": r, "counts": {"attempted": 128, "ok": 128},
+                              "tpot_p95_s": value} for f in (.9, 1.) for r in (1, 2, 3)]}
+    assert judge.aba(arm(1), arm(.99), arm(1))["overall"] == "NO_REGRESSION"
+    assert judge.aba(arm(1), arm(1.06), arm(1))["overall"] == "REGRESSION"
+    assert judge.aba(arm(1), arm(1.02), arm(1))["overall"] == "INCONCLUSIVE"
+    assert judge.aba(arm(1), arm(.99), arm(1.1))["overall"] == "INVALID"
+    assert judge.aba(arm(1), {}, arm(1))["overall"] == "INVALID"
+    noisy = arm(1)
+    noisy["summary"][0]["tpot_p95_s"] = 2
+    assert judge.aba(arm(1), noisy, arm(1))["overall"] == "INVALID"
+
+
+def test_summary_keeps_all_attempts_slo_and_server_timing():
+    module = _load_client_module()
+    args = types.SimpleNamespace(slo_ttft_ms=2000, slo_tpot_ms=500, strict_max_itl_s=1)
+    rows = []
+    for status in (200, 429, None):
+        rows.append({"http_status": status, "ok": status == 200, "started_s": 0, "ended_s": 1,
+                     "ttft_s": .4, "tpot_s": .1, "itls_s": [.1], "e2e_s": 1,
+                     "prompt_tokens": 128, "output_tokens": 8, "error": None if status == 200 else "failed",
+                     "timed_out": status is None, "server_ttft_s": .3 if status == 200 else None,
+                     "server_queue_s": .1 if status == 200 else None})
+    result = module.summarize(rows, 3, {}, args, {"load_fraction": 1, "repeat": 1})
+    assert result["slo_standard_rate"] == pytest.approx(1/3)
+    assert result["admitted_slo_standard_rate"] == 1
+    assert result["reject_429_rate"] == pytest.approx(1/3)
+    assert result["scheduled_to_first_token_p50_s"] == pytest.approx(.2)
+    assert result["output_tokens_p50"] == 8
+
+
+def test_aba_rejects_different_workloads():
+    judge = _load_module("p13_decide", "scripts/p13_decide.py")
+    assert judge.aba({"args": {"seed": 1}}, {"args": {"seed": 2}},
+                     {"args": {"seed": 1}})["reason"] == "benchmark configuration mismatch"
+
+
+def test_padding_requires_repeats_valid_batches_and_tokens():
+    judge = _load_module("p13_decide", "scripts/p13_decide.py")
+    payloads = []
+    for _ in range(5):
+        for mode in ("eager", "segment"):
+            payloads.append({"complete": True, "mode": mode, "batches": {
+                str(n): {"decode_median_ms": (12 if mode == "segment" else 10.5) if n == 17 else 10,
+                         "cv": .01, "actual_batch_valid": True, "tokens_consistent": True,
+                         "cap": 32 if mode == "segment" and n == 17 else n,
+                         "rounds": [{"token_sha256": "warmup"}, {"token_sha256": str(n)}]}
+                for n in (16, 17)}})
+    assert judge.padding(payloads)["overall"] == "STEP_SUPPORTED"
+    assert judge.padding(payloads[:-1])["overall"] == "INVALID"
+    payloads[0]["batches"]["16"]["actual_batch_valid"] = False
+    assert judge.padding(payloads)["overall"] == "INVALID"

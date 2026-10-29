@@ -12,6 +12,9 @@ import argparse
 import json
 import statistics
 import time
+import os
+import hashlib
+from pathlib import Path
 
 
 def main():
@@ -26,7 +29,12 @@ def main():
     parser.add_argument("--rounds", type=int, default=4,
                         help="rounds of 3 single-batch generates; round 1 = warmup, dropped")
     parser.add_argument("--output", default="/root/p11_step.json")
+    parser.add_argument("--batches", default="1", help="comma-separated batch sizes; P13 scans non-boundaries")
+    parser.add_argument("--code-revision", default="unknown")
     args = parser.parse_args()
+    batches = [int(value) for value in args.batches.split(",")]
+    assert batches and min(batches) > 0 and args.rounds >= 3 and args.decode_tokens >= 3
+    os.environ["NANOVLLM_SEGMENT_GRAPH"] = "1" if args.mode == "segment" else "0"
 
     from nanovllm import LLM, SamplingParams
 
@@ -40,12 +48,18 @@ def main():
         expert_parallel_size=args.tp,
         attention_backend=args.attention_backend,
         max_model_len=1024,
-        max_num_seqs=8,
+        max_num_seqs=max(8, ((max(batches) + 15) // 16) * 16) if batches != [1] else 8,
         gpu_memory_utilization=0.3,
         **kwargs,
     )
+    if args.batches != "1":
+        try:
+            scan_batches(llm, batches, args, SamplingParams)
+        finally:
+            llm.exit()
+        return
     prompts = [
-        [(i * 7919 + j) % 900 + 10 for j in range(args.prompt_tokens)]
+        [(i * 7919 + j) % min(900, llm.model_runner.config.hf_config.vocab_size - 10) + 10 for j in range(args.prompt_tokens)]
         for i in range(3)
     ]
     payload = {"mode": args.mode, "rounds": []}
@@ -88,6 +102,55 @@ def main():
     print(f"[step-ab] mode={args.mode} FINAL decode_step_median_ms={median:.2f} "
           f"cv_pct={cv_pct:.2f} rounds={len(measured)}", flush=True)
     llm.exit()
+
+
+def scan_batches(llm, batches, args, sampling_params):
+    """P13 shape sweep. First full batch at EACH shape is discarded (I31)."""
+    payload = {"kind": "p13_padding", "mode": args.mode, "args": vars(args),
+               "started": time.time(), "batches": {},
+               "kv_blocks": llm.model_runner.config.num_kvcache_blocks,
+               "graph_buckets": getattr(llm.model_runner, "graph_bs", []),
+               "versions": {}, "code_revision": args.code_revision}
+    import torch
+    import torch_musa
+    payload["versions"] = {"torch": torch.__version__, "torch_musa": torch_musa.__version__}
+    for batch in batches:
+        prompts = [[(i * 7919 + j) % min(900, llm.model_runner.config.hf_config.vocab_size - 10) + 10 for j in range(args.prompt_tokens)]
+                   for i in range(batch)]
+        rounds = []
+        for index in range(args.rounds):
+            for prompt in prompts:
+                llm.add_request(prompt, sampling_params(temperature=0,
+                    max_tokens=args.decode_tokens, ignore_eos=True))
+            steps, actual_batches, tokens = [], [], {}
+            while not llm.is_finished():
+                started = time.perf_counter()
+                outputs, num_tokens = llm.step()
+                elapsed = (time.perf_counter() - started) * 1000
+                if llm.last_step_metrics["mode"] == "decode":
+                    steps.append(elapsed)
+                    actual_batches.append(-num_tokens)
+                for seq_id, token_ids, _ in outputs:
+                    tokens[seq_id] = list(token_ids)
+            ordered = [tokens[key] for key in sorted(tokens)]
+            rounds.append({"warmup": index == 0, "decode_ms": steps,
+                "decode_median_ms": statistics.median(steps),
+                "actual_batches": sorted(set(actual_batches)),
+                "token_sha256": hashlib.sha256(json.dumps(ordered).encode()).hexdigest()})
+            print(f"[p13-padding] {args.mode} b{batch} round={index} "
+                  f"median={rounds[-1]['decode_median_ms']:.3f}ms", flush=True)
+        values = [r["decode_median_ms"] for r in rounds[1:]]
+        buckets = payload["graph_buckets"]
+        payload["batches"][str(batch)] = {"rounds": rounds,
+            "cap": next((n for n in buckets if n >= batch), batch),
+            "decode_median_ms": statistics.median(values),
+            "cv": statistics.stdev(values) / statistics.mean(values),
+            "actual_batch_valid": all(r["actual_batches"] == [batch] for r in rounds),
+            "tokens_consistent": len({r["token_sha256"] for r in rounds[1:]}) == 1}
+        payload["finished"] = time.time()
+        Path(args.output).write_text(json.dumps(payload, indent=2))
+    payload["complete"] = True
+    Path(args.output).write_text(json.dumps(payload, indent=2))
 
 
 if __name__ == "__main__":

@@ -265,7 +265,7 @@ async def one_request(
     messages = [{"role": "user", "content": prompt}]
 
     async def consume():
-        nonlocal first, end, error, done_received, usage, finish_reason, server_metrics, generated_text
+        nonlocal first, end, error, done_received, usage, finish_reason, server_metrics, generated_text, http_status
         async with client.stream(
             "POST",
             url,
@@ -279,6 +279,7 @@ async def one_request(
             },
             timeout=None,
         ) as response:
+            http_status = response.status_code
             response.raise_for_status()
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
@@ -494,9 +495,11 @@ def summarize(rows, max_concurrency, metrics_delta, args, label, gpu_max=None):
     strict_count = sum(1 for row in rows if row["conforming_strict"])
     standard_ci = wilson_ci(standard_count, len(rows))
     strict_ci = wilson_ci(strict_count, len(rows))
+    admission = admission_summary(rows)
     prefix_hit_tokens = metrics_delta.get("kv_prefix_hit_tokens_total", 0.0)
     result = {
         **label,
+        **admission,
         "achieved_qps": len(good) / duration,
         "request_throughput_per_s": len(good) / duration,
         "input_tokens_per_s": input_tokens / duration,
@@ -550,11 +553,39 @@ def summarize(rows, max_concurrency, metrics_delta, args, label, gpu_max=None):
     result.update(distribution(tpots, "tpot"))
     result.update(distribution(itls, "itl"))
     result.update(distribution(e2es, "e2e"))
+    for quantile, name in ((0.5, "p50"), (0.95, "p95")):
+        result[f"output_tokens_{name}"] = percentile(
+            [row["output_tokens"] for row in good if row.get("output_tokens") is not None], quantile)
+    scheduled_to_first = [row["server_ttft_s"] - row["server_queue_s"] for row in rows
+                          if row.get("server_ttft_s") is not None
+                          and row.get("server_queue_s") is not None]
+    result.update(distribution(scheduled_to_first, "scheduled_to_first_token"))
     if server_queues:
         result["queue_p50_s"] = percentile(server_queues, 0.50, method="linear")
         result["queue_p95_s"] = percentile(server_queues, 0.95, method="linear")
         result["queue_samples"] = len(server_queues)
     return result
+
+
+def admission_summary(rows):
+    """Confirmed HTTP admission; absent responses remain unknown, including legacy rows."""
+    admitted = [r for r in rows if r.get("http_status") is not None
+                and 200 <= r["http_status"] < 300]
+    count = len(admitted)
+    rejected = sum(r.get("http_status") == 429 for r in rows)
+    standard = sum(bool(r.get("conforming_standard")) for r in admitted)
+    strict = sum(bool(r.get("conforming_strict")) for r in admitted)
+    return {
+        "admission_counts": {"admitted": count, "reject_429": rejected,
+                             "unknown": sum(r.get("http_status") is None for r in rows),
+                             "other_http": sum(r.get("http_status") is not None
+                                               and not 200 <= r["http_status"] < 300
+                                               and r["http_status"] != 429 for r in rows),
+                             "conforming_standard": standard, "conforming_strict": strict},
+        "reject_429_rate": rejected / len(rows) if rows else None,
+        "admitted_slo_standard_rate": standard / count if count else None,
+        "admitted_slo_strict_rate": strict / count if count else None,
+    }
 
 
 def aggregate(summaries, key_fields):
@@ -580,6 +611,15 @@ def aggregate(summaries, key_fields):
                 [row["achieved_qps"] for row in rows], 0.50, method="linear"
             ),
         }
+        if all("admission_counts" in row for row in rows):
+            counts = {field: sum(row["admission_counts"][field] for row in rows)
+                      for field in rows[0]["admission_counts"]}
+            entry.update({
+                "admission_counts": counts,
+                "reject_429_rate": counts["reject_429"] / total_attempted if total_attempted else None,
+                "admitted_slo_standard_rate": counts["conforming_standard"] / counts["admitted"] if counts["admitted"] else None,
+                "admitted_slo_strict_rate": counts["conforming_strict"] / counts["admitted"] if counts["admitted"] else None,
+            })
         result.append(entry)
     return result
 
@@ -675,6 +715,13 @@ async def async_main(args):
                     rows, max_concurrency, delta, args, label, gpu_max
                 )
                 summaries.append(summary)
+                # Durable partial evidence if the time budget or server ends a run.
+                checkpoint = Path(args.output).with_suffix(".partial.json")
+                checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                temporary = checkpoint.with_suffix(".tmp")
+                temporary.write_text(json.dumps({"complete": False, "args": vars(args),
+                    "summary": summaries, "records": all_rows, "points": points}, indent=2))
+                temporary.replace(checkpoint)
                 print(
                     f"[online] mode={args.mode} load={fraction} repeat={repeat} "
                     f"ok={sum(row['ok'] for row in rows)}/{len(rows)} "
@@ -688,6 +735,9 @@ async def async_main(args):
 
     payload = {
         "schema_version": 3,
+        "complete": True,
+        "args": vars(args),
+        "admission_definition": "HTTP 2xx confirmed; no HTTP response unknown; SLO defaults use all attempts",
         "run_id": f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}",
         "mode": args.mode,
         "arrival_pattern": args.arrival_pattern if args.mode != "concurrency" else None,

@@ -6,6 +6,23 @@
 
 ---
 
+## P13 执行修订（2026-10-29）
+
+本轮按用户批准的方案执行 P0–P3，预算北京时间 10-29 22:40:15 至 10-30 04:40:15；04:10:15 停止测量，预留30分钟收尾。以下修订覆盖原任务书的冲突描述，历史门不修改：
+
+- ABA 是旧→新→旧 **三次加载**。统一当前客户端、两树 max_num_seqs=512（旧树默认）；每档三个 repeat，各臂 CV≤5%，两旧臂中位数相差≤5%。当前两档均≤两旧臂才关闭 I30；任一档相对两旧臂均≥+5%为真实回归；其余灰区/缺失/漂移保持未定或 INVALID。
+- `slo_standard_rate` / `slo_strict_rate` 保持全部请求分母；新增 HTTP 2xx 确认准入的独立 SLO、429率、其他HTTP和准入未知计数。准入后断流仍在准入分母，响应前超时不能视作成功或确定拒绝。
+- 0.6B 是 dense；b16/b17 实验只检验该模型上的阶跃，另用 tiny MoE 覆盖后端路径。不得据此断言30B padding主因已证明或图优化“永远无收益”。生产图仍默认关闭，密桶和整图不实施。
+- 长上下文固定 chunk-256/1024，各三档×3，末尾复测256低载档；不再择优搜索chunk。TTFT−queue是首次调度到首token时间，含调度间隙，不是纯prefill kernel耗时。
+- eager容量取三个repeat均 standard SLO≥99%的最高已测档；未触及失败档只报容量下界，不能声称长期持续上界。
+- 四套回归及 tiny/0.6B 验证在30B加载前完成。单问题额外排障45分钟，完整数据不足不缩减repeat或放宽门。
+
+执行器：`scripts/p13_run.py --phase prereq|aba|serving --deadline <UTC Unix秒>`，远端 `setsid nohup` 启动，独占锁 `/tmp/nanovllm-p13.lock`，日志与元数据 `/root/p13_data/`。执行器仅终止自己创建的进程组；不自动重启失败任务，不调用远端git。
+
+GitHub 调研依据：[TensorRT-LLM桶调优](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.md)、[vLLM图调度](https://github.com/vllm-project/vllm/blob/main/docs/design/cuda_graphs.md)、[MooreThreads torchada图限制](https://github.com/MooreThreads/torchada#cuda-graphs)。上游经验是实验线索，不是本机测量结论；本轮不升级依赖。
+
+---
+
 ## 0. 三十秒状态
 
 - **分支** `feat/musa-port`,HEAD 见 `git log --oneline -3`(本地,未 push;push 需用户明确授权)。
