@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 def spread(values):
-    return statistics.stdev(values) / statistics.mean(values) if len(values) > 1 and statistics.mean(values) else math.inf
+    return statistics.stdev(values) / statistics.mean(values) if len(values) > 1 and statistics.mean(values) > 0 else None
 
 
 def aba(a1, b, a2):
@@ -67,7 +67,8 @@ def padding(payloads):
             entries = [p["batches"][str(size)] for p in payloads
                        if p["mode"] == mode and str(size) in p.get("batches", {})]
             values = [e["decode_median_ms"] for e in entries]
-            ok = (len(entries) >= 5 and spread(values) <= .05
+            ok = (len(entries) >= 5 and all(math.isfinite(v) and v > 0 for v in values)
+                  and spread(values) <= .05
                   and all(e["cv"] <= .05 and e["actual_batch_valid"] and e["tokens_consistent"] for e in entries))
             row[mode] = {"values": values, "median_ms": statistics.median(values) if values else None,
                          "cv": spread(values) if values else None, "valid": ok,
