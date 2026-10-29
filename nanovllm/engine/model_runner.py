@@ -52,6 +52,18 @@ _SEGMENT_GRAPH = [os.environ.get("NANOVLLM_SEGMENT_GRAPH", "0") == "1"]
 # bisect (P2) and capture-flake slow-start (P1).  Both default inert.
 _SEG_DEBUG = os.environ.get("NANOVLLM_SEG_DEBUG", "0") == "1"
 _SEG_SLOW = float(os.environ.get("NANOVLLM_SEG_SLOW", "0"))
+# I33 bucket-padding controls, both default inert (P12 online A/B verdict kept).
+#   NANOVLLM_SEGMENT_GRAPH_BUCKETS=dense -> vLLM-style ladder [1,2,4]+step-8.
+#     Online concurrency 14-30 sat between the sparse default buckets and paid
+#     up to 1.88x padding compute; dense caps that at 1.41x.  Graph count grows
+#     to 2*layers*len(buckets) (1056/rank at max_num_seqs=64); the MUSA driver
+#     caps live graph executables around ~2048 (torchada), i.e. ~21 buckets at
+#     48 layers x 2 segments.
+#   NANOVLLM_SEGMENT_GRAPH_PAD_RATIO=r   -> when cap/bs > 1+r, run the decode
+#     step eager instead of replaying a padded graph (SGLang
+#     --disable-cuda-graph-padding semantics; default 0 keeps replay-always).
+_SEG_BUCKETS = os.environ.get("NANOVLLM_SEGMENT_GRAPH_BUCKETS", "default")
+_SEG_PAD_RATIO = float(os.environ.get("NANOVLLM_SEGMENT_GRAPH_PAD_RATIO", "0"))
 
 
 def set_mixed_split(enabled: bool) -> None:
@@ -706,7 +718,10 @@ class ModelRunner:
             (max_bs,), min(self.block_size, config.max_model_len), dtype=torch.int32
         )
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        if _SEG_BUCKETS == "dense":
+            self.graph_bs = [1, 2, 4] + list(range(8, max_bs + 1, 8))
+        else:
+            self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.graph_bs[-1] != max_bs:
             self.graph_bs.append(max_bs)
         self.graph_vars = dict(
@@ -833,6 +848,11 @@ class ModelRunner:
     def _run_model_segment(self, input_ids: torch.Tensor, positions: torch.Tensor):
         bs = input_ids.size(0)
         cap = next(x for x in self.graph_bs if x >= bs)
+        if _SEG_PAD_RATIO > 0 and cap > bs * (1.0 + _SEG_PAD_RATIO):
+            # I33: padding rows execute real attention/MoE inside the replayed
+            # graph; past this ratio the wasted compute outweighs the launch
+            # savings, so eager is the better deal.
+            return self.model.compute_logits(self.model(input_ids, positions))
         bufs = self.seg_bufs[cap]
         context = get_context()
         gv = self.graph_vars
