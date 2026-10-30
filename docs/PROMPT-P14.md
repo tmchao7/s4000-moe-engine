@@ -8,7 +8,7 @@
 >
 > **先读(顺序固定)**:`AGENTS.md`(环境/命令/红线/SOP)→ `docs/HANDOFF.md`(唯一交接,本版=P13 收官)→ 按需 `docs/PLAN.md`(冻结门)/`docs/ISSUES.md`(台账)。文档与实测冲突时以代码和实测为准并修文档。**不要重读或重跑已判决实验**(HANDOFF §2 清单)。
 >
-> **当前状态(30 秒)**:HEAD `c717e10`(本地未 push);服务器 idle、双卡 0 MiB、shm 干净、旧树已删、`/root/p13_data/` 留有全量日志;生产栈 `triton_paged` + `grouped_mm`/`bmm_dense` + `enforce_eager=True` + `stall_free` + TP2/EP2 + chunk-256,**默认值一个没动**;分段图服务化分支已关闭(定格单流开关)。SSH 直连 `ssh -p 28036 root@connect.sha1.seetacloud.com`(key 可用;偶发 DNS/网关瞬断=等 60–90 s 重试;密集重试会撞 MaxStartups)。
+> **当前状态(30 秒)**:HEAD `c717e10` 之后的 `9d53877`(本地未 push);服务器 idle、双卡 0 MiB、shm 干净、旧树已删、`/root/p13_data/` 留有全量日志;生产栈 `triton_paged` + `grouped_mm`/`bmm_dense` + `enforce_eager=True` + `stall_free` + TP2/EP2 + chunk-256,**默认值一个没动**;分段图服务化分支已关闭(定格单流开关)。SSH 直连 `ssh -p 28036 root@connect.sha1.seetacloud.com`(key 可用;偶发 DNS/网关瞬断=等 60–90 s 重试;密集重试会撞 MaxStartups)。
 >
 > **目标顺序(严格按序,时间盒到点即切)**:
 >

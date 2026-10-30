@@ -1,7 +1,7 @@
 # HANDOFF — 当前交接(滚动更新;本版 = P13 夜间迭代收官,2026-10-30)
 
 > 本文是**唯一交接文档**(历史版本在 git 历史)。接手先读本文,再按 [AGENTS.md](../AGENTS.md) 核验环境与命令。规则不变:先写门再跑;一次一个 GPU 任务;负结果照录;本地 commit(不 push 除非用户授权);到点无论进度必须停下写交接、清服务器。
-> 配套文档:[docs/PROMPT-P13.md](./PROMPT-P13.md)(任务书)、[docs/P13-survey.md](./P13-survey.md)(业界调研)、[docs/E-vendor-ticket.md](./E-vendor-ticket.md)(厂商工单,成文待发)、[docs/RESUME.md](./RESUME.md)(面试材料)。
+> 配套文档:[docs/PROMPT-P13.md](./PROMPT-P13.md)(任务书)、[docs/PROMPT-P14.md](./PROMPT-P14.md)(P14 执行提示词)、[docs/P13-survey.md](./P13-survey.md)(业界调研)、[docs/E-vendor-ticket.md](./E-vendor-ticket.md)(厂商工单,成文待发)、[docs/RESUME.md](./RESUME.md)(面试材料)。
 
 ## 0. 三十秒状态
 
