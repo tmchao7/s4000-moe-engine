@@ -5,13 +5,13 @@
 
 ## 0. 当前栈与已判决(不要重测)
 
-**生产栈**:`attention=triton_paged`(默认)、`moe_backend=grouped_mm`(prefill)、`decode_moe_backend=bmm_dense`、`enforce_eager=True`、`scheduler=stall_free`(在线)/`fcfs`(离线)、TP2/EP2、chunk-256。30B eager b1 decode 步时 142–159 ms(口径相关);**分段图(`NANOVLLM_SEGMENT_GRAPH=1`,默认关):离线 30B b1 = 116.63 ms(−23.7%),但 P12 在线 A/B 判定 FAIL(四档 TPOT p95 比 eager 慢 5.9–14.7%),不转正、不进默认,仅单流场景可显式开**;离线 b32 133 tok/s;短 prompt 四档 Poisson ×3 全 100% SLO;1k 长上下文 chunk-2048 下 50% 档 TTFT p50 1.036 s、SLO 100%。
+**生产栈**:`attention=triton_paged`(默认)、`moe_backend=grouped_mm`(prefill)、`decode_moe_backend=bmm_dense`、`enforce_eager=True`、`scheduler=stall_free`(在线)/`fcfs`(离线)、TP2/EP2、chunk-256。30B eager b1 decode 步时 142–159 ms(口径相关);**分段图已终局(P12 在线 FAIL + P13 修复验证:padding 税证实并消除,残余 AR 串行化 +1.0~4.7% 超 F2 门)→ 定格为单流可选开关,服务化分支关闭**;离线 b32 133 tok/s;**生产栈容量下界 1.070 req/s(1.6× 档双口径 100%,P13)**;短 prompt 四档 Poisson 全 100% SLO(TPOT p95 0.26–0.29);**1k 长上下文:冷缓存需 chunk-1024(0.5 档 90.6% SLO 过门),暖缓存任意 chunk 100%(P13)**。
 
-**已判决(负结果也是结论)**:投机解码 NO-GO(α≈0 且 c=0.39);**I19 判决(P11):b1 固定等待主体 = 逐算子 host launch 开销,分段 replay 可回收 36.2 ms/步**(单算子融合被否定、replay 有效——两条自洽);整图 graph 否决(I29:TP2 引擎级间歇性 MCCL replay 楔死,barrier 无效),**分段图(图内零 MCCL)已验证取代之(tiny→0.6B→8B→30B 全 PASS,跨臂逐位 0 翻转)**;**split=0 与 chunk-2048 默认化均否决(P10 实测)**;profiled placement 不采用;fused RMSNorm / bmm 容量收缩不采用;host-sync 移除与 mixed-split 已采纳默认开;30B 首 batch 为一次性 warmup 态(I31,token 门必丢首 batch)。
+**已判决(负结果也是结论)**:投机解码 NO-GO(α≈0 且 c=0.39);**I19 判决(P11):b1 固定等待主体 = 逐算子 host launch 开销,分段 replay 可回收 36.2 ms/步**(单算子融合被否定、replay 有效——两条自洽);整图 graph 否决(I29:TP2 引擎级间歇性 MCCL replay 楔死,barrier 无效),**分段图(图内零 MCCL)离线验证成立但在线否决(P12)+ 修复验证后仍转正失败(P13:padding 税已除,残余 AR 串行化 +1.0~4.7%)→ 服务化分支关闭,定格单流开关**;**I30 关闭(P13 ABA:现树快于 pre-P8 栈 23–51%,P9 回归主张被否定)**;**I8 长上下文闭合(P13:冷缓存塌=chunk 粒度,chunk-1024 解;准入=稳定性)**;**split=0 与 chunk-2048 默认化均否决(P10 实测)**;profiled placement 不采用;fused RMSNorm / bmm 容量收缩不采用;host-sync 移除与 mixed-split 已采纳默认开;30B 首 batch 为一次性 warmup 态(I31,token 门必丢首 batch)。
 
 ## 1. P12 迭代内容(按优先级;门与判定树见 `benchmarks/P11-serving.md` 与本节)
 
-> P12 执行状态(10-29 晚收官):**P0 在线 A/B 判定已产出 = FAIL**——臂 A'(eager 生产栈)与臂 B'(段图)各 12/12 点全 128/128、双口径 100% SLO,但 TPOT p95 中位 B 比 A **慢 +5.9%(1.0 档)~+14.7%(0.9 档)**,门①PASS/门②③FAIL;B2 同 session 复跑把 B' 复现到 0.1% 内,排除机时污染。归因:桶集 `[1,2,4,8,16,32,48,64]` 整桶 replay,在线并发 14–30 落在桶间产生 padding 税,而 P11 离线门只测 b1/b8/b32(桶边界)看不见。**默认不动,P1 转正取消**。饱和 bracketed(段图臂)1.2/1.4 档双口径全 100%,拐点 ≥1.218 qps 未探到。详见 `benchmarks/P12-serving.md` §P0 判定(最终)与 `docs/HANDOFF.md`。
+> P13 夜间轮执行状态(10-29 23:28 → 10-30 11:45,五项全收官,报告 `benchmarks/P13-*.md`):**① I30 关闭**(ABA 三加载:现树快于 pre-P8 旧栈 23–51%,P9 回归主张否定,旧树已删);**② I33 修复验证+分支关闭**(密桶 1056 图零失败 + pad 回退;padding 税证实并消除:0.9 档 +14.7%→+2.3%;残余 AR 串行化 +4.7% 超 F2 门 → 段图定格单流开关,默认不变);**③ I8/I26 闭合**(冷缓存塌=chunk 粒度,chunk-1024 砍冷 TTFT −56~57%;零 429 零崩;⚠️ 跨 repeat 确定性 prompt→暖缓存口径伪象);**④ 容量下界 1.070 req/s**(1.6× 档双口径 100%,拐点未探到);**⑤ 厂商工单包成文**(docs/E-vendor-ticket.md)。默认值全部未动;`_SEG_BUCKETS`/`_SEG_PAD_RATIO` 以默认惰性保留。
 
 | # | 项 | 门/判定 | 状态 |
 |---|---|---|---|

@@ -14,17 +14,17 @@
 | **S** | P7 投机解码 | S1–S6 |
 | **E** | 生态与厂商（autotune 手搓边界、runtime 限制） | E1–E6 |
 
-**统计（P12 收口后重算：I 30 项 = 已关闭 17 + 未结 13；S 6 项；E 6 项）**
+**统计（P13 夜间轮后重算：I 30 项 = 已关闭 19 + 未结 11；S 6 项；E 6 项）**
 
 | 系列 | 已关闭 | 未结 | 未结条目 |
 |---|---:|---:|---|
-| I 技术债 | 17 | 13 | I1、I2、I3、I12、I14、**I19**、I20、I27、I28、**I30**、**I31**、**I32**、**I33** |
+| I 技术债 | 19 | 11 | I1、I2、I3、I12、I14、**I19**、I20、I27、I28、**I31**、**I32** |
 | S 投机解码 | 1 | 5 | S2–S6（S5 随 S1 搁置） |
 | E 生态厂商 | 0 | 6 | E1、E2（可手搓）、E3–E6（厂商侧） |
 
-已关闭 18 项（I 17 + S1）：I4、I5、I6、I7、I8、I9、I10、I11、I13、I15、I21、I22、I23、I24（部分修）、I25、I26、I29、S1。
+已关闭 20 项（I 19 + S1）：I4、I5、I6、I7、I8、I9、I10、I11、I13、I15、I21、I22、I23、I24（部分修）、I25、I26、**I29、I30、I33**、S1。
 > 编号：I16–I18 已迁入 E 系列（E2/E5/E6），不再单独计数，故 I 系列实际 30 项（I1–I15、I19–I33）。
-> I8 已用有效跑闭合（1.0–1.15k token、384/384、rank1 存活）；三档 SLO 0% 是真实容量结论（瓶颈在 TTFT），见 I8 条目。
+> I8 已用有效跑闭合（1.0–1.15k token、384/384、rank1 存活）；三档 SLO 0% 是真实容量结论（瓶颈在 TTFT），P13 补齐机理与解法（见 I8 条目 P13 终局）。
 
 状态图例：🔴 阻塞主路径／决定立项　🟡 收益被冻结或覆盖缺口　🟢 工程债/低优　⚪ 厂商 runtime，我们不可修
 
@@ -75,6 +75,7 @@
 - **与上轮无效跑的区别**：上轮 18,354 token、8/128 完成、rank1 死亡；本轮 1.0–1.15k token、384/384、rank1 存活。**这次的 0% SLO 是真实容量结论，不是故障。**
 - **下一步**：I26 准入/背压 → I23 mixed step 后端 → prefill chunk 曲线 → 重定长上下文目标 QPS（0.87 是 137-token 口径）。
 - **证据**：`benchmarks/P6-i8-long-context.md`、`benchmarks/data/p6d/p6_i8_long_unique_v2.json`（sha256 `1249e49bcb3de838500bf0e0e9007310597ee27957deddb0c54017cfacaa297e`）、`i8_watch.log`（`dd3b0c1e…`）
+- **P13 终局（10-30，机理+解法闭合）**：I26 准入在 1k 负载端到端验证（1536+ 请求零 429、零崩、无雪崩）；**冷缓存 1k 塌方的机理 = chunk 粒度**——chunk-256 冷 TTFT p50 3.30/4.14/5.07 s 全档塌，chunk-1024 砍到 1.449/1.784/2.201 s（−56~57%），0.5 档冷态即过 ≤2 s 门（90.6% SLO）。**⚠️ 口径发现**：跨 repeat 的 unique prompt 确定性重建 → rep2/3 全命中前缀缓存，"三 repeat 中位"实测的是暖缓存路径（rep2/3 两臂均 100%）；冷容量必须看 rep1 或改 seed-per-repeat。推荐配置：1k 场景 chunk=1024（冷）/前缀缓存（暖）/准入（稳定）三件套；chunk-256 短 prompt 默认不动（P10 门仍有效）。证据：`benchmarks/P13-longctx.md`。
 
 ### I12 🟢 崩溃进程 teardown 卡死
 - **现状**：rank 间 DistBackendError 后主进程挂在退出路径（bmmdense 回归、30B graph A/B 均遇到），需人工按 PID kill。
@@ -111,9 +112,9 @@
 - **I27 sdpa-decode 图的烘焙形状数值限制(🆕 本轮定位)**:capture 时 context_lens=256 固化 kv 窗口形状,SDPA 归约切分随 shape 变 → 1-ulp 级漂移与近平局翻转(tiny MoE graph 5/5 自洽但不等于 eager);paged kernel 循环边界在 device 上,不受影响 → 生产路径(paged)graph==eager bitwise。sdpa 模型要用图需按运行时窗口分桶捕获。
 - **I28 torch.musa 跨块步长视图 D2H 拷贝返回不一致数据(🆕 平台 bug 嫌疑)**:`kv_cache[:, :, blk, 0]`([2,L,kh,d] strided view)的 `.cpu()` 返回 NaN 垃圾,同位置 K/V 分读与 device 侧逐层扫描干净,`.contiguous()` 后仍复现;workaround = contiguous 化或分 K/V 读;影响所有"整读跨块切片"的诊断代码。
 - **I29 TP2 引擎级图 replay 楔死(P9 定性收口,10-28)**:**间歇性 rendezvous 楔死,非结构确定性**。P9 分级探针(`tests/p9_mccl_graph_probe.py` + `p8_graph_padfix --tp 2`)实测:① 纯张量图(96 图内 AR、b32 payload、48×bmm+AR、~2400 节点、**六桶共享 pool 完整复刻引擎 capture/replay 协议**)TP2 全绿零楔死;② TP1 引擎级从未楔死(P8 0.6B/8B 5/5);③ **0.6B TP2 paged 首次 replay 即楔死(3/3 复现,最小复现,2 min 加载)**;④ 0.6B TP2 sdpa 撞过 2 次 generate 后楔死 → paged 提高首中概率但非必要;⑤ **replay 前后 barrier(`NANOVLLM_GRAPH_REPLAY_BARRIER=1`,默认关)不是解**。必要成分 = 引擎 replay 路径(graph_vars 每步 fill/scratch 填充/replay 后贴 eager compute_logits/采样节奏)× TP2 collectives。崩溃形态多变(对称自旋/单 rank 死+另一 rank 旋),均需按 PID kill(I12)。**30B 图双轨门维持结构性阻断,默认 eager 不变**。复活条件:分段图(attention eager + linear/MoE 进图)或厂商 MUSAGraph+MCCL 修复后用本探针回归。证据:`benchmarks/P9-graph.md`、`benchmarks/data/p9/p9_mccl_graph_probe*.json`、`p9_06b_padfix.log`。**P10 进展(分段图原型,`NANOVLLM_SEGMENT_GRAPH=1`,默认关)**:每层两段(AR 全部移出图)的 segment graph 在 TP2 **捕获可行**(tiny 16 图双 rank)且 **replay 首次稳定跑通**(3×3×8 token 零楔死、自洽、token 与整图一致;`tests/p10_segment_smoke.py`)——但全程 LAUNCH_BLOCKING 下;异步捕获仍撞 I3 族偶发与一次 wedge,padfix 双引擎上下文捕获 illegal memory access 未解;0.6B paged GB 门未跑。见 `benchmarks/P10-graph.md`。**P11 进展(两进程口径 + S2/S4 双过,分段路线转已验证)**:padfix 加 `--phase eager|graph` 两进程口径绕开双引擎上下文后,**0.6B TP2 paged S2 主判决 PASS**(224 图/rank 零失败、GB 5/5 bitwise、GC、GA、零楔死,LB 下)+ **异步门 PASS**(无 LB 捕获首攻成功 + GB 5/5 bitwise——分段图在生产模式数值正确且稳定)。P10 的异步偶发与双引擎 illegal access 本轮 3/3 全部未复现(含 SEG_DEBUG 打点版)——illegal access 降级为偶发未复现、打点开关保留。**P11 P4 收口(全梯子验证完成)**:8B 门 PASS(288 图零失败、GB 5/5 bitwise、异步零楔死)+ **30B 双轨门五项全 PASS**(768 图/rank 零失败、跨臂逐位 0 翻转 b1/b8/b32、显存 +0.00 GiB、b1 decode **−23.7%**(152.85→116.63 ms)超 ≥+15% 转正门;b8 持平、b32 +3.8% 真实回退)。**I19 固定等待判决:b1 的 ~36 ms/步确为逐算子 host launch 开销,replay 可回收**。**P12 终局:L3 在线 A/B 判定 FAIL**——四档 TPOT p95 比 eager 慢 5.9–14.7%(门②③均不过),B2 同 session 复跑把 B' 复现到 0.1% 内;归因见 I33。**分段图不转正,默认 eager 不变,仅单流场景可显式开**。见 `benchmarks/P11-graph.md`、`benchmarks/P12-serving.md` §P0 判定。
-### I30 🟡 短 prompt TPOT p95 相对 v4-era 回归 +13~16%（P9-P4 开，P10 收窄）
+### I30 ✅ 已关闭（P13 ABA 定案，10-30）：「现行栈回归」主张被否定，方向反转
 
-137-token Poisson 矩阵 TPOT p95 0.87 档 0.387–0.397 vs v4 门 0.343,跨 repeats 稳定非噪声;SLO/TTFT 门均 PASS。**P10 已排除候选①(mixed-split 税)**:split=0 时 0.5 档 TPOT p95(0.335–0.348)与 split=1(0.332–0.350)重合,且 split=0 高负载 SLO 崩塌(1.0 档 23–62%)、attempt1 服务器段错误失稳 → split=1 默认维持,该路径关闭(证据 `benchmarks/P10-serving.md`)。剩余候选:② P8 期累积改动二分;③ **跨轮口径复核**(v4 的 0.327 为单跑,先补同矩阵重复测量再谈回归)。下一步:③先行(零代码,一发加载),再决定是否做②。**P11 进展**:③ 已实施但中止——pre-P8 树(`d5779b6`)重放同矩阵,旧栈 0.5 档实速 ~12 min/跑(慢于预期 2.4×,I24 修复缺席所致),收尾窗口内仅得 0.5 档 ×2 SLO 数据(无 TPOT p95 判定)→ 判定未产出;下轮按旧栈实速重排预算(全矩阵 ×3 ≈ 2h,或 0.9/1.0 两档 ×3 ≈ 50 min),判定树冻结在 `benchmarks/P11-serving.md`。
+**终局（同 session ABA：旧树 d5779b6 → 现树 → 旧树，三加载）**：现树两档 TPOT p95（0.9:0.2612、1.0:0.2894）**全部 12 个 repeat 配对快于旧树 23–51%**（旧树 1.0 档 0.580/0.588，slo_standard 仅 ~75%；现树 6/6 全 100% 双口径）。判定脚本标 INVALID 仅因旧臂自身 CV 8.5–12.1%（旧栈慢且噪），关闭条件「当前两档均≤两旧臂」逐字满足且余量压倒。**P9 的 0.387–0.397 与 v4 单跑 0.327 归入机时状态/单跑口径伪象**（与 P12 臂 A′ 0.2691 互证）。v4 门 TPOT p95 ≤0.343 保持为生产回归门（现树 0.26–0.29 达标）。证据：`benchmarks/P13-i30.md`、`benchmarks/data/p13/aba_*.json`。历史记录：P9 发现 0.87 档 0.387–0.397 超 v4 门 0.343 → P10 排除 mixed-split 税 → P11 复核中止 → P13 ABA 定案关闭。
 
 ### I31 🟡 30B 进程首个 batch 与稳态逐位不同（一次性 warmup 态跃迁，P11 发现）
 
@@ -132,6 +133,7 @@
 - **处置**:段图维持默认关(仅单流可显式开)。若要在多并发下复活:① 12–32 间加密桶(步长 4,图数 768→~1200,先核图池显存);② `cap/bs > 1.15` 自动回退 eager;③ **离线门必须补 b12/b20/b24**。
 - **普适教训**:任何"按桶捕获"的路径,验收门里必须有**非桶边界**的 batch 点,否则 padding 税必然漏。
 - **证据**:`benchmarks/P12-serving.md` §P0 判定、`benchmarks/data/p12/p12_online_arm{A2,B2}.json`、`p12_ab_verdict{,_samesession}.json`。
+- **P13 终局(10-30,✅ 闭合:修复已实现并验证,分支定格关闭)**:①0.6B 探针判定力不足(阶跃仅 +3.3%,设备计算太小);②**修复实现**——`NANOVLLM_SEGMENT_GRAPH_BUCKETS=dense`(vLLM 式 11 桶,30B 1056 图/rank 零失败 37.06 GiB)+ `NANOVLLM_SEGMENT_GRAPH_PAD_RATIO=0.15`(cap/bs>1.15 该步回退 eager),**默认惰性**;0.6B paged bitwise 门 10/10 全等、回退精确触发;③**30B 同 session A/B**:padding 税被证实并移除(0.9 档 +14.7%→+2.3%,0.5 档 +7.3%→+1.0%),四档 SLO 全 100%,但 1.0 档残余 +4.7% 超 F2 门(+2%)、F3 红利门 FAIL → **转正失败,分支关闭**;残余 +1.0~4.7% 恰等于 P11 桶边界固有开销(b8+0.5%/b32+3.8%)= **每层 2 次 eager AR 串行化**,属 I29 范畴(AR 进图需整图,已否决)。**分段图定格为单流可选开关;该服务化路线不再投入。**证据:`benchmarks/P13-{padding,fix}.md`、`benchmarks/data/p13/fix_*`。
 
 
 > 详细论证见 git 历史 `docs/P7-speculative-decoding-survey.md`(必要性、选型、判决表)与 `docs/P7-implementation-plan.md`(代码方案、算法、测试门);判决报告见 `benchmarks/archive/P7-*.md`。

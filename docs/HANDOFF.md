@@ -1,59 +1,63 @@
-# HANDOFF — 当前交接(滚动更新;本版 = P12 判定收官,2026-10-29 晚)
+# HANDOFF — 当前交接(滚动更新;本版 = P13 夜间迭代收官,2026-10-30)
 
 > 本文是**唯一交接文档**(历史版本在 git 历史)。接手先读本文,再按 [AGENTS.md](../AGENTS.md) 核验环境与命令。规则不变:先写门再跑;一次一个 GPU 任务;负结果照录;本地 commit(不 push 除非用户授权);到点无论进度必须停下写交接、清服务器。
+> 配套文档:[docs/PROMPT-P13.md](./PROMPT-P13.md)(任务书)、[docs/P13-survey.md](./P13-survey.md)(业界调研)、[docs/E-vendor-ticket.md](./E-vendor-ticket.md)(厂商工单,成文待发)、[docs/RESUME.md](./RESUME.md)(面试材料)。
 
-## 0. 30 秒状态
+## 0. 三十秒状态
 
-- **仓库**:`feat/musa-port`;P12 判定轮已本地 commit(未 push)。
-- **服务器**:已清零核验(双卡 0 MiB、无进程、shm 干净)。`/root/moe-server-p6d`(P2 预部署旧树)仍保留,用完删。**ssh key 认证已自愈**(10-29 19:34 实测 `s/^BatchMode` 直连成功),无需密码;若再遇 `Exceeded MaxStartups`,等 60–90 s 再连并改用 ControlMaster 复用,不要密集重试。
-- **生产栈(未变)**:`triton_paged` + `grouped_mm`(prefill)/`bmm_dense`(decode) + **`enforce_eager=True`** + `stall_free` + TP2/EP2 + chunk-256。
-- **P12 结论一句话**:分段图离线 b1 **−23.7%**,但**在线 A/B 判定 FAIL**(四档 TPOT p95 比 eager 慢 5.9–14.7%),**默认不翻转**,P1 转正取消。原因=桶集 padding 税(详见 §2、`benchmarks/P12-serving.md`)。
+- **仓库**:`feat/musa-port`;P13 夜间迭代全部本地 commit(未 push)。
+- **服务器**:已清零核验(双卡 0 MiB、无进程、shm 干净、`/tmp/nanovllm-p13.lock` 已删)。`/root/moe-server-p6d`(pre-P8 旧树)**已删**(I30 定案后用毕)。证据 JSON 已拉回本地 `benchmarks/data/p13/`(sha256 见 §6);服务器 `/root/p13_data/` 保留全量日志与 meta。
+- **生产栈(未变)**:`triton_paged` + `grouped_mm`(prefill)/`bmm_dense`(decode) + `enforce_eager=True` + `stall_free` + TP2/EP2 + chunk-256。**默认值全部未动**;`_SEG_BUCKETS`/`_SEG_PAD_RATIO` 两个新 env 开关默认惰性(见 §3-1)。
+- **P13 一句话**:四个硬骨头全有终局——**I30 关闭**(ABA,方向反转)、**I33 关闭**(修复已验证但残余 AR 串行化超门 → 段图定格单流开关)、**I8/I26 闭合**(冷缓存塌=chunk 粒度)、**容量下界 1.070 req/s**;外加厂商工单成文。
 
-## 1. 本轮(P12 判定轮)进展(证据 `benchmarks/P12-serving.md` §P0 判定)
+## 1. P13 五项结论(报告 `benchmarks/P13-*.md`)
 
-| 项 | 状态 | 关键事实 |
+| 项 | 判定 | 关键数字 |
 |---|---|---|
-| 开工回归四套 | **全绿** | `p2_grouped_mm` rc=0(六配置全等+round_robin+确定性)、`p6_bmm_dense_tiny` rc=0、`test_benchmarking_v3` 15 passed、`p8_scheduler_gaps` 6/6 |
-| **P0 在线 A/B 判定** | **已产出 = FAIL** | 门① PASS(SLO 四档 100%,0.9 档 strict 差 1/128 内)、门② FAIL(1.0 档 B 0.2848 > A 0.2691)、门③ FAIL(0.5 档 B 慢 7.3%) |
-| 臂 A'(eager 生产栈) | 完成 | 12/12 点 128/128、双口径 100%;init 与 B' 对称(723 blocks/rank、maxseq64);JSON sha256 `a25f9b52…48d604e8` |
-| 臂 B2(段图复跑) | 完成 | 与 19 h 前的 B' **逐档重合**(1.0 档 0.2848 vs 0.28481)→ 排除机时污染;JSON sha256 `f966d103…178d683` |
-| 归因 | 机制已定位 | `graph_bs=[1,2,4,8,16,32,48,64]` 整桶执行;在线并发 14–30 落在桶间 → padding 行照算 attention/MoE;而 P11 离线门只测 b1/b8/b32(全是桶边界),结构性看不见 |
-| P1 转正落地 | **取消** | 前置判定 FAIL,按冻结门不动默认 |
-| P2 I30 v4 复核 | 未跑 | 旧树 `/root/moe-server-p6d` 已预部署 |
+| **I30 定案**(ABA 三加载,23:34–00:53) | **关闭——方向反转** | 现树两档全部 12 repeat 配对快于 pre-P8 旧树 **23–51%**(1.0 档 0.2894 vs 0.5800/0.5877;现树 CV≤3%、双口径 100%;旧树 slo_standard 仅 ~75%);字面 INVALID 仅因旧臂 CV 8.5–12.1%;P9 的 0.387 与 v4 0.327 = 机时/单跑伪象 |
+| **I33 padding 探针**(0.6B,22:45–23:17) | 判定力不足,机制转 fix A/B 判定 | b16→b17 阶跃仅 +3.3%(0.6B 设备计算太小);segment 臂 CV≤0.6%、跨模式 token 全等 |
+| **I33 修复验证 + 分支关闭**(密桶+回退,08:45–11:45) | F1 PASS / **F2 FAIL(+4.7%>2%)** / F3 FAIL → **服务化分支关闭** | 30B 捕获 11 桶 **1056 图/rank 零失败 37.06 GiB**;0.6B bitwise 门 10/10、回退精确触发;**padding 税证实并移除**(0.9 档 +14.7%→+2.3%,0.5 档 +7.3%→+1.0%);残余 +1.0~4.7% = P11 桶边界固有开销 = 每层 2 次 eager AR 串行化(I29 范畴);四档 SLO 全 100% |
+| **I8/I26 长上下文**(chunk-256/1024 两臂,01:29–03:09) | **闭合(机理+解法)** | 冷缓存塌=chunk 粒度:chunk-1024 砍冷 TTFT p50 −56~57%(3.30/4.14/5.07→1.449/1.784/2.201 s),0.5 档冷态 90.6% SLO 过 ≤2s 门;1536+ 请求**零 429 零崩**(I26 端到端稳定);暖缓存两臂 100% |
+| **eager 容量**(00:59–01:29) | **下界 1.070 req/s** | 1.0/1.2/1.4/1.6 档 ×3 全部双口径 100%、并发至 57、TPOT p95 ≤0.46;拐点未探到;高于 I7 旧栈 0.94 与段图臂 1.036 |
 
-## 2. 已判决不要再碰(累计)
+## 2. 已判决不要再碰(累计,新增 P13 三项)
 
-投机解码 NO-GO;I19 "融合换步时"否定(replay 有效已判决);整图 graph TP2 否决(I29);**分段图在线转正否决(P12:收益仅 b1,批量 ≥~8 净负)**;split=0 与 chunk-2048 默认化否决(P10);profiled placement 不采用;fused RMSNorm/容量收缩不采用;host-sync 移除与 mixed-split 已采纳;paged 已转正;tiny sdpa GB 门不适用(I27);双引擎 illegal access 按偶发记录不追。
+投机解码 NO-GO;I19 融合换步时否定;整图 TP2 否决(I29);**分段图在线转正否决并修复后关闭(P12+P13:残余 AR 串行化,单流开关为止)**;**I30 回归主张否定关闭**;**I8 长上下文机理闭合**;split=0/chunk-2048 短 prompt 默认化否决(P10);fused RMSNorm/容量收缩/placement 不采用;host-sync/mixed-split 已采纳;paged 已转正;I31 首 batch 丢弃协议。
 
 ## 3. 下轮 Top-N
 
-> **本轮任务书 = [docs/PROMPT-P13.md](./PROMPT-P13.md)**(自包含:环境/命令/已判决清单/五项攻坚的假设与冻结门/红线/验收)。下表是它在 HANDOFF 里的摘要;冲突时以任务书为准。
-
 | 优先 | 项 | 说明 |
 |---|---|---|
-| **0** | **I30 定案(同 session 新旧树 ABA)** | 不去追 0.343 绝对门(绑机器状态),改看相对差:现树 ≤ 旧树 → 关闭 I30。~1.2 h,2 次加载 |
-| **1** | **I33 padding 税实测(b16 vs b17)** | 0.6B 零 30B 加载,~1 h。阶跃成立 → 图路径定性"单流专用",分支关闭 |
-| **2** | **1k 长上下文端到端(I8/I26 从未复测)** | 必须同时报**拒绝率**,否则等于用 429 刷 SLO。~1.5 h,1 次加载 |
-| **3** | **eager 生产栈容量上界** | 现有饱和数据只覆盖段图臂;eager 上界未知。可与 P2 同一次加载,~45 min |
-| 4 | (可选大课题)KV 量化 I20 | 1–2 天新课题,先做 int8 可行性探针,**不建议本轮做** |
-| 5 | 若要复活图:先做密桶/`cap/bs` 回退 | 先看复活门:**1.0 档须优于 eager ≥3%**,持平不值得 |
+| 1 | 发厂商工单 | `docs/E-vendor-ticket.md` 成文待发(developer.mthreads.com 或 vllm-musa GitHub issues)。四个问题:引擎级图 replay 楔死、~2048 图可执行上限求证、grouped_mm 捕获姿态、watchdog/图级诊断 |
+| 2 | 饱和上界补测(可选) | eager 到 1.6×(1.070 req/s)仍 100%;`--fractions 1.8,2.0` 找拐点(~30 min,一发加载) |
+| 3 | 1k 冷态 1.0 档(可选) | chunk-1024 冷态 1.0 档 TTFT p50 2.2 s 未过门;试 chunk-2048 冷态单点(~20 min) |
+| 4 | 客户端改进 | `benchmark_online.py` 加 `--prompt-seed-per-repeat`(每 repeat 换 seed)——§4-1 暖缓存口径伪象的根治;改动小、零 GPU |
+| 5 | (远期)I20 KV 量化 | 先做 torch_musa int8 转换带宽探针(30 min)再立项;参照 IPEX-LLM/OpenVINO 路线(见 P13-survey §3) |
+
+**不要做**(已关闭或已否决):分段图服务化方向(AR 进图需整图,I29)、norm/rope 单点融合、EAGLE3(前置 I19)、chunk-256→2048 默认化(P10 门)。
 
 ## 4. 本轮新 SOP/坑
 
-1. **离线图门必须测非桶边界 batch**。桶集 `[1,2,4,8,16,32,48,64]` 整桶 replay,P11 只测 b1/b8/b32 = pad 比 1.0,于是 b9–b31 的 padding 税被系统性漏掉,直到在线矩阵才暴露。以后任何"按桶捕获"的改动,门里必须有 b12/b20/b24 之类的中间点。
-2. **跨时段的 A/B 必须补同 session 复跑**。P12 的 A' 与 B' 相隔 19 h(含一次 ssh 失联),B2 复跑把 B' 复现到 0.1% 以内才让判定立住。以后两臂尽量相邻跑;不得不隔时,必须补一次复现臂。
-3. **`EADDRINUSE` 是已知 flake 不是回归**。`llm_engine._get_distributed_init_method` 先 bind 临时端口再关 socket,torch 随后 rebind,存在极小竞态(`llm_engine.py:19-29`)。本轮 `p2_grouped_mm` 首次即撞上,单独重跑 rc=0。遇到先重跑一次,不要当代码回归。
-4. **ssh 两种失败形态要分开**:`Exceeded MaxStartups` = 自己握手太密 → 等 60–90 s 再连、用 ControlMaster 复用;`Permission denied (publickey)` = 服务端认证状态坏 → 见下方旧 SOP。
-5. (继承)api_server 默认 ≠ 生产栈:必须显式 `--decode-moe-backend bmm_dense`;段图上服务必须 `--max-num-seqs ≤ ~64`;detached 链跨会话存活,恢复连接先查产物目录再重跑;运行时切后端用 `runner.call`;pgrep 用 `^/usr/bin/python3|^python3|^[s]pawn_main`;30B token 门丢首 batch(I31)。
+1. **跨 repeat 的 unique prompt 是确定性重建的**(`benchmark_online.py:180-195`,prompt 含 seed+request_id)→ rep2/3 全部命中前缀缓存。**"三 repeat 中位"在 unique 模式度量的是暖缓存路径**;冷容量看 rep1 或等 seed-per-repeat 功能落地。在线报告永远按 repeat 拆开看。
+2. **tiny 模型不能跑 triton_paged**(head_dim=128/page=256/GQA 约束);tiny 上 sdpa 图有 I27 漂移(graph≠eager)→ **跨模式 bitwise 门只能在 0.6B paged 上下**。冒烟测试断言错在这里误报过一次。
+3. **服务停掉后 /dev/shm/nanovllm_* 可能残留**(rank 子进程清理未走完)→ 停服务前扫 `/proc/<pid>/fd` 记 owned shm,kill 后删(`p13_run.py`/`p13_fix_chain.py` 已实现);残留时 `fuser` 确认无人持有再删。链里 idle() 拦住这种残留是**正确行为**,不要绕过。
+4. **旧栈 repeat 噪声大**(0.87 qps 高载档 CV 8–12%):跨栈 A/B 必须同 session ABA 包夹;旧臂 CV 超限会把判定打成 INVALID——方向性结论看配对方向,正式门看 CV。
+5. (继承)EADDRINUSE 端口竞态 flake 单独重跑;MaxStartups 冷却 60–90 s;锚定 pgrep;api_server 默认 ≠ 生产栈(必须 `--decode-moe-backend bmm_dense`);ssh 偶发 DNS 解析失败/网关瞬断 = 重试即可。
 
 ## 5. 红线
 
-见 [AGENTS.md](../AGENTS.md);重申:`NANOVLLM_SEGMENT_GRAPH` 默认**关**(在线判定 FAIL,不翻);`enforce_eager` 生产默认**True**(不动);远端伪 `.git` 绝不提交;一次一个 GPU 任务;本地 commit,不 push 除非用户明确授权。
+见 [AGENTS.md](../AGENTS.md);重申:默认值全部不动(`enforce_eager=True`、`NANOVLLM_SEGMENT_GRAPH=0`、`_SEG_BUCKETS=default`、`_SEG_PAD_RATIO=0`);段图分支已关闭,不再为其开实验;远端伪 `.git` 绝不提交;本地 commit 不 push 除非授权;一次一个 GPU 任务;离线图门(若将来任何按桶捕获复活)**必须含非桶边界 batch 点**。
 
-## 6. 证据索引(本地 `benchmarks/data/p12/`)
+## 6. 证据索引(本地 `benchmarks/data/p13/`)
 
-- `p12_online_armA2.json` / `.log`(臂 A' 生产栈,sha256 `a25f9b52…48d604e8`)、`p12_online_armB2.json`(段图复跑,sha256 `f966d103…178d683`)
-- `p12_online_armB.json`(段图首测,sha256 `a3d8e177…31026d8`)、`p12_sat_armB.json`(饱和,sha256 `6087244b…7931cf`)
-- `p12_ab_verdict.json`(A' vs B')、`p12_ab_verdict_samesession.json`(A' vs B2)
-- `p12_online_armA_groupedmm_decode.*`(首轮口径错误,作废留证)、`p12_online_armA2_partial.log`(早先 5/12 点)
-- 冻结门与全程记录:`benchmarks/P12-serving.md`;服务器侧 `/root/p12_api_arm{A2,B2}.log`
+| 文件 | sha256 前缀 | 内容 |
+|---|---|---|
+| `aba_A1/A2_B.json` ×3 | `d8b75297…`/`d5072a3c…`/`d30ae384…` | I30 三加载矩阵 |
+| `aba_verdict.json` | `c476e929…` | ABA 判定(两档字面 INVALID,关闭条件满足) |
+| `capacity.json` | `ddb96829…` | eager 容量 1.0–1.6× |
+| `long256.json`/`long1024.json`/`long256_repeat.json` | `06fceda8…`/`4b8d663e…`/`eb00ec55…` | 长上下文两臂+暖缓存复测 |
+| `padding_verdict.json` | `a41cf607…` | 0.6B padding 探针 |
+| `fix_eager.json`/`fix_segment.json` | `3a254c72…`/`c37b62af…` | 修复 A/B 两臂 |
+| `fix_verdict.json`/`fixprobe_verdict.json` | `c37ad217…`/`081cbd25…` | 修复判定/0.6B bitwise 门 |
+
+冻结门与五字段报告:`benchmarks/P13-{i30,padding,fix,longctx,capacity}.md`;执行器:`scripts/p13_run.py`(aba/serving 相)、`scripts/p13_fix_chain.py`(修复相,`--resume-from` 支持续跑);服务器侧全量日志 `/root/p13_data/*.log`、meta json(含源码 sha256)。

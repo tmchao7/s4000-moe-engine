@@ -123,9 +123,20 @@ def service(name, segment_fix=False):
 
 
 def stop_service(proc):
-    import signal
+    # Track the engine's shm before killing (same protocol as p13_run.stop_service);
+    # a lingering nanovllm_* fd left by the dead engine otherwise trips idle().
+    owned_shm = set()
+    for fd in Path(f'/proc/{proc.pid}/fd').glob('*'):
+        try:
+            target = Path(os.readlink(fd))
+            if target.parent == Path('/dev/shm') and target.name.startswith('nanovllm'):
+                owned_shm.add(target)
+        except OSError:
+            pass
     clean(proc)
-    time.sleep(5)
+    time.sleep(3)
+    for path in owned_shm:
+        path.unlink(missing_ok=True)
     idle()
 
 
@@ -142,6 +153,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--deadline', type=float, required=True)
     ap.add_argument('--skip-wait', action='store_true')
+    ap.add_argument('--resume-from', choices=['probe', 'eager', 'segment'], default=None,
+                    help='skip already-completed phases (eager arm JSON must exist)')
     args = ap.parse_args()
     DEADLINE = args.deadline
     if not args.skip_wait:
@@ -156,29 +169,32 @@ def main():
         lock.write(str(os.getpid())); lock.flush()
         try:
             # Phase 1: tiny smoke (capture + replay + token self-consistency).
-            run('fix_tiny_smoke', [PY, 'tests/p13_segment_fix_smoke.py'], timeout=1500)
-            # Phase 2: 0.6B tokens/steps with dense+fallback vs eager reference.
-            batches = '6,8,9,12,15,16,17,20,24,32'
-            common = ['--model', '/root/autodl-tmp/models/Qwen3-0.6B', '--dense',
-                      '--batches', batches, '--rounds', '3',
-                      '--prompt-tokens', '128', '--decode-tokens', '80']
-            for i in (1, 2):
-                idle()
-                run(f'fixprobe_eager_{i}', [PY, 'tests/p11_step_ab.py', '--mode', 'eager',
-                    *common, '--output', str(DATA / f'fixprobe_eager_{i}.json')], timeout=1200)
-                idle()
-                run(f'fixprobe_segment_{i}', [PY, 'tests/p11_step_ab.py', '--mode', 'segment',
-                    *common, '--output', str(DATA / f'fixprobe_segment_{i}.json')],
-                    timeout=1200, env_extra=dict(FIX_ENV))
-            run('fixprobe_verdict', [PY, 'scripts/p13_decide.py', 'padding',
-                *[str(DATA / f'fixprobe_{m}_{i}.json') for i in (1, 2) for m in ('eager', 'segment')],
-                '--output', str(DATA / 'fixprobe_verdict.json')], timeout=600)
+            if args.resume_from is None:
+                run('fix_tiny_smoke', [PY, 'tests/p13_segment_fix_smoke.py'], timeout=1500)
+                # Phase 2: 0.6B tokens/steps with dense+fallback vs eager reference.
+                batches = '6,8,9,12,15,16,17,20,24,32'
+                common = ['--model', '/root/autodl-tmp/models/Qwen3-0.6B', '--dense',
+                          '--batches', batches, '--rounds', '3',
+                          '--prompt-tokens', '128', '--decode-tokens', '80']
+                for i in (1, 2):
+                    idle()
+                    run(f'fixprobe_eager_{i}', [PY, 'tests/p11_step_ab.py', '--mode', 'eager',
+                        *common, '--output', str(DATA / f'fixprobe_eager_{i}.json')], timeout=1200)
+                    idle()
+                    run(f'fixprobe_segment_{i}', [PY, 'tests/p11_step_ab.py', '--mode', 'segment',
+                        *common, '--output', str(DATA / f'fixprobe_segment_{i}.json')],
+                        timeout=1200, env_extra=dict(FIX_ENV))
+                run('fixprobe_verdict', [PY, 'scripts/p13_decide.py', 'padding',
+                    *[str(DATA / f'fixprobe_{m}_{i}.json') for i in (1, 2) for m in ('eager', 'segment')],
+                    '--output', str(DATA / 'fixprobe_verdict.json')], timeout=600)
             # Phase 3: 30B eager arm (frozen matrix).
-            proc = service('api_fix_eager')
-            try:
-                bench('fix_eager', '0.5,0.75,0.9,1.0')
-            finally:
-                stop_service(proc)
+            if args.resume_from in (None, 'eager'):
+                proc = service('api_fix_eager')
+                try:
+                    bench('fix_eager', '0.5,0.75,0.9,1.0')
+                finally:
+                    stop_service(proc)
+            assert (DATA / 'fix_eager.json').exists(), 'fix_eager.json missing'
             # Phase 4: 30B segment+fix arm (frozen matrix + saturation).
             proc = service('api_fix_segment', segment_fix=True)
             try:
