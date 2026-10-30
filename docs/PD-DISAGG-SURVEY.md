@@ -433,3 +433,11 @@ nanoPD 公式照抄,四参数 + bandwidth 在 S4000 重测(profiler 的 prefill/
 **工程参考**: [Sarathi-Serve / KV Transfer Math(dev.to)](https://dev.to/wolfsea2357/prefilldecode-disaggregation-in-vllm-the-kv-transfer-math-that-decides-if-it-pays-off-13j8) · [阿里云 eRDMA 双机部署指南](https://help.aliyun.com/zh/ecs/user-guide/qwen3-235b-a22b-model-of-dual-machine-deployment-based-on-erdma) · [NVIDIA 论坛双卡 LMCache P/D 教程](https://forums.developer.nvidia.com/t/disaggregated-prefill-decode-split-using-lmcache-dual-nvidia-rtx-pro-6000-blackwell/360634) · [dstack P/D 指南](https://dstack.ai/blog/pd-disaggregation) · [TaiChi 混合调度](https://arxiv.org/abs/2505.19050)
 
 **本地代码**: nanoPD 关键文件 `nanoPD/workers/kv_transfer.py`(82 行,传输切面)、`router/central_scheduler.py`(状态机)、`cost_model/`(公式);本仓库集成面 `nanovllm/engine/model_runner.py:572-587`(prepare_decode 天然兼容外来序列)、`engine/scheduler.py:152-233`、`engine/block_manager.py`。
+
+## P14 补充:单机侧 M0 探针结果(2026-10-30,只读,未安装任何东西)
+
+- **NIC**:`lspci` 见 ConnectX-6(MT28908);`/sys/class/infiniband` 有 `mlx5_0`、`mlx5_1`、`mlx5_bond_0`;容器内网口仅 `eth0`(veth),RDMA 设备可见。
+- **GPUDirect RDMA 前置**:`lsmod` 已加载 `mt_peermem`(依赖 `ib_uverbs`、被 `mtgpu` 使用)。
+- **拓扑**(`mthreads-gmi topo -m`):GPU0↔GPU1 为 MPB;两卡与 NIC0/NIC1 均为 NODE(同 NUMA 0),NIC2 为 SYS。
+- **mooncake**:`pip download mooncake-transfer-engine-musa --no-deps` 成功取得 `0.3.13.post1` cp310 manylinux wheel(33 MB);**未安装**(红线:不改 site-packages;安装验证留给有第二台机器的下一轮)。
+- **仍缺**:两机带宽/RDMA 实测(无第二台机器)。

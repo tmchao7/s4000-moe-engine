@@ -195,6 +195,23 @@ def build_prompt(prompt_word, prompt_words, prompt_mode, seed, request_id):
     raise ValueError(f"unsupported prompt mode: {prompt_mode}")
 
 
+PROMPT_SEED_STRIDE = 1_000_003  # prime; keeps per-repeat seed spaces disjoint
+
+
+def repeat_prompt_seed(base_seed, repeat, per_repeat):
+    """Seed used to build prompts for a given repeat (1-based).
+
+    Default (per_repeat=False) returns the base seed for every repeat, which
+    makes unique prompts identical across repeats -> repeats 2..N hit the
+    prefix cache and measure the warm path (P13 long-context artefact, I8).
+    With per_repeat=True repeat 1 keeps the base seed (comparable with older
+    runs) and every later repeat gets a disjoint seed, so each repeat is cold.
+    """
+    if not per_repeat:
+        return base_seed
+    return base_seed + (repeat - 1) * PROMPT_SEED_STRIDE
+
+
 def calibrate_prompt_words(tokenizer, prompt_word, prompt_mode, seed, target_tokens,
                            max_iterations=8):
     """Find a word count whose chat-templated prompt lands near ``target_tokens``.
@@ -660,14 +677,17 @@ async def async_main(args):
             }
         print(f"[online] prompt calibration={calibration}", flush=True)
 
+    # Mutable so the repeat loop can switch seeds (--prompt-seed-per-repeat).
+    prompt_seed = {"value": args.seed}
+
     def prompt_for_request(request_id):
         if args.prompt_mode == "mixed":
             bucket = mixed_bucket(request_id)
             return build_prompt(
-                args.prompt_word, mixed_words[bucket], "unique", args.seed, request_id
+                args.prompt_word, mixed_words[bucket], "unique", prompt_seed["value"], request_id
             )
         return build_prompt(
-            args.prompt_word, prompt_words, args.prompt_mode, args.seed, request_id
+            args.prompt_word, prompt_words, args.prompt_mode, prompt_seed["value"], request_id
         )
 
     limits = httpx.Limits(
@@ -679,8 +699,15 @@ async def async_main(args):
         points = []
         summaries = []
         gpu_sampler.phase = "measure"
+        prompt_seeds_used = []
         for point_index, fraction in enumerate(args.fractions):
             for repeat in range(1, args.repeats + 1):
+                prompt_seed["value"] = repeat_prompt_seed(
+                    args.seed, repeat, args.prompt_seed_per_repeat
+                )
+                prompt_seeds_used.append(
+                    {"fraction": fraction, "repeat": repeat, "prompt_seed": prompt_seed["value"]}
+                )
                 if args.mode == "concurrency":
                     rows, before, after, max_concurrency = await run_point_concurrency(
                         client, args, fraction, point_index, repeat,
@@ -743,6 +770,8 @@ async def async_main(args):
         "arrival_pattern": args.arrival_pattern if args.mode != "concurrency" else None,
         "seed": args.seed,
         "prompt_mode": args.prompt_mode,
+        "prompt_seed_per_repeat": args.prompt_seed_per_repeat,
+        "prompt_seeds_used": prompt_seeds_used,
         "prompt_words": prompt_words,
         "prompt_words_mixed": mixed_words,
         "prompt_tokens_target": args.prompt_tokens or None,
@@ -828,6 +857,12 @@ def main():
         "--prompt-mode", choices=("shared", "unique", "mixed"), default="shared",
         help="shared preserves the historic prefix-sharing workload; unique disables "
              "full-block reuse; mixed sends 3:4:3 short/medium/long prompts",
+    )
+    parser.add_argument(
+        "--prompt-seed-per-repeat", action="store_true",
+        help="use a different prompt seed for every repeat (repeat 1 keeps --seed) so "
+             "unique prompts never hit the prefix cache across repeats; default off = "
+             "historic behaviour (repeats 2..N measure the warm-cache path)",
     )
     parser.add_argument("--arrival-pattern", choices=("fixed", "poisson"), default="poisson")
     parser.add_argument("--seed", type=int, default=20261026)

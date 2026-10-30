@@ -1,6 +1,9 @@
 import atexit
 import json
+import os
 import socket
+import sys
+import threading
 import uuid
 from collections import Counter
 from dataclasses import fields
@@ -62,15 +65,53 @@ class LLMEngine:
         self.forward_time_total = 0.0
         self.metrics_path = config.metrics_path
         self.last_step_metrics = None
+        self._shm_name = config.shm_name
         atexit.register(self.exit)
+
+    def _force_exit(self):
+        """Last-resort teardown when a rank is wedged in exit (I12).
+
+        Runs on the watchdog thread: kill spawned ranks, best-effort unlink the
+        shared-memory segment, then leave without running further atexit hooks.
+        """
+        print(
+            "[engine] exit watchdog fired: teardown still blocked; killing ranks "
+            "and forcing process exit (I12)",
+            file=sys.stderr, flush=True,
+        )
+        for p in getattr(self, "ps", []):
+            try:
+                p.kill()
+            except Exception:
+                pass
+        name = getattr(self, "_shm_name", "")
+        if name:
+            try:
+                os.unlink(f"/dev/shm/{name}")
+            except OSError:
+                pass
+        os._exit(0)
 
     def exit(self):
         if not hasattr(self, "model_runner"):
             return
-        self.model_runner.call("exit")
-        del self.model_runner
-        for p in self.ps:
-            p.join()
+        # I12: a wedged rank (DistBackendError, stuck barrier) used to hang the
+        # main process in this path and needed a manual kill by PID. A daemon
+        # timer now bounds the teardown; NANOVLLM_EXIT_TIMEOUT_S=0 disables it.
+        timeout = float(os.environ.get("NANOVLLM_EXIT_TIMEOUT_S", "60"))
+        watchdog = None
+        if timeout > 0:
+            watchdog = threading.Timer(timeout, self._force_exit)
+            watchdog.daemon = True
+            watchdog.start()
+        try:
+            self.model_runner.call("exit")
+            del self.model_runner
+            for p in self.ps:
+                p.join()
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):

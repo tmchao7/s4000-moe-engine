@@ -208,6 +208,26 @@ def test_mixed_bucket_distribution():
     assert counts["long"] == 300
 
 
+def test_prompt_seed_per_repeat_changes_unique_prompts():
+    module = _load_client_module()
+    base = 20261026
+
+    def prompts(per_repeat, repeat, ids=range(8)):
+        seed = module.repeat_prompt_seed(base, repeat, per_repeat)
+        return [module.build_prompt("benchmark", 16, "unique", seed, i) for i in ids]
+
+    # default (off): every repeat rebuilds byte-identical prompts -> warm prefix cache
+    assert prompts(False, 1) == prompts(False, 2) == prompts(False, 3)
+    # on: repeat 1 keeps the historic seed, so it is comparable with older runs
+    assert module.repeat_prompt_seed(base, 1, True) == base
+    assert prompts(True, 1) == prompts(False, 1)
+    # on: later repeats share no prompt string with any other repeat (cold path)
+    r1, r2, r3 = prompts(True, 1), prompts(True, 2), prompts(True, 3)
+    assert not (set(r1) & set(r2)) and not (set(r2) & set(r3)) and not (set(r1) & set(r3))
+    # no shared first word either, so even a 1-block prefix cannot be reused
+    assert not ({p.split()[0] for p in r1} & {p.split()[0] for p in r2})
+
+
 def test_gpu_sampler_line_parsing():
     module = _load_client_module()
     line = "0    MTT S4000            |00000000:27:00.0    |0%    0MiB(49152MiB)"
