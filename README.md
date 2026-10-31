@@ -71,12 +71,12 @@
 │   ├── models/          # qwen3_moe.py（本项目,Qwen3-MoE TP2/EP2）
 │   ├── layers/          # attention(自研 Triton paged) / linear / layernorm / rope / sampler
 │   └── ...
-├── docs/                # 交接 / 计划 / 问题台账 / 架构（活文档见 AGENTS.md）
+├── docs/                # 交接 / 计划 / 问题台账 / 架构 / 调研
 ├── benchmarks/          # 当前轮报告;历史轮次在 benchmarks/archive/
 └── scripts/             # 压测 / 基准 / 决策 / 图表脚本;一次性实验脚本在 scripts/archive/
 ```
 
-Agent/新人入口见 [AGENTS.md](AGENTS.md)(常用命令、红线、SOP);详细设计见 [docs/architecture.md](docs/architecture.md);当前迭代计划见 [docs/PLAN.md](docs/PLAN.md)。
+详细设计见 [docs/architecture.md](docs/architecture.md);当前迭代计划见 [docs/PLAN.md](docs/PLAN.md);问题台账见 [docs/ISSUES.md](docs/ISSUES.md) 与 [docs/CLOSEOUT.md](docs/CLOSEOUT.md)。
 
 <details>
 <summary><b>📈 当前进度（P0–P14 全部判决完毕 — 点击展开）</b></summary>
@@ -103,7 +103,7 @@ pip install -e .
 python example.py
 ```
 
-MUSA 环境各阶段运行方式见 [AGENTS.md](AGENTS.md) 常用命令节。
+MUSA 环境各阶段运行方式见仓库内运行手册(本地维护)。
 
 双卡正确性回归(按顺序,任何一步失败都不要往下跑性能;均在服务器跑,tiny 模型在 `/tmp/tiny_moe`):
 

@@ -202,3 +202,4 @@ benchmarks/data/
 
 # 简历/面试材料只在本地,不入库不上传(user 要求)
 docs/RESUME.md
+AGENTS.md
