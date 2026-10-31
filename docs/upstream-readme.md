@@ -1,5 +1,5 @@
 <p align="center">
-<img width="300" src="assets/logo.png">
+<img width="300" src="https://github.com/GeeeekExplorer/nano-vllm/raw/main/assets/logo.png">
 </p>
 
 <p align="center">

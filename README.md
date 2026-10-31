@@ -1,16 +1,12 @@
-<p align="center">
-<img width="220" src="assets/logo.png">
-</p>
+# s4000-moe-engine
 
-# moe-server-s4000
+面向国产 GPU（摩尔线程 MTT S4000 / MUSA 全栈）的 **Qwen3-30B-A3B 双卡 MoE 推理引擎**：TP2/EP2、自研 Triton paged attention、stall-free 混批调度、OpenAI 兼容流式服务，并以预注册冻结门的 A/B 方法完成 14 轮性能/正确性判决。
 
-基于 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 的国产 GPU（摩尔线程 MTT S4000 / MUSA）MoE 大模型双卡推理引擎。
-
-> 本仓库 fork 自 nano-vllm（MIT License, © 2025 Xingkai Yu），上游代码保留完整 git 历史，本项目所有改动可通过 `git diff upstream/main` 查看。上游原文档见 [docs/upstream-readme.md](docs/upstream-readme.md)。
+> 引擎底座参考了 MIT 协议的轻量推理引擎 nano-vllm（~1.4k 行，[docs/upstream-readme.md](docs/upstream-readme.md)）；MUSA 适配、MoE 模型支持、调度/服务化与全部平台能力为本项目实现，上游版权声明见 [LICENSE](LICENSE)。
 
 ## 项目定位
 
-在 ~1,400 行的轻量推理引擎 nano-vllm 基础上（上游已含 continuous batching、prefix caching、chunked prefill、CUDA graph、TP），针对摩尔线程 S4000 做三件事：
+面向摩尔线程 S4000（无 FP8 算力、MUSA 闭源生态）的四件事：
 
 1. **MUSA 适配**：把引擎从 CUDA 生态移植到 torch_musa + MCCL + Triton-mtgpu；
 2. **MoE 模型支持**：新增 Qwen3-MoE（30B-A3B）模型实现，含 FP8 量化权重反量化加载；
@@ -28,14 +24,14 @@
 ## 架构
 
 ```
-├── nanovllm/            # 引擎本体（fork 自上游）
+├── nanovllm/            # 引擎本体（Python 包名沿用底座）
 │   ├── engine/          # LLMEngine / Scheduler / ModelRunner / BlockManager
-│   ├── models/          # qwen3.py（上游）→ + qwen3_moe.py（本项目）
-│   ├── layers/          # attention / linear / layernorm / rope / sampler
+│   ├── models/          # qwen3_moe.py（本项目,Qwen3-MoE TP2/EP2）
+│   ├── layers/          # attention(自研 Triton paged) / linear / layernorm / rope / sampler
 │   └── ...
-├── docs/                # 交接 / 计划 / 问题台账 / 架构（活文档仅 7 个,见 AGENTS.md）
+├── docs/                # 交接 / 计划 / 问题台账 / 架构（活文档见 AGENTS.md）
 ├── benchmarks/          # 当前轮报告;历史轮次在 benchmarks/archive/
-└── scripts/             # 压测 / 基准 / 决策脚本;一次性实验脚本在 scripts/archive/
+└── scripts/             # 压测 / 基准 / 决策 / 图表脚本;一次性实验脚本在 scripts/archive/
 ```
 
 Agent/新人入口见 [AGENTS.md](AGENTS.md)(常用命令、红线、SOP);详细设计见 [docs/architecture.md](docs/architecture.md);当前迭代计划见 [docs/PLAN.md](docs/PLAN.md)。
