@@ -40,7 +40,7 @@
 
 Agent/新人入口见 [AGENTS.md](AGENTS.md)(常用命令、红线、SOP);详细设计见 [docs/architecture.md](docs/architecture.md);当前迭代计划见 [docs/PLAN.md](docs/PLAN.md)。
 
-## 当前进度(截至 P12 轮,判决详见 [docs/HANDOFF.md](docs/HANDOFF.md))
+## 当前进度(截至 P14 轮,全部判决完毕;详见 [docs/HANDOFF.md](docs/HANDOFF.md) 与 [docs/CLOSEOUT.md](docs/CLOSEOUT.md))
 
 | 阶段 | 状态 | 关键数字 |
 |---|---|---|
@@ -49,9 +49,41 @@ Agent/新人入口见 [AGENTS.md](AGENTS.md)(常用命令、红线、SOP);详细
 | P3–P4 调度与服务化 | 完成 | stall-free 混步调度;OpenAI 兼容 SSE API;短 prompt 四档 Poisson ×3 全 100% SLO(std+strict) |
 | P5–P6 指标/后端/长上下文 | 完成 | 指标 v3(双 SLO/Wilson CI);**triton_paged 按五层门转正**(TPOT p95 −12~18%);I8 长上下文重测 + 调度三缺口修复 |
 | P7–P9 优化探索 | 完成 | 投机解码 NO-GO(α≈0);I19 因果链否定(~20–30 ms/步未解释固定等待);整图否决(I29,TP2 replay 楔死);chunk-2048 把 1k TTFT 砍 −69~73%(50% 档 1.036 s、SLO 100%) |
-| P10–P12 分段图与在线判定 | 完成 | 分段图(图内零 MCCL)离线 30B b1 **−23.7%**、768 图/rank 零失败、跨臂逐位 0 翻转;**在线 A/B 判定 FAIL**(并发 14–30 撞桶 padding 税,慢 5.9–14.7%,同 session 复跑确认)→ 不转正、默认维持 eager;生产栈短 prompt 四档 100% SLO |
+| P10–P12 分段图与在线判定 | 完成 | 分段图(图内零 MCCL)离线 30B b1 **−23.7%**、768 图/rank 零失败、跨臂逐位 0 翻转;**在线 A/B 判定 FAIL**(并发 14–30 撞桶 padding 税,慢 5.9–14.7%,同 session 复跑确认)→ 不转正、默认维持 eager |
+| P13 硬骨头攻坚 | 完成 | **I30 关闭**(同 session ABA:现树快于 pre-P8 栈 23–51%);**I33 修复验证并关闭分支**(密桶 1056 图零失败 + pad 回退,padding 税证实并消除 0.9 档 +14.7%→+2.3%,残余 AR 串行化 +4.7% 超门 → 段图定格单流开关);**I8 闭合**(冷缓存塌=chunk 粒度);**容量下界 1.070 req/s** |
+| P14 收官补测 | 完成 | `--prompt-seed-per-repeat` 根治暖缓存伪象;I12 exit 看门狗;**容量拐点 1.6–1.8×、硬饱和 ≈1.2 req/s**;1k 冷态 1.0 档 chunk-2048 过 TTFT 门(1.08–1.12 s);I29 官方线索(MCCL 混用,缓解非修复) |
 
 正确性门:tiny TP1/TP2 × loop/grouped/bmm 六配置逐 token 全等;跨后端比较采用"候选确定性 + 五层等价门"(数值契约见 [docs/numerics-policy.md](docs/numerics-policy.md))。历史轮次报告(P0–P8)在 [benchmarks/archive/](benchmarks/archive/),当前轮在 [benchmarks/](benchmarks/)。
+
+## 结果一览(图表由 `scripts/render_metrics.py` 从 `benchmarks/data/` 证据 JSON 程序化生成)
+
+### 端到端与离线吞吐
+
+<p align="center">
+<img width="420" src="assets/charts/baseline_throughput.png">
+<img width="520" src="assets/charts/offline_moe_throughput.png">
+</p>
+
+### 在线服务能力(30B 生产栈)
+
+容量拐点 1.6–1.8×,硬饱和 ≈1.2 req/s,1.0× 档双口径 SLO 100%:
+
+<p align="center">
+<img width="620" src="assets/charts/capacity_curve.png">
+</p>
+
+分段图的完整闭环——离线单流 −23.7%,在线被桶 padding 税否决,密桶+回退修复后 padding 税消除、残余为桶边界 AR 串行化,最终按预注册门关闭:
+
+<p align="center">
+<img width="620" src="assets/charts/tpot_tiers.png">
+<img width="520" src="assets/charts/segstep.png">
+</p>
+
+### 1k 长输入:冷缓存塌方 = chunk 粒度(I8 终局)
+
+<p align="center">
+<img width="480" src="assets/charts/longctx_ttft.png">
+</p>
 
 ## 快速开始
 
