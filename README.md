@@ -1,19 +1,61 @@
-# s4000-moe-engine
+<div align="center">
+<img src="https://capsule-render.vercel.app/api?type=soft&height=150&color=0:1E3A8A,55:2563EB,100:0D9488&text=s4000-moe-engine&fontSize=42&fontColor=ffffff&desc=Qwen3-30B-A3B%20MoE%20%C2%B7%20MUSA%20%2F%20MTT%20S4000%20%C3%972%20%C2%B7%20TP2%2BEP2%20%C2%B7%20pre-registered%20frozen-gate%20A%2FB&descSize=15&descAlignY=76">
+</div>
 
-面向国产 GPU（摩尔线程 MTT S4000 / MUSA 全栈）的 **Qwen3-30B-A3B 双卡 MoE 推理引擎**：TP2/EP2、自研 Triton paged attention、stall-free 混批调度、OpenAI 兼容流式服务，并以预注册冻结门的 A/B 方法完成 14 轮性能/正确性判决。
+<div align="center">
+
+![License](https://img.shields.io/badge/License-MIT-blue)
+![GPU](https://img.shields.io/badge/GPU-MTT%20S4000%20%C3%972-EA580C)
+![Model](https://img.shields.io/badge/Model-Qwen3-30B-A3B-2563EB)
+![Parallel](https://img.shields.io/badge/Parallel-TP2%20%2B%20EP2-0D9488)
+![Offline](https://img.shields.io/badge/Offline-141.5%20tok%2Fs%20%28b64%29-1B9E77)
+![Online](https://img.shields.io/badge/Online-%E2%89%A51.07%20req%2Fs%20%C2%B7%20100%25%20SLO-7C3AED)
+![Verdicts](https://img.shields.io/badge/Rounds-P0%E2%80%93P14%20all%20judged-111827)
+
+</div>
+
+面向国产 GPU（摩尔线程 MTT S4000 / MUSA 全栈）的 **Qwen3-30B-A3B 双卡 MoE 推理引擎**：TP2/EP2、自研 Triton paged attention、stall-free 混批调度、OpenAI 兼容流式服务，并以**预注册冻结门的 A/B 方法**完成 14 轮性能/正确性判决。
 
 > 引擎底座参考了 MIT 协议的轻量推理引擎 nano-vllm（~1.4k 行，[docs/upstream-readme.md](docs/upstream-readme.md)）；MUSA 适配、MoE 模型支持、调度/服务化与全部平台能力为本项目实现，上游版权声明见 [LICENSE](LICENSE)。
 
-## 项目定位
+---
 
-面向摩尔线程 S4000（无 FP8 算力、MUSA 闭源生态）的四件事：
+## ✨ 结果一览
+
+> 以下图表由 [`scripts/render_metrics.py`](scripts/render_metrics.py) 从 `benchmarks/data/` 的证据 JSON 程序化生成——每个数字都有对照、冻结门与 sha256 存档，负结果与正结果同等呈现。
+
+| 端到端加速（8B 基线） | 30B 离线吞吐 × MoE 后端 |
+|---|---|
+| ![基线对比](assets/charts/baseline_throughput.png) | ![离线吞吐](assets/charts/offline_moe_throughput.png) |
+
+**在线容量曲线**（拐点 1.6–1.8×，硬饱和 ≈1.2 req/s，1.0× 档双口径 SLO 100%）：
+
+<p align="center">
+<img width="640" src="assets/charts/capacity_curve.png">
+</p>
+
+**分段图的完整闭环**——离线单流 −23.7%，在线被桶 padding 税否决（+5.9~14.7%），密桶+回退修复后 padding 税消除（0.9 档 +14.7%→+2.3%）、残余为桶边界 AR 串行化，最终按预注册门关闭、定格单流开关：
+
+| 在线 TPOT p95 分档 | 30B 离线 decode 步时 |
+|---|---|
+| ![TPOT 分档](assets/charts/tpot_tiers.png) | ![分段图步时](assets/charts/segstep.png) |
+
+**1k 长输入：冷缓存塌方根因 = chunk 粒度**（chunk-2048 冷态 TTFT p50 1.08–1.12 s 过 ≤2 s 门）：
+
+<p align="center">
+<img width="500" src="assets/charts/longctx_ttft.png">
+</p>
+
+---
+
+## 🎯 项目定位
+
+面向摩尔线程 S4000（**无 FP8 算力、MUSA 闭源生态**）的四件事：
 
 1. **MUSA 适配**：把引擎从 CUDA 生态移植到 torch_musa + MCCL + Triton-mtgpu；
 2. **MoE 模型支持**：新增 Qwen3-MoE（30B-A3B）模型实现，含 FP8 量化权重反量化加载；
 3. **MoE 加速与调度**：packed expert + MUSA grouped GEMM、TP2+EP2、stall-free mixed prefill/decode；
 4. **可观测服务**：请求级 TTFT/TPOT 指标、可复现 benchmark、OpenAI 兼容流式 API。
-
-目标硬件与软件栈：
 
 | 项 | 配置 |
 |---|---|
@@ -21,7 +63,7 @@
 | 软件栈 | torch 2.11 + torch_musa 2.11、MCCL 2.11、Triton（mtgpu backend）、Ubuntu 22.04 |
 | 目标模型 | Qwen/Qwen3-30B-A3B-Instruct-2507-FP8（30.5B 总参 / 3.3B 激活，128 专家 top-8） |
 
-## 架构
+## 🏗️ 架构
 
 ```
 ├── nanovllm/            # 引擎本体（Python 包名沿用底座）
@@ -36,7 +78,8 @@
 
 Agent/新人入口见 [AGENTS.md](AGENTS.md)(常用命令、红线、SOP);详细设计见 [docs/architecture.md](docs/architecture.md);当前迭代计划见 [docs/PLAN.md](docs/PLAN.md)。
 
-## 当前进度(截至 P14 轮,全部判决完毕;详见 [docs/HANDOFF.md](docs/HANDOFF.md) 与 [docs/CLOSEOUT.md](docs/CLOSEOUT.md))
+<details>
+<summary><b>📈 当前进度（P0–P14 全部判决完毕 — 点击展开）</b></summary>
 
 | 阶段 | 状态 | 关键数字 |
 |---|---|---|
@@ -51,37 +94,9 @@ Agent/新人入口见 [AGENTS.md](AGENTS.md)(常用命令、红线、SOP);详细
 
 正确性门:tiny TP1/TP2 × loop/grouped/bmm 六配置逐 token 全等;跨后端比较采用"候选确定性 + 五层等价门"(数值契约见 [docs/numerics-policy.md](docs/numerics-policy.md))。历史轮次报告(P0–P8)在 [benchmarks/archive/](benchmarks/archive/),当前轮在 [benchmarks/](benchmarks/)。
 
-## 结果一览(图表由 `scripts/render_metrics.py` 从 `benchmarks/data/` 证据 JSON 程序化生成)
+</details>
 
-### 端到端与离线吞吐
-
-<p align="center">
-<img width="420" src="assets/charts/baseline_throughput.png">
-<img width="520" src="assets/charts/offline_moe_throughput.png">
-</p>
-
-### 在线服务能力(30B 生产栈)
-
-容量拐点 1.6–1.8×,硬饱和 ≈1.2 req/s,1.0× 档双口径 SLO 100%:
-
-<p align="center">
-<img width="620" src="assets/charts/capacity_curve.png">
-</p>
-
-分段图的完整闭环——离线单流 −23.7%,在线被桶 padding 税否决,密桶+回退修复后 padding 税消除、残余为桶边界 AR 串行化,最终按预注册门关闭:
-
-<p align="center">
-<img width="620" src="assets/charts/tpot_tiers.png">
-<img width="520" src="assets/charts/segstep.png">
-</p>
-
-### 1k 长输入:冷缓存塌方 = chunk 粒度(I8 终局)
-
-<p align="center">
-<img width="480" src="assets/charts/longctx_ttft.png">
-</p>
-
-## 快速开始
+## 🚀 快速开始
 
 ```bash
 pip install -e .
@@ -125,6 +140,13 @@ PYTHONPATH=. python3 scripts/benchmark_online.py --model qwen3-30b-a3b \
   --output benchmarks/data/online.json
 ```
 
-## License
+## 🧪 评测方法
 
-MIT（沿用上游）
+- **预注册冻结门**：每个实验先写判据/容差/判定树再跑，跑完不改阈值（见 [docs/PLAN.md](docs/PLAN.md)）；
+- **五字段报告**：门 / 口径 / 结果 / 判定 / 证据——判定只有 PASS、FAIL、未产出三种，缺数据不出判定；
+- **同 session A/B**：两臂相邻测量；跨时段必须补同 session 复现臂；交错取中位数、CV ≤ 5% 否则 INVALID；
+- **负结果照录**：投机解码 NO-GO、整图否决、分段图在线否决等 7 项负结果全部留档（[docs/CLOSEOUT.md](docs/CLOSEOUT.md)）。
+
+## 📄 License
+
+MIT（底座沿用上游，版权声明见 [LICENSE](LICENSE)）
