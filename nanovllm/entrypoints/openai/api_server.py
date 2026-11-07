@@ -60,8 +60,11 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
             raise HTTPException(400, "messages must be a non-empty list")
         max_tokens = int(body.get("max_tokens", 64))
         temperature = float(body.get("temperature", 1.0))
-        if max_tokens <= 0 or temperature < 0:
-            raise HTTPException(400, "max_tokens must be positive and temperature non-negative")
+        # P16-C extension: scheduling tier (0 = highest).  Non-standard field,
+        # ignored by stock OpenAI clients; equal priorities keep FIFO.
+        priority = int(body.get("priority", 0))
+        if max_tokens <= 0 or temperature < 0 or priority < 0:
+            raise HTTPException(400, "max_tokens must be positive; temperature/priority non-negative")
         stop = body.get("stop", [])
         if isinstance(stop, str):
             stop = [stop]
@@ -95,7 +98,8 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
         try:
             handle = await engine.add_request(
                 prompt_ids,
-                SamplingParams(temperature=temperature, max_tokens=max_tokens),
+                SamplingParams(temperature=temperature, max_tokens=max_tokens,
+                               priority=priority),
             )
         except OverflowError as exc:
             raise HTTPException(429, str(exc)) from exc

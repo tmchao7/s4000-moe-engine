@@ -140,6 +140,7 @@ class BlockManager:
         return num_cached_blocks
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
+        assert num_cached_blocks >= 0, "can_allocate returned -1 (insufficient KV)"
         assert not seq.block_table
         self.prefix_cache_hit_tokens += num_cached_blocks * self.block_size
         h = -1

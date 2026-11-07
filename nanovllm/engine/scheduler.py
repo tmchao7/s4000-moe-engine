@@ -114,7 +114,11 @@ class Scheduler:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
-                    self.preempt(self.running.pop())
+                    victim = self._preempt_victim(requester=seq)
+                    if victim is None:
+                        self.preempt(seq)
+                        break
+                    self.preempt(victim)
                 else:
                     self.preempt(seq)
                     break
@@ -132,22 +136,45 @@ class Scheduler:
         return scheduled_seqs, "decode"
 
     def _waiting_candidate(self):
-        if self.policy != "stall_free_lpm" or len(self.waiting) == 1:
-            return self.waiting.popleft()
+        """P16-C: highest priority (lowest value) first; within a tier the
+        policy applies — FIFO for stall_free, most-cacheable for lpm.  The
+        starvation guard outranks priority so a long-queued low tier still
+        makes progress (bounded fairness instead of hard starvation)."""
         for seq in self.waiting:
             seq.wait_steps += 1
         starved = [seq for seq in self.waiting if seq.wait_steps >= self.starvation_steps]
         if starved:
-            candidate = max(starved, key=lambda seq: seq.wait_steps)
+            candidate = max(starved, key=lambda seq: (seq.wait_steps, -seq.priority))
         else:
-            def cached_blocks(seq):
-                if seq.block_table:
-                    return seq.num_cached_tokens // self.block_size
-                value = self.block_manager.can_allocate(seq)
-                return value if value >= 0 else -1
-            candidate = max(self.waiting, key=cached_blocks)
+            candidate = min(self.waiting, key=lambda seq: seq.priority)  # FIFO in tier
+            if self.policy == "stall_free_lpm":
+                tier = [seq for seq in self.waiting if seq.priority == candidate.priority]
+                if len(tier) > 1:
+                    def cached_blocks(seq):
+                        if seq.block_table:
+                            return seq.num_cached_tokens // self.block_size
+                        value = self.block_manager.can_allocate(seq)
+                        return value if value >= 0 else -1
+                    candidate = max(tier, key=cached_blocks)
         self.waiting.remove(candidate)
         return candidate
+
+    def _preempt_victim(self, requester: Sequence | None) -> Sequence | None:
+        """P16-C: preempt the newest lowest-priority running seq (legacy
+        behavior = plain newest via running.pop()).  Returns None when every
+        running seq outranks the requester — the requester must then give up
+        its own blocks instead of evicting a more important stream."""
+        victim_idx = None
+        for i, seq in enumerate(self.running):
+            if victim_idx is None or seq.priority >= self.running[victim_idx].priority:
+                victim_idx = i          # >= keeps the LAST max = newest
+        if victim_idx is None:
+            return None
+        victim = self.running[victim_idx]
+        if requester is not None and victim.priority < requester.priority:
+            return None
+        del self.running[victim_idx]
+        return victim
 
     def _schedule_stall_free(self) -> tuple[list[Sequence], str]:
         decode_seqs = []
@@ -156,14 +183,20 @@ class Scheduler:
         seq_budget = self.max_num_seqs
 
         # Keep every admitted decode moving before admitting prefill work.
-        num_running = len(self.running)
-        for _ in range(num_running):
+        # while (not for-range): each preemption removes an extra running seq,
+        # so a fixed iteration count would popleft an empty deque (latent
+        # upstream bug, fires only under heavy KV pressure).
+        while self.running:
             if token_budget == 0 or len(decode_seqs) >= seq_budget:
                 break
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
-                    self.preempt(self.running.pop())
+                    victim = self._preempt_victim(requester=seq)
+                    if victim is None:
+                        self.preempt(seq)
+                        break
+                    self.preempt(victim)
                 else:
                     self.preempt(seq)
                     break
