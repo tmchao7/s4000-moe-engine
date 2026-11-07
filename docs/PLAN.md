@@ -49,6 +49,7 @@
 | # | 项 | 门/判定 | 状态 |
 |---|---|---|---|
 | A | 混合精度 int8 KV(per-(layer,kv_head) bf16 outlier 维 ≤4 + 侧池 + split-sum kernel) | 同 P17-B 五门 | **机制逐位正确(unit 四张量 BITWISE; 引擎重算 0.0033; 修复 P19 遗留: paged 读误用 store scales)**;**质量门 FAIL(flip 0.5/sim 0.035/degenerate 2) — 三方案连续 FAIL → I20 终判: 本模型 K/V 动态范围对 int8 不可用**; 容量 2× 奖池放弃(除非厂商 fp8); 默认 bf16 不变; int8 代码保留 opt-in-experimental |
+| B | P16-A 默认翻转评估: 30B 单载证据(统一 vs legacy, 信息性门) | ratio ≤1.0 + CV≤5% + flips=0 | **EVIDENCE PASS(11-08)**: ratio **0.977**(−2.3%, 3 rep CV<0.1%) + **flips=0 逐位全等**;P16-A 证据链完整(0.6B 性能 0.749×/8B 0.850× 逐位 0 翻转/30B 0.977× 逐位 0 翻转;唯一瑕疵=0.6B 翻转 0.56%);冻结门①钉在 0.6B 不可翻,默认维持 opt-in,**门修订提案留给用户裁决**;脚本 scripts/p20_30b_flip.py |
 
 ### 范围注记
 
