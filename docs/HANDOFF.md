@@ -5,7 +5,9 @@
 
 ## 0. 三十秒状态
 
-- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;**HEAD 领先 origin 7+ 个本地 commit(隔夜轮+P19,待用户审后 push)**;P19(11-08):I20 per-channel 修复尝试(机制正确/通道内动态范围 500× 仍超 int8)+ 独立 code review(修复 HIGH 重复调度 bug+8 项,详见 benchmarks/P19-i20-review.md)+ 指标核查(/metrics/priority 400)。
+- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;**HEAD 领先 origin 9 个本地 commit(隔夜轮+P19+P20,待用户审后 push)**。
+- **P19(11-08)**:I20 per-channel 修复尝试(机制逐位正确)+ 独立 code review(修复 HIGH 重复调度 bug + 8 项,t6 回归)+ 指标核查(/metrics/priority 400);报告 benchmarks/P19-i20-review.md。
+- **P20(11-08)**:I20 终局 — 混合精度 outlier 通道(per-(layer,kv_head) bf16 维 ≤4 + 侧池 + split-sum)机制逐位正确但质量门 FAIL → **I20 终判:本模型 K/V 动态范围对 int8 不可用**;**P16-A 30B 证据 PASS(ratio 0.977 + flips=0 逐位)**,证据链完整(0.6B/8B/30B),默认维持 opt-in、门修订提案留用户;顺带修复 P19 遗留 bug(paged 读误用 store scales)。
 - **服务器**:seetacloud `s4000`;收官时双卡 0 MiB、无进程、shm 干净;终回归 8/8 全绿(四套+p16-mixed+lru+prio+p17-unit)。
 - **生产栈(一个默认没动)**:`triton_paged` + `grouped_mm`/`bmm_dense` + eager + `stall_free` + TP2/EP2 + chunk-256。新特性全部 opt-in。
 - **隔夜轮一句话**:统一混合批(P16-A,混合步 −25%/−15%,opt-in)→ KV LRU(P16-B,PASS)→ 优先级调度(P16-C,高优 TTFT 42.7×,采用)→ 30B E1(P16-D,负结果,E1 闭合)→ KV int8(P17,机制全通/容量 2.0×,数值方案待换)→ PD Poisson(P18-A,POSITIVE 双档)。
@@ -31,7 +33,7 @@
 | 优先 | 项 | 说明 |
 |---|---|---|
 | 1 | **用户审本地 commit → push** | 隔夜轮+P19 全部成果在本地(bd43cba..P19),远端未动 |
-| 2 | **I20 终局:混合精度 outlier 通道** | 校准挑高动态比通道(ratio=amax/median>20)保 bf16,其余 int8(~1.03× 存储)。**设计已定稿(本轮想清,免下轮摸索)**:int8 池 outlier 列写 0 + bf16 侧池 [blocks,256,kvh,n_out] 紧凑列 + 静态索引张量;kernel 用 **split-sum** 规避寄存器 scatter——logits=Σ(int8·q·mask)+Σ_out(bf16_out·q_gather),V 用主 acc+`acc_out[n_out]` 分离累加、末尾按 OUT_IDX 逐列覆盖 store;n_out≤8 上限校准期截断 |
+| 2 | ~~I20~~ **已终判(P20):int8 对本模型不可用** | 三种方案(per-token/per-channel/混合精度)机制全对、质量门连续 FAIL;除非厂商 fp8 落地(MUSA cast 静默 no-op 已入工单素材),否则放弃容量 2× 奖池 |
 | 3 | P16-A 默认翻转评估 | 8B 逐位 0 翻转+性能双 PASS;需 30B 链路确认后翻 `NANOVLLM_MIXED_UNIFIED` 默认 |
 | 4 | P18-C 优先级 × PD(D 侧优先级+P 侧前缀复用) | 优先级+LRU 已就绪,PD 控制面直接吃 |
 | 5 | P18-B PD OpenAI API 化 | `/v1/chat/completions` 端点形态已存在(含 priority 透传),套 PD 控制面 |
