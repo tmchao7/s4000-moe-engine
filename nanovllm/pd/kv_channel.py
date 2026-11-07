@@ -46,22 +46,33 @@ class KVBlockBuffer:
 
 def extract_kv(kv_cache: torch.Tensor, block_table: list[int],
                buf: KVBlockBuffer) -> None:
-    """Copy the blocks named by ``block_table`` (device) into ``buf`` (pinned)."""
+    """Copy the blocks named by ``block_table`` (device) into ``buf`` (pinned).
+
+    I28 SOP: a cross-block strided view (``pool[:, bid]``) copied D2H through
+    pinned staging intermittently returns garbage on this MUSA stack — gather
+    with ``index_select`` (contiguous output) first, then one pinned copy.
+    """
     assert len(block_table) <= buf.n_blocks
+    n = len(block_table)
     k_pool, v_pool = kv_cache[0], kv_cache[1]          # [L, blocks+1, bs, kvh, d]
-    for i, bid in enumerate(block_table):
-        buf.k[i].copy_(k_pool[:, bid])
-        buf.v[i].copy_(v_pool[:, bid])
+    idx = torch.tensor(block_table, device=k_pool.device, dtype=torch.long)
+    kg = k_pool.index_select(1, idx)                   # [L, n, bs, kvh, d]
+    vg = v_pool.index_select(1, idx)
+    buf.k[:n].copy_(kg.permute(1, 0, 2, 3, 4))
+    buf.v[:n].copy_(vg.permute(1, 0, 2, 3, 4))
 
 
 def import_kv(kv_cache: torch.Tensor, block_table: list[int],
               buf: KVBlockBuffer) -> None:
-    """Scatter ``buf`` blocks into the blocks named by ``block_table``."""
+    """Scatter ``buf`` blocks into the blocks named by ``block_table`` (I28-safe)."""
     assert len(block_table) <= buf.n_blocks
+    n = len(block_table)
     k_pool, v_pool = kv_cache[0], kv_cache[1]
-    for i, bid in enumerate(block_table):
-        k_pool[:, bid].copy_(buf.k[i])
-        v_pool[:, bid].copy_(buf.v[i])
+    idx = torch.tensor(block_table, device=k_pool.device, dtype=torch.long)
+    kdev = buf.k[:n].to(k_pool.device).permute(1, 0, 2, 3, 4).contiguous()
+    vdev = buf.v[:n].to(k_pool.device).permute(1, 0, 2, 3, 4).contiguous()
+    k_pool.index_copy_(1, idx, kdev)
+    v_pool.index_copy_(1, idx, vdev)
 
 
 class LocalKVChannel:

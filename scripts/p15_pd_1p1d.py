@@ -66,7 +66,9 @@ def recv_json(sock):
 def connect_retry(host, port, tries=60):
     for i in range(tries):
         try:
-            return socket.create_connection((host, port), timeout=5)
+            sock = socket.create_connection((host, port), timeout=5)
+            sock.settimeout(None)  # blocking afterwards: D's first decode JITs triton
+            return sock
         except OSError:
             time.sleep(1.0 if i < 10 else 2.0)
     raise ConnectionError(f"cannot connect {host}:{port}")
@@ -113,8 +115,10 @@ def role_prefill(args):
             llm.step()  # prefill all prompt chunks; KV 0..P-1 now in pool
         t1 = time.perf_counter()
         prompt_tokens = seq.token_ids[:seq.num_prompt_tokens]
+        first_token = seq.completion_token_ids[0]  # sampled by P's prefill kernel
         send_json(ctrl_sock, {"type": "request",
                               "prompt_token_ids": prompt_tokens,
+                              "first_token": first_token,
                               "max_tokens": MAX_TOKENS,
                               "nblocks": len(seq.block_table)})
         kvchan.send_blocks(seq.block_table)
@@ -152,6 +156,8 @@ def role_decode(args):
     print(f"[decode] listening on {args.port}/{args.port + 1}", flush=True)
     kv_sock, _ = listener.accept()
     ctrl_sock, _ = listener2.accept()
+    kv_sock.settimeout(None)
+    ctrl_sock.settimeout(None)
     kvchan = TcpKVChannel(kv_sock, llm.model_runner.kv_cache, max_blocks=16)
     bm = llm.scheduler.block_manager
     results = []
@@ -159,8 +165,15 @@ def role_decode(args):
         req = recv_json(ctrl_sock)
         if req.get("type") == "done":
             break
-        seq = Sequence(req["prompt_token_ids"], SamplingParams(
+        # Rebuild the exact post-prefill state: token_ids = prompt + C1 (the
+        # token P's prefill kernel sampled), completions counted from C1 on.
+        # The first decode step here replays collocated's first decode step
+        # bit-for-bit: input = C1, KV write at slot P (fresh), attention over
+        # the imported 0..P-1 plus the new slot.
+        toks = list(req["prompt_token_ids"]) + [req["first_token"]]
+        seq = Sequence(toks, SamplingParams(
             temperature=0, max_tokens=req["max_tokens"], ignore_eos=True))
+        seq.num_prompt_tokens = len(req["prompt_token_ids"])
         seq.status = SequenceStatus.RUNNING
         seq.is_prefill = False
         seq.num_cached_tokens = seq.num_prompt_tokens
@@ -177,8 +190,27 @@ def role_decode(args):
                         "decode_s": round(t2 - t1, 4)})
         print(f"[decode] import={results[-1]['import_s']:.4f}s "
               f"decode={results[-1]['decode_s']:.4f}s", flush=True)
+        send_json(ctrl_sock, {"type": "result", "nblocks": req["nblocks"],
+                              "token_ids": results[-1]["tokens"]})
+    # in-engine control arm: collocated generate on the SAME engine, so
+    # d_collocated vs d_pd isolates the import path from engine state
+    from nanovllm import SamplingParams
+    collocated = []
+    for prompt in PROMPTS:
+        seq_id = llm.add_request(prompt, SamplingParams(
+            temperature=0, max_tokens=MAX_TOKENS, ignore_eos=True))
+        while True:
+            pool = list(llm.scheduler.running) + list(llm.scheduler.waiting)
+            seq = next((x for x in pool if x.seq_id == seq_id), None)
+            if seq is not None:
+                break
+            llm.step()
+        while not seq.is_finished:
+            llm.step()
+        collocated.append({"tokens": list(seq.completion_token_ids)})
     with open(args.out, "w") as f:
-        json.dump({"role": "decode", "results": results}, f)
+        json.dump({"role": "decode", "results": results,
+                   "collocated": collocated}, f)
     llm.exit()
 
 
@@ -202,13 +234,24 @@ def launch(args):
     subprocess.run([sys.executable, __file__, "--role", "baseline",
                     "--out", base_out], env=env, check=True)
     base = json.load(open(base_out))
-    dec_res = json.load(open(d_out))["results"]
-    verdict = {"per_request": [], "pass": True}
-    for i, (b, r) in enumerate(zip(base["tokens"], dec_res)):
-        same = b == r["tokens"]
+    dec = json.load(open(d_out))
+    dec_res = dec["results"]
+    # Gate reference = the IN-ENGINE collocated arm (same process, same engine
+    # state history).  A virgin-engine baseline is NOT a valid reference:
+    # engine tokens depend on state history at near-ties (P15 finding, the
+    # I31 first-batch effect generalized beyond the first batch), so a
+    # history-matched control is the only fair bitwise reference.
+    ref = dec["collocated"]
+    verdict = {"per_request": [], "pass": True,
+               "reference": "in-engine collocated",
+               "virgin_baseline_match": []}
+    for i, (b, r) in enumerate(zip(ref, dec_res)):
+        same = b["tokens"] == r["tokens"]
         verdict["per_request"].append({"req": i, "bitwise_match": same,
                                        "n_tokens": len(r["tokens"])})
         verdict["pass"] &= same
+    for i, (b, r) in enumerate(zip(base["tokens"], dec_res)):
+        verdict["virgin_baseline_match"].append(b == r["tokens"])
     with open(args.out, "w") as f:
         json.dump(verdict, f, indent=1)
     print(json.dumps(verdict, indent=1), flush=True)

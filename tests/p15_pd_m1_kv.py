@@ -13,10 +13,10 @@ the same request set:
         continue — completions must equal arm1 bitwise.  This is the shape a
         real PD transfer takes (D side allocates its own pages).
 
-Also asserts the pinned round-trip itself is bitwise (pre-corrupt snapshot).
-Note: arm3's orphaned old blocks are intentionally never freed (leaked into
-the pool for the lifetime of this engine) — the test runs one engine with
-plenty of headroom; a real channel frees via block_manager.
+Both the pinned round-trip itself and the continued generations are asserted
+bitwise.  Platform note (I28 variant): the channel MUST gather/scatter via
+index_select/index_copy_ — copying cross-block strided views (pool[:, bid])
+through pinned staging intermittently corrupts on this MUSA stack.
 
 Run:  PYTHONPATH=. python3 tests/p15_pd_m1_kv.py     (rc=0 pass)
 """
@@ -55,7 +55,6 @@ def live_seqs(llm, seq_ids):
 
 
 def step_collect(llm, finals):
-    """One engine step; fold finished outputs into `finals`."""
     outputs, _ = llm.step()
     for seq_id, toks, _ in outputs:
         finals[seq_id] = list(toks)
@@ -87,11 +86,6 @@ def scribble(llm, block_table, seed):
         kv[:, :, bid] = noise
 
 
-def block_sig(llm, bid):
-    kv = llm.model_runner.kv_cache
-    return (round(kv[0][:, bid].sum().item(), 3), round(kv[1][:, bid].sum().item(), 3))
-
-
 def main():
     torch.musa.set_device(0)
     llm = LLM(MODEL, enforce_eager=True, tensor_parallel_size=1,
@@ -117,9 +111,9 @@ def main():
         seqs = running_until_pause(llm, seq_ids, finals)
         assert all(s.block_table for s in seqs), "no live block tables"
 
-        bufs, pre, pre_tables = {}, {}, {}
+        bufs, pre, old_tables = {}, {}, {}
         for s in seqs:
-            pre_tables[s.seq_id] = list(s.block_table)
+            old_tables[s.seq_id] = list(s.block_table)
             buf = KVBlockBuffer.from_pool(kv_cache, len(s.block_table))
             extract_kv(kv_cache, s.block_table, buf)
             torch.musa.synchronize()
@@ -128,47 +122,31 @@ def main():
 
         if arm == "arm3-rehome-new-blocks":
             bm = llm.scheduler.block_manager
-            print(f"[m1][debug] rehome plans: " + " ".join(
-                f"seq{s.seq_id}(cached={s.num_cached_tokens}):{list(s.block_table)}"
-                for s in seqs), flush=True)
-            old_tables = {}
             for s in seqs:
                 new_table = [bm._allocate_block() for _ in s.block_table]
                 import_kv(kv_cache, new_table, bufs[s.seq_id])
                 torch.musa.synchronize()
                 k, v = snapshot_blocks(llm, new_table)
                 pk, pv = pre[s.seq_id]
-                imm = torch.equal(k, pk) and torch.equal(v, pv)
-                print(f"[m1][debug] seq{s.seq_id} immediate verify={imm} "
-                      f"old={list(s.block_table)} new={new_table}", flush=True)
-                old_tables[s.seq_id] = list(s.block_table)
+                assert torch.equal(k, pk) and torch.equal(v, pv), \
+                    f"{arm}: import not bitwise for seq {s.seq_id}"
                 s.block_table[:] = new_table
-            for s in seqs:  # scribble old blocks only after all verifies
-                scribble(llm, old_tables[s.seq_id], seed=(s.seq_id * 7919 + 13) % 2**31)
+            for s in seqs:  # kill the old blocks only after all verifies
+                scribble(llm, old_tables[s.seq_id],
+                         seed=(s.seq_id * 7919 + 13) % 2**31)
         else:
             for s in seqs:
-                scribble(llm, s.block_table, seed=(s.seq_id * 7919 + 13) % 2**31)
+                scribble(llm, s.block_table,
+                         seed=(s.seq_id * 7919 + 13) % 2**31)
                 import_kv(kv_cache, s.block_table, bufs[s.seq_id])
         torch.musa.synchronize()
 
-        # roundtrip fidelity: imported blocks must match the pre-corrupt snapshot
+        # roundtrip fidelity: imported blocks match the pre-corrupt snapshot
         for s in seqs:
             k, v = snapshot_blocks(llm, s.block_table)
             pk, pv = pre[s.seq_id]
-            if not (torch.equal(k, pk) and torch.equal(v, pv)):
-                print(f"[m1][debug] seq {s.seq_id} ctx={s.num_tokens} "
-                      f"old_table={pre_tables[s.seq_id]} new_table={list(s.block_table)}",
-                      flush=True)
-                for bi in range(k.shape[1]):
-                    if not torch.equal(k[:, bi], pk[:, bi]):
-                        dk = (k[:, bi].float() - pk[:, bi].float()).abs()
-                        pos = int(dk.amax(dim=(0, 2, 3)).argmax())
-                        print(f"[m1][debug]   K block#{bi} maxdiff={dk.max():.4f} "
-                              f"worst_token_pos={pos}", flush=True)
-                    if not torch.equal(v[:, bi], pv[:, bi]):
-                        dv = (v[:, bi].float() - pv[:, bi].float()).abs()
-                        print(f"[m1][debug]   V block#{bi} maxdiff={dv.max():.4f}", flush=True)
-                assert False, f"{arm}: KV roundtrip not bitwise for seq {s.seq_id}"
+            assert torch.equal(k, pk) and torch.equal(v, pv), \
+                f"{arm}: KV roundtrip not bitwise for seq {s.seq_id}"
 
         while not llm.is_finished():
             step_collect(llm, finals)
