@@ -1,56 +1,52 @@
-# HANDOFF — 当前交接(滚动更新;本版 = P16 进行中,P15 收官于 2026-11-07)
+# HANDOFF — 当前交接(滚动更新;本版 = P16–P18 隔夜轮收官,2026-11-08)
 
 > 本文是**唯一交接文档**(历史版本在 git 历史)。接手先读本文,再按 [AGENTS.md](../AGENTS.md) 核验环境与命令。规则不变:先写门再跑;一次一个 GPU 任务;负结果照录;本地 commit(用户授权后才 push);到点无论进度必须停下写交接、清服务器。
-> 配套:[docs/PLAN.md](./PLAN.md)(迭代计划与冻结门)、[docs/ISSUES.md](./ISSUES.md)(台账)、[docs/CLOSEOUT.md](./CLOSEOUT.md)、[docs/E-vendor-ticket.md](./E-vendor-ticket.md)(厂商工单,**待用户亲自发**)、[docs/PD-DISAGG-SURVEY.md](./PD-DISAGG-SURVEY.md)(PD 立项调研)。`docs/RESUME.md` 只在本地不入库。
+> 配套:[docs/PLAN.md](./PLAN.md)(迭代计划与冻结门)、[docs/ISSUES.md](./ISSUES.md)(台账)、[docs/CLOSEOUT.md](./CLOSEOUT.md)、[docs/E-vendor-ticket.md](./E-vendor-ticket.md)(厂商工单,**待用户亲自发**)。`docs/RESUME.md` 只在本地不入库。
 
 ## 0. 三十秒状态
 
-- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;P15 全量已 push,P16 进行中(本地 commit)。
-- **服务器**:新 seetacloud 实例(ssh 别名 `s4000`)。双卡 0 MiB、模型 0.6B/8B/30B 齐(9/9 shard 校验)、四套单测全绿、30B 冒烟通过。
-- **生产栈(未变)**:`triton_paged` + `grouped_mm`(prefill)/`bmm_dense`(decode) + `enforce_eager=True` + `stall_free` + TP2/EP2 + chunk-256。**默认值一个没动**。
-- **P16-A 一句话(已判决)**:统一混合批(一步单 pass,vLLM V1/SGLang MIXED 形态)——**混合步 0.6B −25%/8B −15%,在线 pooled p95 −2.4%;数值门 0.6B 0.56%>0.5% FAIL(GEMM 批组成固有,split 回退同值;8B 逐位 0 翻转;legacy 自身历史敏感性 0.294%)→ opt-in `NANOVLLM_MIXED_UNIFIED=1`,默认不变**。报告 benchmarks/P16-mixed-unified.md。
-- **P16 待做**:B LRU 淘汰 / C 优先级调度 / D 30B E1;之后 P17 KV int8、P18 PD 推进(PLAN §1)。
-- **I29 红线(用户明令)**:**不要再运行 graph replay 类实验**(`tests/p15_i29_engine_probe.py` 保留作历史证据,其楔死会留下宿主级 22GB 无主显存,容器内不可清)。
+- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;**HEAD 领先 origin 6 个本地 commit(隔夜轮,待用户审后 push)**:`bd43cba`(P16-A)→`2f63431`(B)→`b2074ac`(C)→`52cddf5`(P17+P16-D)+ 收官文档 commit。
+- **服务器**:seetacloud `s4000`;收官时双卡 0 MiB、无进程、shm 干净;终回归 8/8 全绿(四套+p16-mixed+lru+prio+p17-unit)。
+- **生产栈(一个默认没动)**:`triton_paged` + `grouped_mm`/`bmm_dense` + eager + `stall_free` + TP2/EP2 + chunk-256。新特性全部 opt-in。
+- **隔夜轮一句话**:统一混合批(P16-A,混合步 −25%/−15%,opt-in)→ KV LRU(P16-B,PASS)→ 优先级调度(P16-C,高优 TTFT 42.7×,采用)→ 30B E1(P16-D,负结果,E1 闭合)→ KV int8(P17,机制全通/容量 2.0×,数值方案待换)→ PD Poisson(P18-A,POSITIVE 双档)。
+- **I29 红线(用户明令)**:不跑 graph replay 类实验。
 
-## 1. P15 结论(报告 `benchmarks/P15-pd-autotune.md`)
+## 1. 隔夜轮判决汇总(详见 PLAN §1 与三份报告)
 
 | 项 | 判定 | 关键数字 |
 |---|---|---|
-| **E1 paged kernel autotune** | **FAIL→opt-in** | 内核级 1.59–2.90×(32 配置×16 形状);无全局 bitwise 配置;0.6B LCP 翻转率 0.81%>0.5% 冻结门 → 默认保持 (32,4,1),tuned 表 `NANOVLLM_PAGED_CONFIG=auto` |
-| **I29 新栈复测** | **维持(形态改变)** | 纯张量梯子 7/8 绿;引擎级 2 clean + 1 WEDGE(init/capture 段);残显存 22GB 宿主级,跨容器重启/关机开机/克隆均持久 → **AutoDL 工单是唯一清除路径** |
-| **PD Step 0** | **GO(零 GPU)** | 读既有 evidence:合部模式 ITL p99/p50 = 2.3–6.3×,全场景 ≥2× 门 |
-| **PD M1(KV 原语)** | **PASS** | 三臂 bitwise(锚点/同块恢复/换新块重挂);I28 变体修入通道(index_select/index_copy_ 连续化) |
-| **PD M2(1P1D 端到端)** | **PASS(0.6B+8B)** | 卡0=P/卡1=D;PD==同引擎 collocated 6/6 bitwise;交接契约=P prefill 内核采样 C1 随 KV 交付 |
-| **PD M3(并发化+在线 A/B)** | **POSITIVE(双档)** | ITL p95 比值 0.753×(0.6B)/0.839×(8B);8B 全分位改善;client e2e −41~48%;吞吐 −15~27%(PD 赢 SLO 不赢吞吐,实测验证) |
-| **I34(新发现)** | 台账登记 | collocated token 依赖引擎状态历史(泛化 I31);bitwise 门必须同引擎同历史对照 |
+| P16-A 统一混合批 | **opt-in**(`NANOVLLM_MIXED_UNIFIED=1`) | 混合步 0.6B 0.749×/8B 0.850×;在线 pooled p95 0.976;数值门 0.6B 0.56%>0.5% FAIL(GEMM 批组成固有;8B 0%;legacy 自身历史敏感性 0.294% 对照;vLLM 同机理) |
+| P16-B KV LRU | **PASS,默认开**(`NANOVLLM_LRU_EVICT=0` 关) | 两级 victim(fresh→LRU 冷块)+touch-on-hit;bitwise ✓;**前提修正**:cached 块本住 free 列表,准入悬崖=纯容量;FIFO≡LRU 于顺序流量 |
+| P16-C 优先级调度 | **采用**(per-request,默认 0=legacy) | **高优 TTFT p50 21.8s→0.511s(42.7×)**;ITL 门 FAIL 照录(收益在准入延迟);I35 上游潜伏 bug 修复(for-range 抢占越界) |
+| P16-D 30B E1 | **负结果,E1 闭合** | e2e ratio 1.010~1.020(3 rep 稳);内核 2× 被 MoE 主导稀释;tuned 表维持 opt-in |
+| P17 KV int8 | **机制全通,数值方案待换**(opt-in) | 容量 **2.0× 精确**、decode 步时 1.013×;数值 FAIL:**K per-head amax 196~492 vs 典型 0.5 → per-token-head absmax 失效**;逐件排除 plumbing;修复路径=per-layer-head 校准静态 scale(布局已就绪,只换 scale 来源) |
+| P18-A PD Poisson | **POSITIVE 双档** | 0.6B ratio≈0.79、8B≈0.82;**PD 赢 SLO 在三种负载形态全部成立**(闭式突发/0.6B Poisson/8B Poisson) |
 
-回归四套在新机器全绿(`test_benchmarking_v3` 28 passed、`p8_scheduler_gaps`、`p2_grouped_mm`、`p6_bmm_dense_tiny`)。
+## 2. 已判决不要再碰(累计,含隔夜轮新增)
 
-## 2. 已判决不要再碰(累计)
-
-投机解码 NO-GO;I19 融合换步时否定;整图 TP2 否决(I29,P15 追加"init 楔+驱动级残留"形态,**实验类命令用户已封存**);分段图服务化关闭(单流开关保留);I30 回归主张否定;I8 机理闭合;split=0/chunk-2048 短 prompt 默认化否决;fused RMSNorm/容量收缩/placement 不采用;host-sync/mixed-split 已采纳;paged 已转正;I31→I34 状态历史协议;**eager 容量上界已测;E1 autotune 已判决(默认不翻);PD 小模型线已闭环**。
+投机解码 NO-GO;I19 融合换步时否定;整图/分段图 TP2 否决(I29,**实验类命令用户已封存**);I30 否定;I8 闭合;fused RMSNorm/容量收缩/placement 不采用;split=0/chunk-2048 否决;host-sync/mixed-split/paged 采纳;E1 autotune **闭合(30B e2e 负结果)**;**per-token-head absmax int8 KV 数值方案否定(校准静态 scale 待立项)**;I35 已修。
 
 ## 3. 下轮 Top-N(按 ROI)
 
 | 优先 | 项 | 说明 |
 |---|---|---|
-| 1 | **用户亲自发厂商工单** | [E-vendor-ticket.md](./E-vendor-ticket.md) 已并入 P15 新栈证据(init 楔 + 驱动级残留);渠道 developer.mthreads.com / vllm-musa issues |
-| 2 | KV cache 淘汰(LRU) | 前缀缓存只进不出,容量耗尽=准入硬悬崖;加法型特性,必出结果 |
-| 3 | 优先级/SLO 分级调度 | 业界标配(SGLang 同款);调度层"做足"主项 |
-| 4 | collocated-TP1 对照补测(可选) | 隔离 PD ITL 优势中"去 TP AR"的混淆分量 |
-| 5 | 30B E1 单载实测 | tuned 表 e2e 确认(内核 2× 已证);一发加载 |
-| 6 | 旧实例释放 + AutoDL 工单 | 旧宿主机 22GB 无主显存只有平台能清 |
+| 1 | **用户审 6 个本地 commit → push** | 隔夜轮全部成果在本地,远端未动 |
+| 2 | **I20 修复:per-layer-head 校准静态 scale** | 布局/读路径全就绪,只换 scale 来源;预期数值门可过 → int8 KV 转正(容量 2×) |
+| 3 | P16-A 默认翻转评估 | 8B 逐位 0 翻转+性能双 PASS;需 30B 链路确认后翻 `NANOVLLM_MIXED_UNIFIED` 默认 |
+| 4 | P16-B 优先级 × PD 组合(D 侧优先级=P18-C) | 优先级+LRU 已就绪,PD 控制面直接吃 |
+| 5 | P18-B PD OpenAI API 化 | `/v1/chat/completions` 端点形态已存在,套 PD 控制面 |
+| 6 | 用户亲自发厂商工单 | E-vendor-ticket.md(P15 新栈证据已并入) |
 
-**不要做**:graph replay 类实验(用户封存)、分段图服务化、norm/rope 单点融合、EAGLE3、chunk-2048 短 prompt 默认化、E2(vllm_fused 非生产路径)。
+**不要做**:graph replay(封存);per-token-head absmax int8(已判死,换方案再战);norm/rope 单点融合;EAGLE3。
 
-## 4. SOP/坑(继承 + P15 新增)
+## 4. SOP/坑(继承 + 隔夜轮新增)
 
-1. **模型下载**:modelscope CDN 单流仅 3–10 MB/s;**hf-mirror + `aria2c -x16 -s16 -k4M` ≈22 MiB/s**(31GB≈22min);hf-mirror 突发小文件间歇 403(rc=22/29)→ 幂等重跑 + curl 兜底。
-2. **ssh 后台启动**:`ssh host '... && setsid nohup cmd & echo; sleep'` 会把整条 && 链后台化 → stdin 竞态写出 0 字节脚本;**先 `ssh 'cat > f' < local` 干净写入+校验,再单独 ssh 启动**;启动后 ssh 可能挂住本地 120s(远端不受影响,另开连接验证)。
-3. **AutoDL 克隆实例的数据是异步后台拷贝**(du 会涨),用前逐 shard 校验尺寸;克隆大概率落同宿主机(数据卷本地),换机要靠克隆+运气或工单。
-4. `scripts/` 无 `__init__.py` → 跨脚本共享代码放 `nanovllm/pd/` 等正式包;非阻塞 socket 大载荷 sendall 会 BlockingIOError(发送侧临时切阻塞);同进程第二引擎是已知失败模式。
-5. `NANOVLLM_PAGED_CONFIG`:`auto`=tuned 表;`BN,warps,stages`=钉死;缺省=生产 (32,4,1)。泄漏期 KV 预算被设备级 used 毒化时,引擎构建用 `--gpu-util 0.9` 绕过。
-6. (继承)1k 冷态一律 `--prompt-seed-per-repeat`;tiny 不能跑 triton_paged,bitwise 门只在 0.6B paged;EADDRINUSE 单独重跑;MaxStartups 冷却 60–90 s;锚定 pgrep(`[p]` 括号);api_server 默认 ≠ 生产栈(须 `--decode-moe-backend bmm_dense`);`/tmp/tiny_moe` 用 `scripts/make_tiny_moe.py` 重建。
-7. **(P16-A 新增)在线 p95 判定必须交错 ≥3 重复后 pool**:单次 A/B 曾判 FAIL(p95 ratio 1.079),交错 3 重复后反转 PASS(0.976)——单次在线差异默认当噪声。
-8. **(P16-A 新增)ABA 门必须有丢弃式暖机段**:进程首个段吃 triton JIT/首触分配(legacy rep1 1.07s vs 稳态 0.17s),双臂各暖一段再计 rep,否则 CV 门必挂。
-9. **(P16-A 新增)TP2 运行时开关一律走 `runner.call("set_xxx")` 实例方法**(rank 同步);裸模块级 flag 会让 rank1 停在旧路径。`NANOVLLM_MIXED_UNIFIED=1` 启用统一混合批(默认 legacy split);`NANOVLLM_MIXED_MOE=split` 为 MoE 行组分发回退(数值上与 unified 无差,翻转源=GEMM 批组成)。
+1. **(P16-A)在线 p95 判定必须交错 ≥3 重复后 pool**——单次判过 FAIL(p95 1.079),pool 后反转 PASS(0.976)。
+2. **(P16-A)ABA 门必须有丢弃式暖机段**——首段 JIT/首触(legacy rep1 1.07s vs 0.17s)。
+3. **(P16-A)TP2 运行时开关一律 `runner.call("set_xxx")` 实例方法**;env 过不了 rank 边界。
+4. **(P16-B)本架构 cached 块住 free 列表**——"缓存扣留容量"类假设先查 `allocate` 的 revive 语义再立门。
+5. **(P16-C)真实抢占压力才能测 preempt 路径**——decode 不跨块边界=零抢占;`max_tokens` 要大到跨块。
+6. **(P17)int8 量化粒度对离群敏感**——per-token-head absmax 被 K 的 head 级离群(amax ~500 vs 典型 0.5)摧毁;合成随机数据的探针误差不能外推到真实激活。
+7. **(P17)显微测试池形状必须带 layer 维**——`[2, blocks+1, ...]` 的 `pool[0,0]` 只有 256 行,写 slot≥256 全部 OOB(连续布局会掩盖成"BITWISE")。
+8. **(隔夜)ssh 用 ControlMaster 复用**(`-o ControlMaster=auto -o ControlPath=/tmp/cm-s4000 -o ControlPersist=43200`)——反复新连接触发 MaxStartups 长冷却,复用后零断连。
+9. (继承)模型下载 hf-mirror+aria2c;ssh 后台两段式(先 cat 写脚本再启动);AutoDL 克隆异步拷贝;`scripts/` 无 `__init__.py` 用 importlib spec 加载;`NANOVLLM_PAGED_CONFIG`/`NANOVLLM_MIXED_UNIFIED`/`NANOVLLM_MIXED_MOE`/`NANOVLLM_LRU_EVICT` 语义见各报告;tiny 无 paged;bitwise 门同引擎同历史(I34)+丢首 batch(I31);`--prompt-seed-per-repeat`(I8);MaxStartups 冷却;`[p]` pgrep;api_server 默认≠生产栈。

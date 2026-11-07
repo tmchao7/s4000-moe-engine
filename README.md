@@ -10,7 +10,7 @@
 ![Parallel](https://img.shields.io/badge/Parallel-TP2%20%2B%20EP2-0D9488)
 ![Offline](https://img.shields.io/badge/Offline-141.5%20tok%2Fs%20%28b64%29-1B9E77)
 ![Online](https://img.shields.io/badge/Online-%E2%89%A51.07%20req%2Fs%20%C2%B7%20100%25%20SLO-7C3AED)
-![Verdicts](https://img.shields.io/badge/Rounds-P0%E2%80%93P15%20all%20judged-111827)
+![Verdicts](https://img.shields.io/badge/Rounds-P0%E2%80%93P18%20all%20judged-111827)
 
 </div>
 
@@ -79,7 +79,7 @@
 详细设计见 [docs/architecture.md](docs/architecture.md);当前迭代计划见 [docs/PLAN.md](docs/PLAN.md);问题台账见 [docs/ISSUES.md](docs/ISSUES.md) 与 [docs/CLOSEOUT.md](docs/CLOSEOUT.md)。
 
 <details>
-<summary><b>📈 当前进度（P0–P15 全部判决完毕 — 点击展开）</b></summary>
+<summary><b>📈 当前进度（P0–P18 全部判决完毕 — 点击展开）</b></summary>
 
 | 阶段 | 状态 | 关键数字 |
 |---|---|---|

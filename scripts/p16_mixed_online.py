@@ -58,20 +58,45 @@ def build_workload(n_long, n_short):
     return reqs
 
 
-def run_arm(model, gpu_util, reqs, max_tokens, out_dir, tag, unified):
+def run_arm(model, gpu_util, reqs, max_tokens, out_dir, tag, unified,
+            role="collocated", poisson_qps=0.0):
     env = dict(os.environ, PYTHONPATH=REPO,
                NANOVLLM_MIXED_UNIFIED="1" if unified else "0")
-    log = open(f"{out_dir}/{tag}_{'unified' if unified else 'legacy'}.log", "w")
-    proc = subprocess.Popen(
-        [sys.executable, os.path.join(REPO, "scripts/p15_pd_serve.py"),
-         "--role", "collocated", "--model", model,
-         "--gpu-util", str(gpu_util), "--port", "29740"],
-        env=env, stdout=log, stderr=subprocess.STDOUT)
+    log = open(f"{out_dir}/{tag}_{'pd' if role == 'pd' else 'coll'}_"
+               f"{'uni' if unified else 'leg'}.log", "w")
+    procs = []
+    if role == "collocated":
+        procs.append(subprocess.Popen(
+            [sys.executable, os.path.join(REPO, "scripts/p15_pd_serve.py"),
+             "--role", "collocated", "--model", model,
+             "--gpu-util", str(gpu_util), "--port", "29740"],
+            env=env, stdout=log, stderr=subprocess.STDOUT))
+        port = 29740
+    else:
+        # PD 1P1D: D on card1 (started first, listens), P on card0 (client-facing)
+        procs.append(subprocess.Popen(
+            [sys.executable, os.path.join(REPO, "scripts/p15_pd_serve.py"),
+             "--role", "decode", "--model", model,
+             "--gpu-util", str(gpu_util), "--port", "29760"],
+            env={**env, "MUSA_VISIBLE_DEVICES": "1"},
+            stdout=log, stderr=subprocess.STDOUT))
+        procs.append(subprocess.Popen(
+            [sys.executable, os.path.join(REPO, "scripts/p15_pd_serve.py"),
+             "--role", "prefill", "--model", model,
+             "--gpu-util", str(gpu_util), "--port", "29750",
+             "--d-port", "29760"],
+            env=env, stdout=log, stderr=subprocess.STDOUT))
+        port = 29750
     try:
-        client = connect_retry("127.0.0.1", 29740)
+        client = connect_retry("127.0.0.1", port)
         client.setblocking(True)
-        t0 = time.perf_counter()
+        import random
+        import time as _t
+        rng = random.Random(1234)
+        t0 = _t.perf_counter()
         for i, (_, prompt) in enumerate(reqs):
+            if poisson_qps > 0 and i:
+                _t.sleep(rng.expovariate(poisson_qps))
             send_json(client, {"req_id": i, "prompt": prompt,
                                "max_tokens": max_tokens})
         results = {}
@@ -83,11 +108,12 @@ def run_arm(model, gpu_util, reqs, max_tokens, out_dir, tag, unified):
             for msg in js.feed(chunk):
                 if msg.get("type") == "result":
                     results[msg["req_id"]] = msg
-        wall = time.perf_counter() - t0
+        wall = _t.perf_counter() - t0
         send_json(client, {"type": "done"})
         client.close()
     finally:
-        proc.wait(timeout=300)
+        for proc in procs:
+            proc.wait(timeout=300)
     return [results[i] for i in range(len(reqs))], wall
 
 
@@ -115,6 +141,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--repeats", type=int, default=3,
                         help="interleaved legacy/unified repeats; ITLs pooled")
+    parser.add_argument("--poisson-qps", type=float, default=0.0,
+                        help="0 = closed burst; >0 = client-side Poisson arrivals")
     parser.add_argument("--out", default="/root/p16_data/online.json")
     args = parser.parse_args()
 
@@ -124,17 +152,19 @@ def main():
     tag = "8b" if "8B" in args.model else "0.6b"
 
     print(f"[online] workload: {args.n_long} long + {args.n_short} short, "
-          f"max_tokens={args.max_tokens}, repeats={args.repeats} (interleaved)",
-          flush=True)
+          f"max_tokens={args.max_tokens}, repeats={args.repeats}, "
+          f"poisson_qps={args.poisson_qps}", flush=True)
     leg_all, uni_all = [], []          # pooled results across repeats
     leg_p95s, uni_p95s, leg_walls, uni_walls = [], [], [], []
     for rep in range(args.repeats):
         leg_res, leg_wall = run_arm(args.model, args.gpu_util, reqs,
                                     args.max_tokens, out_dir,
-                                    f"{tag}_r{rep}", unified=False)
+                                    f"{tag}_r{rep}", unified=False,
+                                    poisson_qps=args.poisson_qps)
         uni_res, uni_wall = run_arm(args.model, args.gpu_util, reqs,
                                     args.max_tokens, out_dir,
-                                    f"{tag}_r{rep}", unified=True)
+                                    f"{tag}_r{rep}", unified=True,
+                                    poisson_qps=args.poisson_qps)
         leg_all += leg_res
         uni_all += uni_res
         leg_p95s.append(itl_percentiles(leg_res).get("p95"))
@@ -156,7 +186,8 @@ def main():
     verdict = {
         "model": args.model,
         "workload": {"n_long": args.n_long, "n_short": args.n_short,
-                     "max_tokens": args.max_tokens, "repeats": args.repeats},
+                     "max_tokens": args.max_tokens, "repeats": args.repeats,
+                     "poisson_qps": args.poisson_qps},
         "legacy": {"itl": leg_itl,
                    "client_e2e_mean_s": round(statistics.fmean(leg_e2e), 3),
                    "wall_median_s": round(wall_leg, 2),

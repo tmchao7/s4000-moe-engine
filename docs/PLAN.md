@@ -16,22 +16,22 @@
 | # | 项 | 门/判定(预注册,不可改) | 状态 |
 |---|---|---|---|
 | A | **统一混合 batch**(vLLM V1/SGLang MIXED 形态;现状=`_run_mixed` 双 pass,I19 launch-bound) | ① 数值:混合步 LCP 翻转率 ≤0.5% vs legacy split(0.6B paged,同引擎同历史 I34);不过则 `NANOVLLM_MIXED_MOE=split` 再测,记录哪版过门 ② 性能:混合步 wall ≤0.9× legacy(0.6B+8B;CV≤5%,交错≥5,ABA) ③ 在线:混合负载 ITL p95 ≤ legacy(照实记录),吞吐降幅 ≤2% ④ 正确性:tests/p16_mixed_unified.py(纯 decode/prefill 步不受影响;fcfs 不产 mixed;边界组)+四套单测 ⑤ 门全过→默认 `NANOVLLM_MIXED_UNIFIED=1`,否则 opt-in 照录 | **判决 opt-in(11-07)**:② **PASS 双档**(0.6B 0.749×/8B 0.850×,CV≤0.044,暖机段修复 rep1 JIT 伪象)③ **PASS**(交错×3 pooled p95 0.976,吞吐 1.007;单次 1.079 系噪声)④ 单测 PASS(结构全过;7/8 逐位)① **FAIL@0.6B**(0.5602%>0.5%,确定性;**split 回退同值**→翻转源=GEMM 批组成而非 MoE 后端,回退路径穷尽;**8B 0% PASS**;对照:legacy 自身 burst-vs-drip 历史敏感性 0.294%@0.6B/0.285%@8B=同类现象;业界同机理,vLLM batch invariance 亦 beta opt-in 默认关)→ 按⑤保持 opt-in `NANOVLLM_MIXED_UNIFIED=1`,默认 legacy split 不变;报告 benchmarks/P16-mixed-unified.md |
-| B | **前缀缓存 LRU 淘汰**(现状零淘汰,池耗尽=准入跳过/抢占) | ① 单测:只淘 ref_count==0 的 hash 块 ② 活动序列生成 bitwise 不变(0.6B paged 同引擎同历史) ③ 压力负载准入硬悬崖消除(开关 A/B 对比 429/skip 曲线,seed-per-repeat) ④ 主动复用模式前缀命中率不降 ⑤ 四套单测;默认开,`NANOVLLM_LRU_EVICT=0` 关 | 未跑 |
-| C | **优先级/SLO 分级调度**(SamplingParams.priority;插件点=waiting 候选/preempt victim/chunk 顺序) | ① 0.6B 混合负载 高:低=1:3,高优先 ITL p95 ≤0.8× 无优先级基线(同引擎 A/B) ② 低优先全部完成(饥饿守卫 32 步保留) ③ 四套单测 | 未跑 |
-| D | **30B E1 单载 e2e**(tuned 表 `NANOVLLM_PAGED_CONFIG=auto` vs 默认;一次加载窗口) | e2e/decode 时延 ≥5% 且 CV≤5%(ABA 交错);负结果照录 | 未跑 |
+| B | **前缀缓存 LRU 淘汰**(现状零淘汰,池耗尽=准入跳过/抢占) | ① 单测:只淘 ref_count==0 的 hash 块 ② 活动序列生成 bitwise 不变(0.6B paged 同引擎同历史) ③ 压力负载准入硬悬崖消除(开关 A/B 对比 429/skip 曲线,seed-per-repeat) ④ 主动复用模式前缀命中率不降 ⑤ 四套单测;默认开,`NANOVLLM_LRU_EVICT=0` 关 | **判决 PASS(11-08)**:两级 victim(fresh 优先+LRU 冷块,touch-on-hit);①⑤ ✓(双策略模糊测试)②bitwise ✓ ④✓;**③前提修正**:cached 块本就住 free 列表(revive 出列),准入悬崖=纯容量,缓存从不扣留块;顺序流量 FIFO≡LRU(结构使然),分歧窗口=排队命中者 touch(t2 确定性证明);报告 benchmarks/P16-lru-priority.md |
+| C | **优先级/SLO 分级调度**(SamplingParams.priority;插件点=waiting 候选/preempt victim/chunk 顺序) | ① 0.6B 混合负载 高:低=1:3,高优先 ITL p95 ≤0.8× 无优先级基线(同引擎 A/B) ② 低优先全部完成(饥饿守卫 32 步保留) ③ 四套单测 | **判决:特性采用,门①FAIL 照录(11-08)**:priority 默认 0=逐字节 legacy(零回归面,per-request 无全局默认可翻);**高优 TTFT p50 21.8s→0.511s(42.7×)**(真实抢占压力 3 次/臂);ITL p95 比值 0.996(收益机制=准入延迟,非 decode 干扰);低优不饿死 ✓;顺带修复 I35(stall_free for-range 抢占越界,上游潜伏);api_server 透传 priority;报告 benchmarks/P16-lru-priority.md |
+| D | **30B E1 单载 e2e**(tuned 表 `NANOVLLM_PAGED_CONFIG=auto` vs 默认;一次加载窗口) | e2e/decode 时延 ≥5% 且 CV≤5%(ABA 交错);负结果照录 | **判决:负结果(11-08)**:e2e ratio 1.010~1.020(3 rep,CV<2%,极稳)——auto 一致性略慢;内核级 2× 被 MoE 主导步时稀释;tuned 表维持 opt-in,生产默认 (32,4,1) 获 e2e 确认;**E1 项闭合**;报告 benchmarks/P17-kv-int8.md §E |
 
 ### P17 KV int8 量化(I20 立项;探针:独立 dequant pass 慢 5.7×,必须融 kernel)
 
 | # | 项 | 门/判定(预注册,不可改) | 状态 |
 |---|---|---|---|
-| A | **int8 KV 池+量化写 kernel**(opt-in `kv_cache_dtype="int8"`;scale `[L,blocks+1,256,kvh]`;block_bytes 减半) | ① 量化 kernel 与 torch 参考逐位一致 ② 池块数 ≥1.8×(同 gpu-util) ③ 四套单测 | 未跑 |
-| B | **读侧融合 dequant**(paged decode kernel 两处 load 后乘 scale;`_gather_kv` gather 后 dequant) | ① LCP 翻转率 ≤2%(int8 有损,per-token-head absmax 探针往返误差 0.67%)+32-prompt 生成 sanity(完成率 100%,无乱码,平均长度偏差 ≤10%) ② decode 步时 ≤+5% vs bf16(CV≤5% 交错≥5) ③ 容量曲线:1.6× 档并发吞吐不塌 ④ 四套单测;门全过仍默认 bf16(opt-in) | 未跑 |
+| A | **int8 KV 池+量化写 kernel**(opt-in `kv_cache_dtype="int8"`;scale `[L,blocks+1,256,kvh]`;block_bytes 减半) | ① 量化 kernel 与 torch 参考逐位一致 ② 池块数 ≥1.8×(同 gpu-util) ③ 四套单测 | **判决 PASS(11-08)**:① BITWISE(正确池形状复核)② **2.0× 精确**(730→1460 块,block_bytes 减半)③ 全绿 |
+| B | **读侧融合 dequant**(paged decode kernel 两处 load 后乘 scale;`_gather_kv` gather 后 dequant) | ① LCP 翻转率 ≤2%(int8 有损,per-token-head absmax 探针往返误差 0.67%)+32-prompt 生成 sanity(完成率 100%,无乱码,平均长度偏差 ≤10%) ② decode 步时 ≤+5% vs bf16(CV≤5% 交错≥5) ③ 容量曲线:1.6× 档并发吞吐不塌 ④ 四套单测;门全过仍默认 bf16(opt-in) | **判决:机制 PASS,数值门 FAIL(11-08)**:② decode 步时 1.013× ✓ sanity ✓ ① **FAIL — 0.5(32/32 首 token 分叉,生成退化)**;**根因实测**:Qwen3 K per-head amax 196~492 vs 典型元素 0.5 → per-token-head absmax 步长淹没信号(逐件排除 plumbing:store/gather 逐位、paged+scale 4.8e-4、引擎内重算 0.0019);修复路径=per-layer-head 校准静态 scale(下轮);默认 bf16 不变;ISSUES I20 更新;报告 benchmarks/P17-kv-int8.md |
 
 ### P18 PD 小模型推进(吃 P16/P17 产出;M1/M2/M3 已 POSITIVE)
 
 | # | 项 | 门/判定(预注册,不可改) | 状态 |
 |---|---|---|---|
-| A | Poisson 持续负载 collocated vs PD A/B | 同款判决:PD ITL p95 < collocated;补 TTFT 对比 | 未跑 |
+| A | Poisson 持续负载 collocated vs PD A/B | 同款判决:PD ITL p95 < collocated;补 TTFT 对比 | **POSITIVE(11-08,双档)**:0.6B qps0.5×3rep **ratio≈0.79**(0.1023~0.1048 vs 0.1213~0.1311)、8B qps0.3×2rep **ratio≈0.82**(0.121 vs 0.148);PD TTFT +1.2~1.9s(交接传输已知代价);**PD 赢 SLO 结论在闭式突发/0.6B Poisson/8B Poisson 三种负载形态下全部成立**;脚本 scripts/p18_pd_poisson.py |
 | B | PD OpenAI 兼容端点(`/v1/chat/completions`) | 与 collocated api_server 同负载 A/B;冒烟客户端过 | 未跑 |
 | C | P 侧前缀复用 + D 侧优先级(吃 P16-B/C) | 重复前缀请求 P 侧 TTFT 下降可测;D 优先级门同 P16-C 口径 | 未跑 |
 | D | KV int8 传输(吃 P17;kv_channel index_select/index_copy_ 路径) | 传输字节 ≈½ 且传输时间下降;D 终态数值门同 P17-B;汇总组合收益 | 未跑 |
