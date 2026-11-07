@@ -30,16 +30,25 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     flat_v[slot_mapping] = value
 
 
-def _gather_kv(cache, block_table, valid_len, block_size, scale=None):
+def _gather_kv(cache, block_table, valid_len, block_size, dscale=None,
+               side=None, out_idx2d=None, head_n_out=None):
     """Gather paged KV for one sequence. valid_len: int (tokens). Returns
     (len, h, d) in bf16 — for an int8 pool the dequant rides the same flat
-    gather (P19: per-channel [h, d] scale broadcasts over the page dims)."""
+    gather (per-head dscale broadcasts, 0 at outlier dims; the exact values
+    come from the per-head compacted side pool, P20)."""
     num_blocks = (valid_len + block_size - 1) // block_size
     blocks = block_table[:num_blocks].long()
     kv = cache[blocks]
-    if scale is not None:
-        kv = (kv.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
-    return kv.view(-1, *cache.shape[-2:])[:valid_len]
+    if dscale is not None:
+        kv = (kv.to(torch.float32) * dscale.to(torch.float32)).to(torch.bfloat16)
+    kv = kv.view(-1, *cache.shape[-2:])[:valid_len]
+    if side is not None and int(head_n_out.max()) > 0:
+        s = side[blocks].view(-1, *side.shape[-2:])[:valid_len]
+        for h in range(kv.shape[1]):
+            n_h = int(head_n_out[h])
+            if n_h:
+                kv[:, h, out_idx2d[h, :n_h].long()] = s[:, h, :n_h]
+    return kv
 
 
 def _expand_kv(kv: torch.Tensor, num_heads: int, dim: int = -2) -> torch.Tensor:
@@ -103,7 +112,11 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.block_size = None  # set on first use from kv cache shape
         self.k_cache = self.v_cache = torch.tensor([])
-        self.k_scale = self.v_scale = None      # P17 int8 pools
+        self.k_scale = self.v_scale = None      # P20 int8 store scales
+        self.k_dscale = self.v_dscale = None    # read (dequant) scales, 0 at outlier dims
+        self.side_k = self.side_v = None        # exact bf16 outlier dims, per head
+        self.out_idx2d = None                   # [KVH, N_OUT_MAX] per-head dim indices
+        self.head_n_out = None                  # [KVH] active side dims per head
         self.kv_cache_is_int8 = False
         self.attention_backend = "sdpa"
         self.profiler = None
@@ -125,6 +138,8 @@ class Attention(nn.Module):
                     from nanovllm.kernels.kv_int8 import store_kvcache_int8
                     store_kvcache_int8(k, v, k_cache, v_cache,
                                        self.k_scale, self.v_scale,
+                                       self.side_k, self.side_v,
+                                       self.out_idx2d, self.head_n_out,
                                        context.slot_mapping)
                 else:
                     store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
@@ -167,8 +182,10 @@ class Attention(nn.Module):
             cu_q = context.cu_seqlens_q.tolist()
             cu_k = context.cu_seqlens_k.tolist()
         int8 = getattr(self, "kv_cache_is_int8", False)
-        k_sc = self.k_scale if int8 else None
-        v_sc = self.v_scale if int8 else None
+        k_ds = self.k_dscale if int8 else None
+        v_ds = self.v_dscale if int8 else None
+        side_k = self.side_k if int8 else None
+        side_v = self.side_v if int8 else None
         outs = []
         for i in range(len(cu_q) - 1):
             sq, sk = cu_q[i + 1] - cu_q[i], cu_k[i + 1] - cu_k[i]
@@ -182,8 +199,14 @@ class Attention(nn.Module):
                 outs.append(_sdpa(q_i, k_i, v_i, self.scale, is_causal=True))
             else:                                                  # prefix cache hit
                 start = sk - sq
-                k_i = _expand_kv(_gather_kv(k_cache, block_tables[i], sk, self.block_size, scale=k_sc), self.num_heads).transpose(0, 1)
-                v_i = _expand_kv(_gather_kv(v_cache, block_tables[i], sk, self.block_size, scale=v_sc), self.num_heads).transpose(0, 1)
+                k_i = _expand_kv(_gather_kv(k_cache, block_tables[i], sk, self.block_size,
+                                            dscale=k_ds, side=side_k,
+                                            out_idx2d=self.out_idx2d,
+                                            head_n_out=self.head_n_out), self.num_heads).transpose(0, 1)
+                v_i = _expand_kv(_gather_kv(v_cache, block_tables[i], sk, self.block_size,
+                                            dscale=v_ds, side=side_v,
+                                            out_idx2d=self.out_idx2d,
+                                            head_n_out=self.head_n_out), self.num_heads).transpose(0, 1)
                 positions = torch.arange(start, sk, device=q.device)
                 allowed = torch.arange(sk, device=q.device) <= positions.unsqueeze(1)
                 outs.append(_sdpa(q_i, k_i, v_i, self.scale, attn_mask=allowed))
@@ -193,6 +216,7 @@ class Attention(nn.Module):
         if self.attention_backend == "triton_paged":
             from nanovllm.kernels.paged_attention import paged_decode_attention
             with self._profile("attention.triton_paged"):
+                i8 = getattr(self, "kv_cache_is_int8", False)
                 return paged_decode_attention(
                     q,
                     k_cache,
@@ -201,8 +225,16 @@ class Attention(nn.Module):
                     context_lens,
                     self.scale,
                     max_context_len,
-                    k_scale=self.k_scale if getattr(self, "kv_cache_is_int8", False) else None,
-                    v_scale=self.v_scale if getattr(self, "kv_cache_is_int8", False) else None,
+                    # READ path consumes the DSCALES (0 at outlier dims —
+                    # the exact values come from the side pool), NOT the
+                    # store scales (P19 bug: passing kv_scales made the side
+                    # pool inert and reproduced the per-channel failure).
+                    k_scale=self.k_dscale if i8 else None,
+                    v_scale=self.v_dscale if i8 else None,
+                    side_k=self.side_k if i8 else None,
+                    side_v=self.side_v if i8 else None,
+                    out_idx2d=self.out_idx2d if i8 else None,
+                    head_n_out=self.head_n_out if i8 else None,
                 )
         bs = q.size(0)
         block_size = self.block_size
@@ -218,8 +250,12 @@ class Attention(nn.Module):
             v = v_cache[blocks].view(bs, full_kv_len, *v_cache.shape[-2:])
             if getattr(self, "kv_cache_is_int8", False):
                 from nanovllm.kernels.kv_int8 import dequant_gathered
-                k = dequant_gathered(k[:, :kv_len], self.k_scale)
-                v = dequant_gathered(v[:, :kv_len], self.v_scale)
+                sk_side = self.side_k[blocks].view(bs, full_kv_len, *self.side_k.shape[-2:])[:, :kv_len]
+                sv_side = self.side_v[blocks].view(bs, full_kv_len, *self.side_v.shape[-2:])[:, :kv_len]
+                k = dequant_gathered(k[:, :kv_len], self.k_dscale, sk_side,
+                                     self.out_idx2d, self.head_n_out)
+                v = dequant_gathered(v[:, :kv_len], self.v_dscale, sv_side,
+                                     self.out_idx2d, self.head_n_out)
             else:
                 k = k[:, :kv_len]
                 v = v[:, :kv_len]

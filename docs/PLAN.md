@@ -44,6 +44,12 @@
 | B | 全面 code review(独立 agent 审 8 文件) | HIGH bug 修复+回归测试;风险/nit 全处理 | **修复:分块重排队×优先级=同 seq 单步重复调度(HIGH,t6 回归)+wait_steps 语义+校准异常安全+计数器重置+api 400+touch 泄漏+scale hoist**;7/7 回归全绿 |
 | C | 指标核查 | /metrics 新计数器 + priority 400 | **✓ 活体冒烟**(kv_lru_size/kv_prefix_hit_tokens_total 暴露;priority 非整数→400) |
 
+### P20(2026-11-08 迭代轮 2:I20 终局 — 混合精度 outlier 通道)
+
+| # | 项 | 门/判定 | 状态 |
+|---|---|---|---|
+| A | 混合精度 int8 KV(per-(layer,kv_head) bf16 outlier 维 ≤4 + 侧池 + split-sum kernel) | 同 P17-B 五门 | **机制逐位正确(unit 四张量 BITWISE; 引擎重算 0.0033; 修复 P19 遗留: paged 读误用 store scales)**;**质量门 FAIL(flip 0.5/sim 0.035/degenerate 2) — 三方案连续 FAIL → I20 终判: 本模型 K/V 动态范围对 int8 不可用**; 容量 2× 奖池放弃(除非厂商 fp8); 默认 bf16 不变; int8 代码保留 opt-in-experimental |
+
 ### 范围注记
 
 - P16-A 本阶段**不做**单 varlen paged 内核(q_len≥1 统一 attention,SGLang 式)——列为 A2 可选后续,需过 E1 同款翻转门。

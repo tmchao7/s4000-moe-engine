@@ -94,6 +94,11 @@ def _trace_init(rank, stage, started=None):
 
 class ModelRunner:
 
+    # P20: per-layer cap on bf16 outlier channels kept alongside the int8 KV
+    # pool (8 of 128 dims ≈ 12.5% storage overhead; excess ratio channels
+    # fall back to clipped int8).
+    KV_N_OUT_MAX = 8
+
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         self.device = DEVICE
@@ -563,15 +568,39 @@ class ModelRunner:
             dtype=torch.int8 if kv_int8 else None,
         )
         if kv_int8:
-            # P19: per-channel (layer, head, dim) fp32 scales, frozen by
-            # calibrate_kv_int8().  Ones (not zeros) so a pre-calibration
-            # store saturates instead of dividing by zero.
+            # P20 mixed precision: per-channel store scales + read (dequant)
+            # scales (0 at outlier channels) + a compacted bf16 side pool for
+            # the outlier channels.  N_OUT_MAX caps the side width (8 of 128
+            # dims ≈ 12.5% storage overhead); excess ratio channels keep
+            # int8 with clipping.  Ones (not zeros) so a pre-freeze store
+            # saturates instead of dividing by zero.
             self.kv_scales = torch.ones(
                 2, hf_config.num_hidden_layers, num_kv_heads, head_dim,
                 dtype=torch.float32, device=self.device,
             )
+            self.kv_dscales = torch.ones(
+                2, hf_config.num_hidden_layers, num_kv_heads, head_dim,
+                dtype=torch.float32, device=self.device,
+            )
+            self.kv_side = torch.zeros(
+                2, hf_config.num_hidden_layers, config.num_kvcache_blocks + 1,
+                self.block_size, num_kv_heads, self.KV_N_OUT_MAX,
+                dtype=torch.bfloat16, device=self.device,
+            )
+            self.kv_out_idx2d = torch.zeros(
+                hf_config.num_hidden_layers, num_kv_heads, self.KV_N_OUT_MAX,
+                dtype=torch.int32, device=self.device,
+            )
+            self.kv_head_n_out = torch.zeros(
+                hf_config.num_hidden_layers, num_kv_heads,
+                dtype=torch.int32, device=self.device,
+            )
         else:
             self.kv_scales = None
+            self.kv_dscales = None
+            self.kv_side = None
+            self.kv_out_idx2d = None
+            self.kv_head_n_out = None
         self.kv_cache_is_int8 = kv_int8
         self.scratch_block_id = config.num_kvcache_blocks
         self.scratch_slot = config.num_kvcache_blocks * self.block_size
@@ -581,50 +610,84 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 if kv_int8:
-                    module.k_scale = self.kv_scales[0, layer_id]   # [KVH, D]
+                    module.k_scale = self.kv_scales[0, layer_id]    # [KVH, D]
                     module.v_scale = self.kv_scales[1, layer_id]
+                    module.k_dscale = self.kv_dscales[0, layer_id]  # read (0 at outliers)
+                    module.v_dscale = self.kv_dscales[1, layer_id]
+                    module.side_k = self.kv_side[0, layer_id]
+                    module.side_v = self.kv_side[1, layer_id]
+                    module.out_idx2d = self.kv_out_idx2d[layer_id]
+                    module.head_n_out = self.kv_head_n_out[layer_id]
                 module.kv_cache_is_int8 = kv_int8
                 layer_id += 1
 
     def kv_calibrate_begin(self):
-        """P19: start accumulating per-channel K/V amax on every int8
-        attention module (running max over all calibration forwards)."""
+        """P20: start accumulating per-channel K/V amax and mean|k| on every
+        int8 attention module (running max / running sum over all calibration
+        forwards; PREFILL forwards only — graph-replayed decode bypasses
+        Python hooks, and production is eager anyway)."""
         self._calib_handles = []
-        self._calib_amax = []
+        self._calib_stats = []
         atts = [m for m in self.model.modules()
                 if getattr(m, "kv_cache_is_int8", False)]
-        for li, module in enumerate(atts):
-            buf = {"k": None, "v": None}
+        for module in atts:
+            buf = {"k": None, "v": None, "k_sum": None, "v_sum": None, "n": 0}
 
             def make_hook(buf):
                 def hook(_module, args):
                     _, k, v = args
-                    k_amax = k.detach().abs().amax(dim=0).float()      # [KVH, D]
-                    v_amax = v.detach().abs().amax(dim=0).float()
-                    buf["k"] = k_amax if buf["k"] is None else torch.maximum(buf["k"], k_amax)
-                    buf["v"] = v_amax if buf["v"] is None else torch.maximum(buf["v"], v_amax)
+                    kf = k.detach().abs().amax(dim=0).float()          # [KVH, D]
+                    vf = v.detach().abs().amax(dim=0).float()
+                    buf["k"] = kf if buf["k"] is None else torch.maximum(buf["k"], kf)
+                    buf["v"] = vf if buf["v"] is None else torch.maximum(buf["v"], vf)
+                    buf["k_sum"] = k.detach().abs().sum(dim=0).float() if buf["k_sum"] is None \
+                        else buf["k_sum"] + k.detach().abs().sum(dim=0).float()
+                    buf["v_sum"] = v.detach().abs().sum(dim=0).float() if buf["v_sum"] is None \
+                        else buf["v_sum"] + v.detach().abs().sum(dim=0).float()
+                    buf["n"] += k.shape[0]
                 return hook
 
             self._calib_handles.append(
                 module.register_forward_pre_hook(make_hook(buf)))
-            self._calib_amax.append(buf)
+            self._calib_stats.append(buf)
 
     def kv_calibrate_freeze(self):
-        """P19: freeze per-channel scales = amax/127 (clipped) into
-        kv_scales and drop the calibration hooks."""
+        """P20: freeze store scales (amax/127), read scales (0 at outlier
+        dims), and per-(layer, kv_head) bf16 outlier-dim lists — K∪V joint
+        ratio (amax/mean) > 10, capped at KV_N_OUT_MAX dims per head.  The
+        exact outlier values live in the side pool, written at store time."""
         for handle in self._calib_handles:
             handle.remove()
         self._calib_handles = []
-        for li, buf in enumerate(self._calib_amax):
+        n_out_total = 0
+        for li, buf in enumerate(self._calib_stats):
+            scales = {}
+            ratios = []
             for ki, key in ((0, "k"), (1, "v")):
                 amax = buf[key]
                 assert amax is not None, "calibration saw no activations"
+                typ = (buf[key + "_sum"] / max(buf["n"], 1)).clamp_min(1e-6)
                 scale = (amax / 127.0).clamp_min(1e-6)
-                self.kv_scales[ki, li] = scale
-        self._calib_amax = []
-        n = self.kv_scales.numel()
-        print(f"[kv-int8] per-channel scales frozen ({n} values, "
-              f"range [{self.kv_scales.min().item():.4g}, "
+                scales[ki] = scale
+                ratios.append(amax / typ)
+            ratio = torch.maximum(*ratios)                    # [KVH, D] K∪V joint
+            for ki in (0, 1):
+                self.kv_scales[ki, li] = scales[ki]
+                dscale = scales[ki].clone()
+                self.kv_dscales[ki, li] = dscale
+            for h in range(ratio.shape[0]):
+                dims = ratio[h].nonzero().flatten()
+                dims = dims[ratio[h, dims] > 10.0][:self.KV_N_OUT_MAX]
+                n_h = int(dims.numel())
+                n_out_total += n_h
+                self.kv_out_idx2d[li, h, :n_h] = dims.to(torch.int32)
+                self.kv_head_n_out[li, h] = n_h
+                for ki in (0, 1):
+                    self.kv_dscales[ki, li, h, dims.long()] = 0.0   # exact via side pool
+        self._calib_stats = []
+        print(f"[kv-int8] mixed-precision scales frozen "
+              f"(bf16 outlier dims: {n_out_total}, "
+              f"scale range [{self.kv_scales.min().item():.4g}, "
               f"{self.kv_scales.max().item():.4g}])", flush=True)
 
     def prepare_block_tables(self, seqs: list[Sequence]):

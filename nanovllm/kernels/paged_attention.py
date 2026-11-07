@@ -73,7 +73,7 @@ if triton is not None:
     @triton.jit
     def _paged_decode_kernel(
         Q, K, V, BLOCK_TABLES, CONTEXT_LENS, OUT,
-        K_SCALE, V_SCALE,
+        K_SCALE, V_SCALE, SIDE_K, SIDE_V, OUT_IDX2D, HEAD_N_OUT,
         scale,
         stride_qb, stride_qh,
         stride_kp, stride_kt, stride_kh,
@@ -86,6 +86,8 @@ if triton is not None:
         PAGE_SIZE: tl.constexpr,
         BLOCK_N: tl.constexpr,
         HAS_SCALE: tl.constexpr,
+        HAS_SIDE: tl.constexpr,
+        N_OUT_MAX: tl.constexpr,
     ):
         batch = tl.program_id(0)
         q_head = tl.program_id(1)
@@ -101,10 +103,21 @@ if triton is not None:
         if HAS_SCALE:
             k_s_vec = tl.load(K_SCALE + kv_head * HEAD_DIM + offs_d)
             v_s_vec = tl.load(V_SCALE + kv_head * HEAD_DIM + offs_d)
+        # P20 mixed precision: exact bf16 side dims for THIS kv_head.
+        offs_nout = tl.arange(0, N_OUT_MAX)
+        stride_sk = NUM_KV_HEADS * N_OUT_MAX
+        if HAS_SIDE:
+            head_n_out = tl.load(HEAD_N_OUT + kv_head)
+            nout_valid = offs_nout < head_n_out
+            out_dims = tl.load(OUT_IDX2D + kv_head * N_OUT_MAX + offs_nout,
+                               mask=nout_valid, other=0)
+            q_out = tl.load(Q + batch * stride_qb + q_head * stride_qh + out_dims,
+                            mask=nout_valid, other=0.0).to(tl.float32)
 
         running_max = -float("inf")
         running_sum = 0.0
         acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+        acc_out = tl.zeros([N_OUT_MAX], dtype=tl.float32)
         # Runtime loop bound (not a constexpr): one compiled kernel serves every
         # context length, which is required for CUDA/MUSA graph capture.
         for start in range(0, context_len, BLOCK_N):
@@ -124,10 +137,21 @@ if triton is not None:
             )
             keys = tl.load(K + k_offsets, mask=valid[:, None], other=0.0)
             if HAS_SCALE:
+                # dscale is 0 at outlier cols: the int8 payload there is
+                # garbage but contributes exactly 0; the exact values come
+                # from the side pool below (split-sum — no register scatter).
                 keys32 = keys.to(tl.float32) * k_s_vec[None, :]
             else:
                 keys32 = keys.to(tl.float32)
             logits = tl.sum(keys32 * q32[None, :], axis=1) * scale
+            if HAS_SIDE:
+                side_k = tl.load(
+                    SIDE_K + pages[:, None] * stride_sk
+                    + (in_page[:, None] * NUM_KV_HEADS + kv_head) * N_OUT_MAX
+                    + offs_nout[None, :],
+                    mask=valid[:, None] & nout_valid[None, :], other=0.0,
+                ).to(tl.float32)
+                logits += tl.sum(side_k * q_out[None, :], axis=1) * scale
             logits = tl.where(valid, logits, -float("inf"))
 
             tile_max = tl.max(logits, axis=0)
@@ -147,16 +171,29 @@ if triton is not None:
             else:
                 values32 = values.to(tl.float32)
             acc = acc * old_scale + tl.sum(probs[:, None] * values32, axis=0)
+            if HAS_SIDE:
+                side_v = tl.load(
+                    SIDE_V + pages[:, None] * stride_sk
+                    + (in_page[:, None] * NUM_KV_HEADS + kv_head) * N_OUT_MAX
+                    + offs_nout[None, :],
+                    mask=valid[:, None] & nout_valid[None, :], other=0.0,
+                ).to(tl.float32)
+                acc_out = acc_out * old_scale + tl.sum(probs[:, None] * side_v, axis=0)
             running_sum = running_sum * old_scale + tl.sum(probs, axis=0)
             running_max = new_max
 
         output = acc / running_sum
         tl.store(OUT + batch * stride_ob + q_head * stride_oh + offs_d, output)
+        if HAS_SIDE:
+            out_final = acc_out / running_sum
+            tl.store(OUT + batch * stride_ob + q_head * stride_oh + out_dims,
+                     out_final, mask=nout_valid)
 
 
 def paged_decode_attention(
     q, k_cache, v_cache, block_tables, context_lens, scale, max_context_len,
-    k_scale=None, v_scale=None,
+    k_scale=None, v_scale=None, side_k=None, side_v=None,
+    out_idx2d=None, head_n_out=None,
 ):
     if triton is None:
         raise RuntimeError("triton is required for triton_paged attention")
@@ -178,10 +215,16 @@ def paged_decode_attention(
     block_n, num_warps, num_stages = _resolve_config(batch)
     grid = (batch, num_heads)
     has_scale = k_scale is not None
+    has_side = side_k is not None and int(head_n_out.max()) > 0
+    n_out_max = side_k.shape[-1] if has_side else 1
     _paged_decode_kernel[grid](
         q, k_cache, v_cache, block_tables, context_lens, output,
         k_scale if has_scale else q,      # dummy ptr when unused (tl needs an arg)
         v_scale if has_scale else q,
+        side_k if has_side else q,
+        side_v if has_side else q,
+        out_idx2d if has_side else q,
+        head_n_out if has_side else q,
         scale,
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
@@ -194,6 +237,8 @@ def paged_decode_attention(
         PAGE_SIZE=page_size,
         BLOCK_N=block_n,
         HAS_SCALE=has_scale,
+        HAS_SIDE=has_side,
+        N_OUT_MAX=n_out_max,
         num_warps=num_warps,
         num_stages=num_stages,
     )
