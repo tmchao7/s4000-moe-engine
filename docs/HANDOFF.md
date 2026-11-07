@@ -1,66 +1,52 @@
-# HANDOFF — 当前交接(滚动更新;本版 = P14 收官,2026-10-30)
+# HANDOFF — 当前交接(滚动更新;本版 = P15 收官,2026-11-07)
 
-> 本文是**唯一交接文档**(历史版本在 git 历史)。接手先读本文,再按 [AGENTS.md](../AGENTS.md) 核验环境与命令。规则不变:先写门再跑;一次一个 GPU 任务;负结果照录;本地 commit(不 push 除非用户授权);到点无论进度必须停下写交接、清服务器。
-> 配套文档:[docs/CLOSEOUT.md](./CLOSEOUT.md)(**已解决/无法解决清单**)、[docs/E-vendor-ticket.md](./E-vendor-ticket.md)(厂商工单,成文待发)、[docs/P13-survey.md](./P13-survey.md)、[docs/PD-DISAGG-SURVEY.md](./PD-DISAGG-SURVEY.md)。P13/P14 任务书已执行完毕,存 git 历史(`docs/PROMPT-P13.md`/`PROMPT-P14.md`);`docs/RESUME.md`(面试材料)只在本地,不入库。
+> 本文是**唯一交接文档**(历史版本在 git 历史)。接手先读本文,再按 [AGENTS.md](../AGENTS.md) 核验环境与命令。规则不变:先写门再跑;一次一个 GPU 任务;负结果照录;本地 commit(用户授权后才 push);到点无论进度必须停下写交接、清服务器。
+> 配套:[docs/PLAN.md](./PLAN.md)(迭代计划与冻结门)、[docs/ISSUES.md](./ISSUES.md)(台账)、[docs/CLOSEOUT.md](./CLOSEOUT.md)、[docs/E-vendor-ticket.md](./E-vendor-ticket.md)(厂商工单,**待用户亲自发**)、[docs/PD-DISAGG-SURVEY.md](./PD-DISAGG-SURVEY.md)(PD 立项调研)。`docs/RESUME.md` 只在本地不入库。
 
 ## 0. 三十秒状态
 
-- **仓库**:`feat/musa-port`;P14 全部本地 commit(未 push)。
-- **服务器**:已清零核验(双卡 0 MiB、无进程、shm 干净、`/tmp/nanovllm-p14.lock` 已删)。证据 JSON 已拉回 `benchmarks/data/p14/`;服务器 `/root/p14_data/` 留有全量日志。
+- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;HEAD 已 push(P15 全量,2026-11-07)。
+- **服务器**:新 seetacloud 实例(ssh 别名 `s4000`,**克隆到的新宿主机**,旧实例带宿主级泄漏可释放)。双卡 0 MiB、模型 0.6B/8B/30B 齐(9/9 shard 校验)、四套单测全绿、30B 冒烟通过。
 - **生产栈(未变)**:`triton_paged` + `grouped_mm`(prefill)/`bmm_dense`(decode) + `enforce_eager=True` + `stall_free` + TP2/EP2 + chunk-256。**默认值一个没动**。
-- **P14 一句话**:项目**可以收官**。补测全部完成并有终局:容量拐点找到(1.6×~1.8×,硬饱和 ≈1.2 req/s);1k 冷态 1.0 档用 chunk-2048 过 TTFT 门(有 ITL 代价);客户端暖缓存伪象根治;I12 引擎侧兜底落地;I29 找到官方线索(缓解不修复)。剩余问题全部归档在 [CLOSEOUT.md](./CLOSEOUT.md) B 节——都需要厂商或用户。
+- **P15 一句话**:合成线(快赢 → I29 复测 → PD)全部判决。**E1 autotune 内核 2× 但数值门 FAIL(默认不翻,opt-in);I29 新栈维持(形态变为 init 楔 + 驱动级残留);PD 分离单机双卡小模型线全闭环——M1/M2 bitwise + M3 在线 A/B POSITIVE(ITL p95 −16~25%)**。
+- **I29 红线(用户明令)**:**不要再运行 graph replay 类实验**(`tests/p15_i29_engine_probe.py` 保留作历史证据,其楔死会留下宿主级 22GB 无主显存,容器内不可清)。
 
-## 1. P14 结论(报告 `benchmarks/P14-*.md`)
+## 1. P15 结论(报告 `benchmarks/P15-pd-autotune.md`)
 
 | 项 | 判定 | 关键数字 |
 |---|---|---|
-| **P0 `--prompt-seed-per-repeat`** | 合入 | 默认关=行为不变;repeat k 用 `seed+(k-1)*1000003`;实测三 repeat 前缀命中增量 0(真冷);单测 + `prompt_seeds_used` 入 JSON |
-| **I12 teardown 看门狗** | 合入 | `LLMEngine.exit()` 超时(`NANOVLLM_EXIT_TIMEOUT_S`,默认 60 s)kill rank + unlink shm + `os._exit`;`tests/p14_exit_watchdog.py` 三例 PASS |
-| **P1 容量上界** | 拐点 ∈ (1.6×, 1.8×) | 1.8× slo_std 94.5/87.5/80.5%(<99% 门),2.0× 30–62%;完成吞吐饱和 ≈1.20–1.23 req/s;已验证 ≥1.070 req/s;无 429 |
-| **P2 1k 冷态 1.0 档** | **门 PASS** | chunk-2048:TTFT p50 1.08–1.12 s(≤2 s;chunk-1024 为 2.2 s);代价:slo_strict 18–24%、最大 ITL p95 ~1.2–1.5 s;不设默认 |
-| **I29 MCCL 混用探针** | 缓解非修复 | 0.6B TP2 整图完整通过:base 0/8、`=0` 0/3、`MCCL_GRAPH_MIXING_SUPPORT=1` 3/9;30B 整图红线不放开 |
-| **联网/杂项** | 已记录 | ~2048 图上限=厂商已知(SGLang #27537);I20 探针:朴素 dequant 比 bf16 拷贝慢 5.7×→须融进 kernel;PD M0 单机侧:有 CX-6 + `mt_peermem`,mooncake-musa wheel 可下 |
+| **E1 paged kernel autotune** | **FAIL→opt-in** | 内核级 1.59–2.90×(32 配置×16 形状);无全局 bitwise 配置;0.6B LCP 翻转率 0.81%>0.5% 冻结门 → 默认保持 (32,4,1),tuned 表 `NANOVLLM_PAGED_CONFIG=auto` |
+| **I29 新栈复测** | **维持(形态改变)** | 纯张量梯子 7/8 绿;引擎级 2 clean + 1 WEDGE(init/capture 段);残显存 22GB 宿主级,跨容器重启/关机开机/克隆均持久 → **AutoDL 工单是唯一清除路径** |
+| **PD Step 0** | **GO(零 GPU)** | 读既有 evidence:合部模式 ITL p99/p50 = 2.3–6.3×,全场景 ≥2× 门 |
+| **PD M1(KV 原语)** | **PASS** | 三臂 bitwise(锚点/同块恢复/换新块重挂);I28 变体修入通道(index_select/index_copy_ 连续化) |
+| **PD M2(1P1D 端到端)** | **PASS(0.6B+8B)** | 卡0=P/卡1=D;PD==同引擎 collocated 6/6 bitwise;交接契约=P prefill 内核采样 C1 随 KV 交付 |
+| **PD M3(并发化+在线 A/B)** | **POSITIVE(双档)** | ITL p95 比值 0.753×(0.6B)/0.839×(8B);8B 全分位改善;client e2e −41~48%;吞吐 −15~27%(PD 赢 SLO 不赢吞吐,实测验证) |
+| **I34(新发现)** | 台账登记 | collocated token 依赖引擎状态历史(泛化 I31);bitwise 门必须同引擎同历史对照 |
 
-回归四套(`test_benchmarking_v3` 28 passed、`p8_scheduler_gaps`、`p2_grouped_mm`、`p6_bmm_dense_tiny`)均 rc=0。
+回归四套在新机器全绿(`test_benchmarking_v3` 28 passed、`p8_scheduler_gaps`、`p2_grouped_mm`、`p6_bmm_dense_tiny`)。
 
 ## 2. 已判决不要再碰(累计)
 
-投机解码 NO-GO;I19 融合换步时否定;整图 TP2 否决(I29,P14 追加缓解线索但红线不变);分段图服务化关闭;I30 回归主张否定;I8 机理闭合+冷态 1.0 档解法已知;split=0/chunk-2048 **短 prompt 默认化**否决(P10);fused RMSNorm/容量收缩/placement 不采用;host-sync/mixed-split 已采纳;paged 已转正;I31 首 batch 丢弃协议;**eager 容量上界已测(P14)**。
+投机解码 NO-GO;I19 融合换步时否定;整图 TP2 否决(I29,P15 追加"init 楔+驱动级残留"形态,**实验类命令用户已封存**);分段图服务化关闭(单流开关保留);I30 回归主张否定;I8 机理闭合;split=0/chunk-2048 短 prompt 默认化否决;fused RMSNorm/容量收缩/placement 不采用;host-sync/mixed-split 已采纳;paged 已转正;I31→I34 状态历史协议;**eager 容量上界已测;E1 autotune 已判决(默认不翻);PD 小模型线已闭环**。
 
-## 3. 下轮 Top-N(都是可选;项目本体已收官)
+## 3. 下轮 Top-N(按 ROI)
 
 | 优先 | 项 | 说明 |
 |---|---|---|
-| 1 | **用户亲自发厂商工单** | [E-vendor-ticket.md](./E-vendor-ticket.md)(渠道 developer.mthreads.com / vllm-musa issues)。已含 MCCL 文档线索、2048 交叉印证、P14 探针表 |
-| 2 | I29 后续(0.6B/8B,零 30B) | 8B TP2 同三臂复测;再试 `MCCL_GRAPH_HELPER_DISABLE=1`;**30B 整图需用户另行批准** |
-| 3 | 是否 push | 本仓库所有 commit 均未 push,由用户决定 |
-| 4 | I20 int8 KV(周级) | 先写融合 dequant 的 paged attention kernel 原型再谈带宽收益 |
-| 5 | PD 分离 M0 | 需第二台机器;单机前置已满足(CX-6 + mt_peermem) |
+| 1 | **用户亲自发厂商工单** | [E-vendor-ticket.md](./E-vendor-ticket.md) 已并入 P15 新栈证据(init 楔 + 驱动级残留);渠道 developer.mthreads.com / vllm-musa issues |
+| 2 | KV cache 淘汰(LRU) | 前缀缓存只进不出,容量耗尽=准入硬悬崖;加法型特性,必出结果 |
+| 3 | 优先级/SLO 分级调度 | 业界标配(SGLang 同款);调度层"做足"主项 |
+| 4 | collocated-TP1 对照补测(可选) | 隔离 PD ITL 优势中"去 TP AR"的混淆分量 |
+| 5 | 30B E1 单载实测 | tuned 表 e2e 确认(内核 2× 已证);一发加载 |
+| 6 | 旧实例释放 + AutoDL 工单 | 旧宿主机 22GB 无主显存只有平台能清 |
 
-**不要做**:分段图服务化、norm/rope 单点融合、EAGLE3(前置 I19)、chunk-256→2048 默认化。
+**不要做**:graph replay 类实验(用户封存)、分段图服务化、norm/rope 单点融合、EAGLE3、chunk-2048 短 prompt 默认化、E2(vllm_fused 非生产路径)。
 
-## 4. SOP/坑(P13 继承 + P14 新增)
+## 4. SOP/坑(继承 + P15 新增)
 
-1. 跨 repeat 的 unique prompt 默认相同(已有开关根治):**1k 冷态一律加 `--prompt-seed-per-repeat`**;shared 模式该开关无作用。
-2. tiny 模型不能跑 triton_paged;跨模式 bitwise 门只能在 0.6B paged 上下。
-3. 服务停掉后 `/dev/shm/nanovllm_*` 可能残留 → 停服务前扫 `/proc/<pid>/fd` 记 owned shm(`p14_run.py` 已实现),`fuser` 确认后删。`fcntl` lock 文件 `/tmp/nanovllm-p1x.lock` 在 runner 退出后仍存在,**需手动删**。
-4. 图/楔死类探针:每 run 独立进程 + 硬 `timeout`,超时按 PID 清场再 `fuser` 清 shm(`scripts/p14_mccl_probe.sh` 模板);楔死的 run 要等到 timeout,别提前判。
-5. **SSH 偶发 `Connection closed by ...`**:长时间不连后首次连接常失败,等 90–120 s 重试即可;不要把 `tail` 等状态输出和 `tar czf -` 管道混在同一条 ssh 命令里(会污染 tgz)。
-6. 旧栈/高载档 repeat CV 可达 8–12% → 跨栈 A/B 必须同 session ABA 包夹。
-7. (继承)EADDRINUSE 端口竞态 flake 单独重跑;MaxStartups 冷却 60–90 s;锚定 pgrep;api_server 默认 ≠ 生产栈(必须 `--decode-moe-backend bmm_dense`)。
-
-## 5. 红线
-
-见 [AGENTS.md](../AGENTS.md);重申:默认值全部不动(`enforce_eager=True`、`NANOVLLM_SEGMENT_GRAPH=0`、`_SEG_BUCKETS=default`、`_SEG_PAD_RATIO=0`、不设任何 `MCCL_*`);远端伪 `.git` 绝不提交;本地 commit 不 push 除非授权;一次一个 GPU 任务;30B 图实验禁止(I29)。
-
-## 6. 证据索引(本地 `benchmarks/data/p14/`,sha256 全表见 `SHA256SUMS`;**`benchmarks/data/` 被 .gitignore 忽略,与 P13 一致,证据只在本机和服务器 `/root/p14_data/`,不进 git**)
-
-| 文件 | 内容 |
-|---|---|
-| `capacity_hi.json` | P1:1.8×/2.0× ×3 repeat |
-| `long2048_cold.json` | P2:chunk-2048 冷态 1.0 档 ×3 repeat(seed-per-repeat) |
-| `p14_summary.json` | 两份结果的逐 repeat 统计(人工复算) |
-| `mccl/`、`mccl2/`、`mccl_probe*.log` | I29 MCCL_GRAPH_MIXING_SUPPORT 探针两批 |
-| `int8_kv_probe.json` | I20 int8↔bf16 带宽探针 |
-
-报告:`benchmarks/P14-serving.md`、`benchmarks/P14-mccl-mixing.md`;执行器 `scripts/p14_run.py`、`scripts/p14_mccl_probe{,2}.sh`、`scripts/p14_int8_kv_probe.py`;服务器日志 `/root/p14_data/`。
+1. **模型下载**:modelscope CDN 单流仅 3–10 MB/s;**hf-mirror + `aria2c -x16 -s16 -k4M` ≈22 MiB/s**(31GB≈22min);hf-mirror 突发小文件间歇 403(rc=22/29)→ 幂等重跑 + curl 兜底。
+2. **ssh 后台启动**:`ssh host '... && setsid nohup cmd & echo; sleep'` 会把整条 && 链后台化 → stdin 竞态写出 0 字节脚本;**先 `ssh 'cat > f' < local` 干净写入+校验,再单独 ssh 启动**;启动后 ssh 可能挂住本地 120s(远端不受影响,另开连接验证)。
+3. **AutoDL 克隆实例的数据是异步后台拷贝**(du 会涨),用前逐 shard 校验尺寸;克隆大概率落同宿主机(数据卷本地),换机要靠克隆+运气或工单。
+4. `scripts/` 无 `__init__.py` → 跨脚本共享代码放 `nanovllm/pd/` 等正式包;非阻塞 socket 大载荷 sendall 会 BlockingIOError(发送侧临时切阻塞);同进程第二引擎是已知失败模式。
+5. `NANOVLLM_PAGED_CONFIG`:`auto`=tuned 表;`BN,warps,stages`=钉死;缺省=生产 (32,4,1)。泄漏期 KV 预算被设备级 used 毒化时,引擎构建用 `--gpu-util 0.9` 绕过。
+6. (继承)1k 冷态一律 `--prompt-seed-per-repeat`;tiny 不能跑 triton_paged,bitwise 门只在 0.6B paged;EADDRINUSE 单独重跑;MaxStartups 冷却 60–90 s;锚定 pgrep(`[p]` 括号);api_server 默认 ≠ 生产栈(须 `--decode-moe-backend bmm_dense`);`/tmp/tiny_moe` 用 `scripts/make_tiny_moe.py` 重建。

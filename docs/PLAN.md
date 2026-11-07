@@ -20,17 +20,10 @@
 | C-M3 | **PD 并发化 + collocated vs PD 在线 A/B** | 门:PD ITL p95 < collocated | **POSITIVE(11-07)**:0.6B p95 比值 **0.753×**、8B **0.839×**(全分位改善,e2e −41~48%,吞吐 −15~27% 符合"PD 赢 SLO 不赢吞吐");TP1 去 AR 混淆已注记;报告 benchmarks/P15-pd-autotune.md §H;PD 主线 M1/M2/M3 全闭环 |
 | E | backlog(过 A–C 后再排):KV cache 淘汰(LRU)、优先级/SLO 分级调度、I20 KV int8(须融 kernel) | — | 未排 |
 
-## 1b. P13 收官存档(2026-10-30 全部判决,报告 benchmarks/P13-*.md)
+## 1b. P13 收官存档(2026-10-30 五项全判决,细节见 git 历史与本节报告)
 
-> P13 夜间轮执行状态(10-29 23:28 → 10-30 11:45,五项全收官,报告 `benchmarks/P13-*.md`):**① I30 关闭**(ABA 三加载:现树快于 pre-P8 旧栈 23–51%,P9 回归主张否定,旧树已删);**② I33 修复验证+分支关闭**(密桶 1056 图零失败 + pad 回退;padding 税证实并消除:0.9 档 +14.7%→+2.3%;残余 AR 串行化 +4.7% 超 F2 门 → 段图定格单流开关,默认不变);**③ I8/I26 闭合**(冷缓存塌=chunk 粒度,chunk-1024 砍冷 TTFT −56~57%;零 429 零崩;⚠️ 跨 repeat 确定性 prompt→暖缓存口径伪象);**④ 容量下界 1.070 req/s**(1.6× 档双口径 100%,拐点未探到);**⑤ 厂商工单包成文**(docs/E-vendor-ticket.md)。默认值全部未动;`_SEG_BUCKETS`/`_SEG_PAD_RATIO` 以默认惰性保留。
+I30 关闭 / I33 修复验证后段图定格单流开关 / I8+I26 闭合(chunk 粒度) / 容量下界 1.070 req/s / 厂商工单成文。报告:`benchmarks/archive/P13-*.md`。
 
-| # | 项 | 门/判定 | 状态 |
-|---|---|---|---|
-| 1 | **segment 在线 L3 A/B + 转正决策**(最大收益) | SLO 双门不劣化 + 1.0 档 TPOT p95 不劣于 eager 臂 + 低载档改善可见;过门 → 翻默认 + 4 单测套件 + 0.6B S2 快速复验。**前提(I32):两臂带 `--decode-moe-backend bmm_dense --max-num-seqs 64`** | **判定 FAIL(10-29 晚):门①PASS/②③FAIL,TPOT p95 慢 5.9–14.7%;B2 复跑确认。默认不翻,P1 取消** |
-| 2 | I30 v4 口径复核重跑(pre-P8 树重放) | 判定树冻结于 P11-serving.md:旧栈 ×3 ≈0.33 → 回退真实(P8 二分);≈0.39 → v4 假象关闭 I30;预算按旧栈实速(0.9/1.0 两档 ×3 ≈ 50 min) | 未跑(P6D 树已预部署于 `/root/moe-server-p6d`) |
-| 3 | Poisson 饱和 bracketed(`--fractions 1.2,1.4 --repeats 3`) | 报告 slo_standard ≥99% 的最大达成 QPS | **PASS:1.2/1.4 档双口径全 100%(0.924/1.036 req/s 实测),拐点 ≥1.218 qps 未探到** |
-| 4 | b32 +3.8% 回退归因/缓解(可选) | AR/replay 重叠或高载自动降级 eager;收益上限 3.8% | 未排 |
-| 5 | (低优)mixed-step segment 化预研 / 1k prefill kernel profile / I20 KV 量化 / E1 / E2 | — | 未排 |
 
 ## 2. 冻结门汇总(集中一处,**均不可改**)
 

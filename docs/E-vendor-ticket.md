@@ -41,7 +41,9 @@
 | `MCCL_GRAPH_MIXING_SUPPORT=0` | 0 / 3 |
 | `MCCL_GRAPH_MIXING_SUPPORT=1` | **3 / 9**(单 run 36 s) |
 
-结论:打开混用支持能缓解但不能消除楔死,**说明"图内/图外 MCCL 混用"是成分之一、尚有另一个楔死源**。请厂商:① 确认单通信器(WORLD)的 captured/non-captured 混用是否也在该死锁机制覆盖范围内;② 指认剩余楔死源或提供图级诊断。详细数据:`benchmarks/P14-mccl-mixing.md`。
+结论:打开混用支持能缓解但不能消除楔死,**说明"图内/图外 MCCL 混用"是成分之一、尚有另一个楔死源**。请厂商:① 确认单通信器(WORLD)的 captured/non-captured 混用是否也在该死锁机制覆盖范围内;② 指认剩余楔死源或提供图级诊断。详细数据:`benchmarks/archive/P14-mccl-mixing.md`。
+
+**P15 补充(2026-11-07,torch 2.11.0.post1 新栈实测)**:楔死在新栈仍存在且**形态改变**——纯张量梯子(96 AR/大载荷/bmm 混合/2400 节点)7/8 全绿,但引擎级 0.6B TP2 paged 整图 ×3 = 2 clean + **1 WEDGE(楔在 engine-init/capture 段而非首次 replay)**,且留下**驱动级无主残显存 22GB**(mthreads-gmi 显示占用但进程表为空,跨容器重启/完整关机-开机/克隆实例均持久)。证据:`tests/p15_i29_engine_probe.py`。请厂商:③ 解释 init/capture 阶段楔死的机制与残留显存为何不被驱动回收。
 
 ## 2. 问题二:MUSA 驱动每进程存活图可执行文件 ~2048 上限(torchada 已披露,求证细节)
 
@@ -63,7 +65,7 @@ torchada README:"The MUSA driver caps the number of live graph *executables* per
 
 - `tests/p9_mccl_graph_probe.py`(分级探针,独立进程+watchdog)
 - `tests/p8_graph_padfix.py --tp 2`(引擎级复现 harness,两进程口径)
-- `benchmarks/P9-graph.md`、`benchmarks/P11-graph.md`、`benchmarks/P12-serving.md`(全过程与冻结门)
+- `benchmarks/archive/P9-graph.md`、`benchmarks/archive/P11-graph.md`、`benchmarks/archive/P12-serving.md`(全过程与冻结门)
 - 分段图替代实现作为 workaround 已验证:`NANOVLLM_SEGMENT_GRAPH=1`(图内零 MCCL,每层两段,all-reduce eager 在段间)——0.6B/8B/30B 离线门全过、768 图零失败、跨臂逐位 0 翻转;但在 TP2 上只能作为 workaround,批量 ≥8 时因桶 padding 与段间 eager AR 净负(详见 P12)。
 - 运行环境:`docs/musa-pitfalls.md` 记录的其他平台坑(跨块 strided view D2H 返回垃圾 I28、FP8 逐 expert 反量化 351 s 等)。
 

@@ -9,8 +9,8 @@
 | 客户端跨 repeat 暖缓存口径伪象(I8) | `benchmark_online.py --prompt-seed-per-repeat`(默认关) | 单测 `test_prompt_seed_per_repeat_changes_unique_prompts`;ISSUES I8 |
 | I12 teardown 卡死(引擎侧) | `LLMEngine.exit()` 看门狗:`NANOVLLM_EXIT_TIMEOUT_S`(默认 60 s)超时 kill rank、unlink shm、`os._exit` | `tests/p14_exit_watchdog.py` 三例 PASS;ISSUES I12 |
 | "~2048 图上限"是不是我们的误判 | 否:SGLang PR #27537 + torchada 文档均确认 MUSA 驱动每进程约 2048 个 `musaGraphExec_t` | 工单 §2 已补 |
-| I29 有没有可用线索 | 有:MCCL 官方文档点名"捕获/未捕获 MCCL 混用 → 死锁",`MCCL_GRAPH_MIXING_SUPPORT=1` 使 0.6B TP2 整图完整通过 0/11→3/9 | [benchmarks/P14-mccl-mixing.md](../benchmarks/P14-mccl-mixing.md) |
-| eager 容量上界 | 拐点落在 1.6×~1.8×：1.8× 三 repeat 94.5/87.5/80.5%（<99% 门），2.0× 30–62%；硬饱和吞吐 ≈1.2 req/s；已验证 ≥1.070 req/s | [P14-serving.md](../benchmarks/P14-serving.md) |
+| I29 有没有可用线索 | 有:MCCL 官方文档点名"捕获/未捕获 MCCL 混用 → 死锁",`MCCL_GRAPH_MIXING_SUPPORT=1` 使 0.6B TP2 整图完整通过 0/11→3/9 | [benchmarks/archive/P14-mccl-mixing.md](../benchmarks/archive/P14-mccl-mixing.md) |
+| eager 容量上界 | 拐点落在 1.6×~1.8×：1.8× 三 repeat 94.5/87.5/80.5%（<99% 门），2.0× 30–62%；硬饱和吞吐 ≈1.2 req/s；已验证 ≥1.070 req/s | [P14-serving.md](../benchmarks/archive/P14-serving.md) |
 | 1k 冷态 1.0 档 | chunk-2048 + seed-per-repeat：TTFT p50 1.08–1.12 s，**门 PASS**（chunk-1024 为 2.2 s）；代价：slo_strict 18–24%（最大 ITL ~1.2–1.5 s） | 同上 |
 
 ## B. 无法解决(及原因 / 谁能解决 / 当前绕过)
@@ -25,9 +25,9 @@
 | **I28 torch.musa 跨块 strided view D2H 返回垃圾** | 平台 bug 嫌疑 | torch_musa 团队 | `.contiguous()`/分 K/V 读 |
 | **I31 30B 首 batch 与稳态逐位不同** | 机制未查(候选:JIT/autotune/allocator 首次布局)。无外部线索,也非性能问题 | 需单独开一轮 bisect;收益低 | 一致性门丢弃首 batch |
 | **I19 每步固定成本 / S6 EAGLE3** | I19 已被实测否定"launch-bound→融合换步时";EAGLE3 需训练头 + 大改引擎,且前置收益不明 | 立项决策(周级工程) | 不做 |
-| **PD 分离** | 需第二台机器与跨机网络（两机 iperf3/RDMA 带宽未测）。**单机 M0 探针已做**：本机有 ConnectX-6（mlx5_0/1/bond）、`mt_peermem` 内核模块已加载（GPUDirect RDMA 前置满足）；`mthreads-gmi topo -m` 显示 GPU0/1 ↔ NIC0/1 为 NODE（同 NUMA），NIC2 为 SYS；`mooncake-transfer-engine-musa 0.3.13.post1` wheel 可从源下载（未安装，不改 site-packages）| 用户提供第二台机器 | 调研文档 `docs/PD-DISAGG-SURVEY.md` |
+| ~~PD 分离~~ → **P15 已完成单机双卡小模型线** | (原判"需第二台机器"仅针对 30B 生产拓扑;≤8B 单机双卡成立) | — | M1/M2/M3 全 PASS:bitwise 交接 + 在线 A/B ITL p95 0.753×(0.6B)/0.839×(8B);见 [P15-pd-autotune.md](../benchmarks/P15-pd-autotune.md) |
 | **I20 int8 KV** | 周级工程。探针结论：朴素 torch dequant 比 bf16 拷贝慢 5.7×，必须融进 attention kernel | 立项 | 探针数据见 ISSUES I20 |
-| **E1/E2 kernel/MoE 配置自调** | 可做但 ROI 低(decode 已用 bmm_dense) | 有人愿意花 30–60 min | 不做 |
+| ~~E1 kernel autotune~~ → **P15 已判决** | 32 配置×16 形状实测内核 1.59–2.90×,但 0.6B LCP 翻转率 0.81%>0.5% 冻结门 → 默认不翻 | 转正需产品决策接受新数值契约(同 I4 流程) | tuned 表保留 `NANOVLLM_PAGED_CONFIG=auto` opt-in |
 
 ## C. 需要用户亲自做
 
