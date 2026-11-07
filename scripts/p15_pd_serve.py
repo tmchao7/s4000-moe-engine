@@ -40,11 +40,16 @@ def listen(port):
     return s
 
 
-def build_engine(model, gpu_util, tensor_parallel_size, max_num_seqs=8):
+def build_engine(model, gpu_util, tensor_parallel_size, max_num_seqs=8,
+                 num_kvcache_blocks=0):
     from nanovllm import LLM
+    kwargs = {}
+    if num_kvcache_blocks > 0:
+        kwargs["num_kvcache_blocks"] = num_kvcache_blocks
     return LLM(model, enforce_eager=True, tensor_parallel_size=tensor_parallel_size,
                attention_backend="triton_paged", max_model_len=2048,
-               max_num_seqs=max_num_seqs, gpu_memory_utilization=gpu_util)
+               max_num_seqs=max_num_seqs, gpu_memory_utilization=gpu_util,
+               **kwargs)
 
 
 def live_seqs(llm):
@@ -53,8 +58,11 @@ def live_seqs(llm):
 
 def sampling_params(msg):
     from nanovllm import SamplingParams
+    # P18-C: priority rides the client request → P-side admission → handoff
+    # ctrl frame → D-side Sequence (preempt victim / waiting order).
     return SamplingParams(temperature=0, max_tokens=msg["max_tokens"],
-                          ignore_eos=True)
+                          ignore_eos=True,
+                          priority=int(msg.get("priority", 0)))
 
 
 # ---------------------------------------------------------------- collocated
@@ -106,7 +114,8 @@ def role_decode(args):
     from nanovllm.engine.sequence import Sequence, SequenceStatus
     from nanovllm.pd.kv_channel import TcpKVChannel, KVFrameAssembler, import_kv
 
-    llm = build_engine(args.model, args.gpu_util, tensor_parallel_size=1)
+    llm = build_engine(args.model, args.gpu_util, tensor_parallel_size=1,
+                       num_kvcache_blocks=args.kv_blocks)
     kv_srv, ctrl_srv = listen(args.port), listen(args.port + 1)
     print(f"[decode] listening on {args.port}/{args.port + 1}", flush=True)
     kv_sock, _ = kv_srv.accept()
@@ -117,7 +126,9 @@ def role_decode(args):
     assembler = KVFrameAssembler()
     ctrl_js = JsonStream()
     bm = llm.scheduler.block_manager
-    pending = deque()      # (req_id, seq) waiting for their KV frame
+    pending = deque()      # (req_id, seq) admitted, waiting for their KV frame
+    ready = deque()        # assembled KV frames, FIFO-matched to `pending`
+    hold = deque()         # handoffs waiting for free D-side blocks (backpressure)
     fin_map = {}           # seq_id -> req_id
     sel = selectors.DefaultSelector()
     sel.register(kv_sock, selectors.EVENT_READ)
@@ -137,30 +148,39 @@ def role_decode(args):
                     if msg.get("type") == "done":
                         running = False
                         break
-                    toks = list(msg["token_ids"])
-                    seq = Sequence(toks, sampling_params(msg))
+                    seq = Sequence(list(msg["token_ids"]), sampling_params(msg))
                     seq.num_prompt_tokens = seq.num_tokens - 1  # C1 = completion #1
                     seq.status = SequenceStatus.RUNNING
                     seq.is_prefill = False
                     seq.num_cached_tokens = seq.num_prompt_tokens
-                    seq.block_table = [bm._allocate_block()
-                                       for _ in range(msg["nblocks"])]
-                    pending.append((msg["req_id"], seq))
-                    print(f"[decode] admitted req{msg['req_id']} ctx={seq.num_tokens}",
-                          flush=True)
+                    hold.append((msg, seq))
             else:
-                for (n, k_bytes, v_bytes) in assembler.feed(chunk):
-                    req_id, seq = pending.popleft()
-                    shape = (n,) + kvchan.buf.k.shape[1:]
-                    arr_k = torch.frombuffer(bytearray(k_bytes), dtype=torch.int16)
-                    arr_v = torch.frombuffer(bytearray(v_bytes), dtype=torch.int16)
-                    kvchan.buf.k[:n] = arr_k.view(kvchan.buf.k.dtype).reshape(shape)
-                    kvchan.buf.v[:n] = arr_v.view(kvchan.buf.v.dtype).reshape(shape)
-                    import_kv(llm.model_runner.kv_cache, seq.block_table, kvchan.buf)
-                    torch.musa.synchronize()
-                    llm.scheduler.running.append(seq)
-                    fin_map[seq.seq_id] = req_id
-                    print(f"[decode] imported req{req_id} ({n} blocks)", flush=True)
+                # frames arrive in handoff order == admission order; hold them
+                # in `ready` so a multi-frame chunk can't outrun `pending`
+                ready.extend(assembler.feed(chunk))
+
+        # admit held handoffs once the D-side pool has room (P18-C backpressure)
+        while hold and len(bm.free_block_ids) >= hold[0][0]["nblocks"]:
+            msg, seq = hold.popleft()
+            seq.block_table = [bm._allocate_block()
+                               for _ in range(msg["nblocks"])]
+            pending.append((msg["req_id"], seq))
+            print(f"[decode] admitted req{msg['req_id']} ctx={seq.num_tokens} "
+                  f"prio={seq.priority}", flush=True)
+        # import assembled frames FIFO — one per admitted seq, strictly paired
+        while pending and ready:
+            req_id, seq = pending.popleft()
+            n, k_bytes, v_bytes = ready.popleft()
+            shape = (n,) + kvchan.buf.k.shape[1:]
+            arr_k = torch.frombuffer(bytearray(k_bytes), dtype=torch.int16)
+            arr_v = torch.frombuffer(bytearray(v_bytes), dtype=torch.int16)
+            kvchan.buf.k[:n] = arr_k.view(kvchan.buf.k.dtype).reshape(shape)
+            kvchan.buf.v[:n] = arr_v.view(kvchan.buf.v.dtype).reshape(shape)
+            import_kv(llm.model_runner.kv_cache, seq.block_table, kvchan.buf)
+            torch.musa.synchronize()
+            llm.scheduler.running.append(seq)
+            fin_map[seq.seq_id] = req_id
+            print(f"[decode] imported req{req_id} ({n} blocks)", flush=True)
         if not running:
             break
         if live_seqs(llm):
@@ -180,7 +200,8 @@ def role_decode(args):
 def role_prefill(args):
     from nanovllm.pd.kv_channel import TcpKVChannel
 
-    llm = build_engine(args.model, args.gpu_util, tensor_parallel_size=1)
+    llm = build_engine(args.model, args.gpu_util, tensor_parallel_size=1,
+                       num_kvcache_blocks=args.kv_blocks)
     kv_sock = connect_retry(args.host, args.d_port)
     ctrl_sock = connect_retry(args.host, args.d_port + 1)
     kvchan = TcpKVChannel(kv_sock, llm.model_runner.kv_cache, max_blocks=16)
@@ -237,6 +258,7 @@ def role_prefill(args):
             send_json(ctrl_sock, {"type": "handoff", "req_id": rid,
                                   "token_ids": list(seq.token_ids),
                                   "max_tokens": seq.max_tokens,
+                                  "priority": seq.priority,
                                   "nblocks": len(seq.block_table)})
             kvchan.send_blocks(seq.block_table)
             handed.add(seq.seq_id)
@@ -259,6 +281,8 @@ def main():
     parser.add_argument("--d-port", type=int, default=29720,
                         help="decode role's kv port (prefill connects here)")
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--kv-blocks", type=int, default=0,
+                        help="cap the KV pool (0 = auto); D-side pressure knob")
     args = parser.parse_args()
     if args.role == "collocated":
         role_collocated(args)
