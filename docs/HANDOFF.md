@@ -31,7 +31,7 @@
 | 优先 | 项 | 说明 |
 |---|---|---|
 | 1 | **用户审本地 commit → push** | 隔夜轮+P19 全部成果在本地(bd43cba..P19),远端未动 |
-| 2 | **I20 终局:混合精度 outlier 通道** | 校准挑高动态比通道保 bf16,其余 int8(~1.03× 存储);布局/读路径就绪;fp8 在 MUSA 是静默 no-op(工单素材) |
+| 2 | **I20 终局:混合精度 outlier 通道** | 校准挑高动态比通道(ratio=amax/median>20)保 bf16,其余 int8(~1.03× 存储)。**设计已定稿(本轮想清,免下轮摸索)**:int8 池 outlier 列写 0 + bf16 侧池 [blocks,256,kvh,n_out] 紧凑列 + 静态索引张量;kernel 用 **split-sum** 规避寄存器 scatter——logits=Σ(int8·q·mask)+Σ_out(bf16_out·q_gather),V 用主 acc+`acc_out[n_out]` 分离累加、末尾按 OUT_IDX 逐列覆盖 store;n_out≤8 上限校准期截断 |
 | 3 | P16-A 默认翻转评估 | 8B 逐位 0 翻转+性能双 PASS;需 30B 链路确认后翻 `NANOVLLM_MIXED_UNIFIED` 默认 |
 | 4 | P18-C 优先级 × PD(D 侧优先级+P 侧前缀复用) | 优先级+LRU 已就绪,PD 控制面直接吃 |
 | 5 | P18-B PD OpenAI API 化 | `/v1/chat/completions` 端点形态已存在(含 priority 透传),套 PD 控制面 |
