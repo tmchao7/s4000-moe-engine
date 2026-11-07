@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from nanovllm import LLM, SamplingParams
 from nanovllm.pd.kv_channel import KVBlockBuffer, extract_kv, import_kv
 
-MODEL = "/root/autodl-tmp/models/Qwen3-0.6B"
+MODEL = "/root/autodl-tmp/models/Qwen3-0.6B"  # overridden by --model
 MAX_TOKENS = 24
 PAUSE_AT = 8
 PROMPTS = [
@@ -87,8 +87,13 @@ def scribble(llm, block_table, seed):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--out", default="/root/p15_data/pd_m1_kv.json")
+    args = parser.parse_args()
     torch.musa.set_device(0)
-    llm = LLM(MODEL, enforce_eager=True, tensor_parallel_size=1,
+    llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=1,
               attention_backend="triton_paged", max_model_len=1024,
               max_num_seqs=4, gpu_memory_utilization=0.5)
     kv_cache = llm.model_runner.kv_cache
@@ -159,8 +164,8 @@ def main():
 
     verdict["pass"] = ok
     print(json.dumps(verdict, indent=1), flush=True)
-    os.makedirs("/root/p15_data", exist_ok=True)
-    with open("/root/p15_data/pd_m1_kv.json", "w") as f:
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    with open(args.out, "w") as f:
         json.dump(verdict, f, indent=1)
     print(f"[m1] {'PASS' if ok else 'FAIL'}", flush=True)
     llm.exit()

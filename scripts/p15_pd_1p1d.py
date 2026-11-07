@@ -29,7 +29,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-MODEL = "/root/autodl-tmp/models/Qwen3-0.6B"
+MODEL = "/root/autodl-tmp/models/Qwen3-0.6B"  # overridden by --model
 MAX_TOKENS = 24
 PROMPTS = [
     "请解释什么是 MoE（混合专家）架构。",
@@ -74,16 +74,16 @@ def connect_retry(host, port, tries=60):
     raise ConnectionError(f"cannot connect {host}:{port}")
 
 
-def build_engine():
+def build_engine(model=MODEL, gpu_util=0.5):
     from nanovllm import LLM
-    return LLM(MODEL, enforce_eager=True, tensor_parallel_size=1,
+    return LLM(model, enforce_eager=True, tensor_parallel_size=1,
                attention_backend="triton_paged", max_model_len=2048,
-               max_num_seqs=8, gpu_memory_utilization=0.5)
+               max_num_seqs=8, gpu_memory_utilization=gpu_util)
 
 
 def role_baseline(args):
     from nanovllm import SamplingParams
-    llm = build_engine()
+    llm = build_engine(args.model, args.gpu_util)
     outs = llm.generate(PROMPTS, SamplingParams(
         temperature=0, max_tokens=MAX_TOKENS, ignore_eos=True), use_tqdm=False)
     tokens = [list(o["token_ids"]) for o in outs]
@@ -95,7 +95,7 @@ def role_baseline(args):
 
 def role_prefill(args):
     from nanovllm import SamplingParams
-    llm = build_engine()
+    llm = build_engine(args.model, args.gpu_util)
     kv_sock = connect_retry(args.host, args.port)
     ctrl_sock = connect_retry(args.host, args.port + 1)
     from nanovllm.pd.kv_channel import TcpKVChannel
@@ -144,7 +144,7 @@ def role_decode(args):
     from nanovllm.engine.sequence import Sequence, SequenceStatus
     from nanovllm.pd.kv_channel import TcpKVChannel
 
-    llm = build_engine()
+    llm = build_engine(args.model, args.gpu_util)
     listener = socket.socket()
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind((args.host, args.port))
@@ -215,24 +215,30 @@ def role_decode(args):
 
 
 def launch(args):
+    if args.model != MODEL and "--out" not in sys.argv:
+        tag = "8b" if "8B" in args.model else args.model.rstrip("/").split("-")[-1].lower()
+        args.out = args.out.replace(".json", f"_{tag}.json")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     env = dict(os.environ, PYTHONPATH=REPO)
     d_out = args.out.replace(".json", "_decode.json")
     p_out = args.out.replace(".json", "_prefill.json")
     dec = subprocess.Popen(
         [sys.executable, __file__, "--role", "decode", "--host", args.host,
-         "--port", str(args.port), "--out", d_out],
+         "--port", str(args.port), "--out", d_out, "--model", args.model,
+         "--gpu-util", str(args.gpu_util)],
         env={**env, "MUSA_VISIBLE_DEVICES": "1"})
     pre = subprocess.Popen(
         [sys.executable, __file__, "--role", "prefill", "--host", args.host,
-         "--port", str(args.port), "--out", p_out], env=env)
+         "--port", str(args.port), "--out", p_out, "--model", args.model,
+         "--gpu-util", str(args.gpu_util)], env=env)
     dec.wait()
     pre.wait()
     rc = dec.returncode | pre.returncode
 
     base_out = args.out.replace(".json", "_baseline.json")
     subprocess.run([sys.executable, __file__, "--role", "baseline",
-                    "--out", base_out], env=env, check=True)
+                    "--out", base_out, "--model", args.model,
+                    "--gpu-util", str(args.gpu_util)], env=env, check=True)
     base = json.load(open(base_out))
     dec = json.load(open(d_out))
     dec_res = dec["results"]
@@ -266,6 +272,9 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=29610)
     parser.add_argument("--out", default="/root/p15_data/pd_m2_verdict.json")
+    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--gpu-util", type=float, default=0.5,
+                        help="raise to 0.9 when orphaned GPU memory poisons the KV heuristic")
     args = parser.parse_args()
     if args.role == "launch":
         sys.exit(launch(args))

@@ -15,7 +15,7 @@
 |---|---|---|---|
 | A | **E1 paged kernel autotune** | ① 数值:非 bitwise → L2 翻转门(<0.5%)+首 token 100% ② 性能 ≥5% CV≤5% ③ 四套单测 | **判决 FAIL(11-07)**:内核 1.59–2.90×(b1→b32 geomean ~2×)但无全局 bitwise 配置,0.6B LCP 口径翻转率 0.81%>0.5% 门 → **默认保持 (32,4,1),tuned 表降级 `NANOVLLM_PAGED_CONFIG=auto` opt-in**;报告 benchmarks/P15-pd-autotune.md §A |
 | B | **I29 新栈复测** | 引擎级 0.6B TP2 paged replay ×3 判定 | **判决:维持(11-07)**——纯张量梯子 7/8 绿;引擎级 2 clean + **1 WEDGE(init/capture 段,驱动级无主残显存 22GB,需重启实例)**。形态从"确定性首 replay 楔"变为"间歇性 init 楔"→ 30B graph 维持禁止;素材已入厂商工单 |
-| C | **PD 1P1D 主线** | Step 0 ITL 2× 门 / M1 bitwise / M2 bitwise vs 同引擎对照 | **Step 0 GO**:**M1 PASS**(三臂 bitwise;I28 变体修入通道:index_select/index_copy_ 连续化);**M2 PASS**(端到端 1P1D:prefill 57ms/传输 14-21ms/块/decode 1.27s;PD==同引擎 collocated 6/6 bitwise,PD 跨进程全等);**新发现 I34**:collocated token 依赖引擎状态历史(泛化 I31)→ bitwise 门必须同引擎同历史对照;下一步=8B 复验+在线 A/B(待实例重启清残显存) |
+| C | **PD 1P1D 主线** | Step 0 ITL 2× 门 / M1 bitwise / M2 bitwise vs 同引擎对照 | **Step 0 GO**:**M1 PASS**(三臂 bitwise;I28 变体修入通道:index_select/index_copy_ 连续化);**M2 PASS @ 0.6B+8B 双档**(0.6B: 57ms/14-21ms/1.27s;8B: 74ms/18-27ms/1.4s,块=36MiB;两档 PD==同引擎 collocated 6/6 bitwise;8B 处女 baseline 也全等);**新发现 I34**:collocated token 依赖引擎状态历史(泛化 I31)→ bitwise 门必须同引擎同历史对照;下一步=8B 复验+在线 A/B(待实例重启清残显存) |
 | D | (并行,零 GPU)用户亲自发送 `docs/E-vendor-ticket.md`;E2(vllm_fused 调优配置,非生产路径)降级 backlog | — | 待用户 |
 | E | backlog(过 A–C 后再排):KV cache 淘汰(LRU)、优先级/SLO 分级调度、I20 KV int8(须融 kernel) | — | 未排 |
 

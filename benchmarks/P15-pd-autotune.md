@@ -62,6 +62,11 @@
 - **新发现(I34,泛化 I31)**:collocated 的 token 依赖**引擎状态历史**——处女引擎 baseline 与"跑过 6 个 PD 请求后的引擎"在同 prompt 上 2/6 于中途近平局分叉(completion#10/#19),两侧各自跨进程完全确定。→ **bitwise 门的对照臂必须同引擎同状态历史**;处女 baseline 不是合法参照。I31("首 batch 与稳态逐位不同")由此泛化为"状态历史相关";已记 ISSUES。
 - 途中修复:P↔D 死锁(D 忘发 result)、socket 5s 超时 vs 首请求 JIT。
 
+## E2. PD M2 @ Qwen3-8B(容器重启后、关机开机前,泄漏仍在的条件实测)— **PASS(6/6 bitwise,连处女 baseline 也全等)**
+
+8B 经 hf-mirror+aria2 下载(16GB,~12min)。M2 全链路:prefill 74–88ms(首请求含 JIT 0.88s)→ 传输 **18–27ms/块(8B 块=36 MiB)** → 导入 27–84ms → decode 1.36–1.50s/24 tok。卡0 在泄漏下 KV 只剩 37 块(1.3GiB,util 0.9 绕过毒化公式)仍全绿。**判定:PD==同引擎 collocated 6/6 bitwise + 处女 baseline 6/6 全等** → 调研的"≤8B 单机双卡 1P1D 成立"从推断变实测(0.6B+8B 双档)。I34 状态风味在 8B 未触发(与状态具体性一致,非系统效应)。
+工程化:`scripts/p15_pd_1p1d.py` 与 `tests/p15_pd_m1_kv.py` 已参数化 `--model`/`--gpu-util`(泄漏期 KV 公式被毒化时用 0.9)。
+
 ## F. 网关事件与收尾状态
 
 - 14:4x–16:0x ssh 网关(101.126.24.47:18140)持续 Connection closed(非 MaxStartups,自愈;P12 先例)。
