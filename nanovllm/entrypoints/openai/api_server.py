@@ -61,8 +61,13 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
         max_tokens = int(body.get("max_tokens", 64))
         temperature = float(body.get("temperature", 1.0))
         # P16-C extension: scheduling tier (0 = highest).  Non-standard field,
-        # ignored by stock OpenAI clients; equal priorities keep FIFO.
-        priority = int(body.get("priority", 0))
+        # ignored by stock OpenAI clients; equal priorities keep FIFO.  NOTE:
+        # ordering applies under stall_free policies; with the fcfs default
+        # only preemption-victim selection honors it.
+        try:
+            priority = int(body.get("priority", 0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "priority must be an integer")
         if max_tokens <= 0 or temperature < 0 or priority < 0:
             raise HTTPException(400, "max_tokens must be positive; temperature/priority non-negative")
         stop = body.get("stop", [])

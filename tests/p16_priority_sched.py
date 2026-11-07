@@ -129,6 +129,45 @@ def t5_legacy_equivalence():
     return True
 
 
+def t6_chunked_requeue_no_duplicates():
+    """Review finding 1 regression: a chunked (multi-chunk) seq re-queued
+    mid-loop must not be re-picked within the SAME step under priority
+    selection (the old code re-forwarded its chunk once per waiting seq)."""
+    from collections import Counter
+    sched = Scheduler(SimpleNamespace(
+        max_num_seqs=8, max_num_batched_tokens=64, eos=0,
+        kvcache_block_size=256, scheduler_policy="stall_free",
+        prefill_chunk_size=8, scheduler_starvation_steps=32,
+        num_kvcache_blocks=64))
+    long_h = mkseq(list(range(1000, 1020)), priority=0)     # 20 tok → 3 chunks
+    low_a = mkseq(list(range(2000, 2008)), priority=5)
+    low_b = mkseq(list(range(3000, 3008)), priority=5)
+    for s in (long_h, low_a, low_b):
+        sched.add(s)
+    for _ in range(12):
+        batch = sched.schedule()
+        ids = [s.seq_id for s in batch.sequences]
+        dupes = [sid for sid, c in Counter(ids).items() if c > 1]
+        assert not dupes, f"seq scheduled multiple times in one batch: {dupes}"
+        for seq in batch.sequences:
+            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = 0
+            if seq.is_prefill and seq.num_cached_tokens >= seq.num_tokens:
+                seq.status = SequenceStatus.RUNNING
+                if seq in sched.waiting:
+                    sched.waiting.remove(seq)
+            elif not seq.is_prefill:
+                seq.append_token(1)
+                if seq.num_completion_tokens >= seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    sched.running.remove(seq)
+                    sched.block_manager.deallocate(seq)
+        if sched.is_finished():
+            break
+    assert sched.is_finished(), "sequences stalled (starved by re-picking)"
+    return True
+
+
 def pct(values, q):
     if not values:
         return None
@@ -173,13 +212,10 @@ def part2_engine():
             for seq_id, toks, metrics in outputs:
                 finals[sid_map[seq_id]] = metrics
         missing = [sid_map[sid] for sid in sid_map if sid_map[sid] not in finals]
-        sched = llm.scheduler
-        print(f"  [dbg] missing={missing} waiting={len(sched.waiting)} "
-              f"running={len(sched.running)} preempts={llm.scheduler.preemptions - preempts0}",
-              flush=True)
-        for seq in list(sched.waiting) + list(sched.running):
-            print(f"  [dbg] stray seq{seq.seq_id} status={seq.status} "
-                  f"tokens={seq.num_tokens}/{seq.num_prompt_tokens}+{seq.max_tokens}",
+        if missing:
+            sched = llm.scheduler
+            print(f"  [prio] MISSING finals: {missing} "
+                  f"(waiting={len(sched.waiting)} running={len(sched.running)})",
                   flush=True)
         return finals, llm.scheduler.preemptions - preempts0, highs
 
@@ -231,7 +267,8 @@ def main():
                      ("t2_equal_fifo", t2_equal_priority_fifo),
                      ("t3_starvation_guard", t3_starvation_outranks_priority),
                      ("t4_preempt_victim", t4_preempt_victim_priority),
-                     ("t5_legacy_equivalence", t5_legacy_equivalence)):
+                     ("t5_legacy_equivalence", t5_legacy_equivalence),
+                     ("t6_chunked_requeue", t6_chunked_requeue_no_duplicates)):
         try:
             results[name] = bool(fn())
         except Exception as exc:  # noqa: BLE001 — recorded verbatim

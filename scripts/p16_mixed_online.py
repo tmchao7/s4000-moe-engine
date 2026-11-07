@@ -14,6 +14,7 @@ Run:  PYTHONPATH=. python3 scripts/p16_mixed_online.py \
 import argparse
 import json
 import os
+import random
 import statistics
 import subprocess
 import sys
@@ -90,13 +91,11 @@ def run_arm(model, gpu_util, reqs, max_tokens, out_dir, tag, unified,
     try:
         client = connect_retry("127.0.0.1", port)
         client.setblocking(True)
-        import random
-        import time as _t
         rng = random.Random(1234)
-        t0 = _t.perf_counter()
+        t0 = time.perf_counter()
         for i, (_, prompt) in enumerate(reqs):
             if poisson_qps > 0 and i:
-                _t.sleep(rng.expovariate(poisson_qps))
+                time.sleep(rng.expovariate(poisson_qps))
             send_json(client, {"req_id": i, "prompt": prompt,
                                "max_tokens": max_tokens})
         results = {}
@@ -108,7 +107,7 @@ def run_arm(model, gpu_util, reqs, max_tokens, out_dir, tag, unified,
             for msg in js.feed(chunk):
                 if msg.get("type") == "result":
                     results[msg["req_id"]] = msg
-        wall = _t.perf_counter() - t0
+        wall = time.perf_counter() - t0
         send_json(client, {"type": "done"})
         client.close()
     finally:

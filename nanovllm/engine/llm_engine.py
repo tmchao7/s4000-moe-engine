@@ -66,6 +66,50 @@ class LLMEngine:
         self.metrics_path = config.metrics_path
         self.last_step_metrics = None
         self._shm_name = config.shm_name
+        if config.kv_cache_dtype == "int8":
+            # P19: per-channel scale calibration over a few real prompts
+            # (mixed languages/lengths), then frozen for serving.  Saturating
+            # garbage during calibration is fine — only activation amax is
+            # harvested (hooks; PREFILL forwards only — graph-replayed decode
+            # steps bypass Python hooks, and production is eager anyway).
+            # begin/freeze go through call() so TP workers calibrate
+            # symmetrically.  Exception-safe: a failure tears the engine down
+            # instead of leaking the spawned TP worker (which would hang exit).
+            try:
+                self.model_runner.call("kv_calibrate_begin")
+                calib_prompts = [
+                    "用一段话解释大模型推理中的 KV cache 与 paged attention。",
+                    "Write a Python function that computes moving averages.",
+                    "请比较 TCP 与 UDP 的区别，并给出各自适用场景。",
+                    "Summarize how continuous batching improves GPU utilization.",
+                    "计算 17 × 23 并给出中间步骤，然后用一句话解释竖式乘法。",
+                    "Explain why decode is memory-bandwidth bound in one paragraph.",
+                    "写一首关于秋天的四行诗。",
+                    "List three trade-offs between throughput and latency in serving.",
+                ]
+                sp = SamplingParams(temperature=0, max_tokens=16, ignore_eos=True)
+                self.generate(calib_prompts, [sp] * len(calib_prompts), use_tqdm=False)
+                self.scheduler.block_manager.clear_prefix_cache()
+                self.model_runner.call("kv_calibrate_freeze")
+            except Exception:
+                self.exit()
+                raise
+            self.step_count = 0
+            self.schedule_mode_counts.clear()
+            self.prefill_tokens_total = 0
+            self.decode_tokens_total = 0
+            self.schedule_time_total = 0.0
+            self.forward_time_total = 0.0
+            self.last_token_events = []
+            self.last_step_metrics = None
+            self.scheduler.preemptions = 0
+            self.scheduler.kv_admission_skips_total = 0
+            bm = self.scheduler.block_manager
+            bm.prefix_cache_hit_tokens = 0
+            bm.allocations = 0
+            bm.reclaims = 0
+            bm.evictions = 0
+            print("[kv-int8] calibration complete; counters reset", flush=True)
         atexit.register(self.exit)
 
     def _force_exit(self):

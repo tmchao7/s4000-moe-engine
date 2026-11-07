@@ -78,7 +78,6 @@ if triton is not None:
         stride_qb, stride_qh,
         stride_kp, stride_kt, stride_kh,
         stride_vp, stride_vt, stride_vh,
-        stride_ks, stride_vs,
         stride_btb,
         stride_ob, stride_oh,
         NUM_HEADS: tl.constexpr,
@@ -97,6 +96,11 @@ if triton is not None:
         # captured-graph replay independent of the host-side context length.
         q32 = q.to(tl.float32)
         context_len = tl.load(CONTEXT_LENS + batch)
+        # P19 per-channel scales: loop-invariant per (program, head) — hoisted
+        # explicitly above the KV loop.
+        if HAS_SCALE:
+            k_s_vec = tl.load(K_SCALE + kv_head * HEAD_DIM + offs_d)
+            v_s_vec = tl.load(V_SCALE + kv_head * HEAD_DIM + offs_d)
 
         running_max = -float("inf")
         running_sum = 0.0
@@ -120,14 +124,7 @@ if triton is not None:
             )
             keys = tl.load(K + k_offsets, mask=valid[:, None], other=0.0)
             if HAS_SCALE:
-                # P17 int8 KV: per-token-head fp32 scale rides the same
-                # (page, token, kv_head) addressing as the payload.
-                k_s = tl.load(
-                    K_SCALE + pages * stride_ks + in_page * (NUM_KV_HEADS) + kv_head,
-                    mask=valid,
-                    other=0.0,
-                )
-                keys32 = keys.to(tl.float32) * k_s[:, None]
+                keys32 = keys.to(tl.float32) * k_s_vec[None, :]
             else:
                 keys32 = keys.to(tl.float32)
             logits = tl.sum(keys32 * q32[None, :], axis=1) * scale
@@ -146,12 +143,7 @@ if triton is not None:
             )
             values = tl.load(V + v_offsets, mask=valid[:, None], other=0.0)
             if HAS_SCALE:
-                v_s = tl.load(
-                    V_SCALE + pages * stride_vs + in_page * (NUM_KV_HEADS) + kv_head,
-                    mask=valid,
-                    other=0.0,
-                )
-                values32 = values.to(tl.float32) * v_s[:, None]
+                values32 = values.to(tl.float32) * v_s_vec[None, :]
             else:
                 values32 = values.to(tl.float32)
             acc = acc * old_scale + tl.sum(probs[:, None] * values32, axis=0)
@@ -194,8 +186,6 @@ def paged_decode_attention(
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-        k_scale.stride(0) if has_scale else 1,   # scale PAGE stride = 256*KVH
-        v_scale.stride(0) if has_scale else 1,
         block_tables.stride(0),
         output.stride(0), output.stride(1),
         NUM_HEADS=num_heads,

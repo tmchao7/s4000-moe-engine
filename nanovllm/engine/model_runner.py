@@ -563,11 +563,12 @@ class ModelRunner:
             dtype=torch.int8 if kv_int8 else None,
         )
         if kv_int8:
-            # [K/V, layer, block, token, kv_head] — K and V quantize with
-            # their OWN per-token-head absmax, so scales are separate.
-            self.kv_scales = torch.zeros(
-                2, hf_config.num_hidden_layers, config.num_kvcache_blocks + 1,
-                self.block_size, num_kv_heads, dtype=torch.float32, device=self.device,
+            # P19: per-channel (layer, head, dim) fp32 scales, frozen by
+            # calibrate_kv_int8().  Ones (not zeros) so a pre-calibration
+            # store saturates instead of dividing by zero.
+            self.kv_scales = torch.ones(
+                2, hf_config.num_hidden_layers, num_kv_heads, head_dim,
+                dtype=torch.float32, device=self.device,
             )
         else:
             self.kv_scales = None
@@ -580,10 +581,51 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 if kv_int8:
-                    module.k_scale = self.kv_scales[0, layer_id]
+                    module.k_scale = self.kv_scales[0, layer_id]   # [KVH, D]
                     module.v_scale = self.kv_scales[1, layer_id]
                 module.kv_cache_is_int8 = kv_int8
                 layer_id += 1
+
+    def kv_calibrate_begin(self):
+        """P19: start accumulating per-channel K/V amax on every int8
+        attention module (running max over all calibration forwards)."""
+        self._calib_handles = []
+        self._calib_amax = []
+        atts = [m for m in self.model.modules()
+                if getattr(m, "kv_cache_is_int8", False)]
+        for li, module in enumerate(atts):
+            buf = {"k": None, "v": None}
+
+            def make_hook(buf):
+                def hook(_module, args):
+                    _, k, v = args
+                    k_amax = k.detach().abs().amax(dim=0).float()      # [KVH, D]
+                    v_amax = v.detach().abs().amax(dim=0).float()
+                    buf["k"] = k_amax if buf["k"] is None else torch.maximum(buf["k"], k_amax)
+                    buf["v"] = v_amax if buf["v"] is None else torch.maximum(buf["v"], v_amax)
+                return hook
+
+            self._calib_handles.append(
+                module.register_forward_pre_hook(make_hook(buf)))
+            self._calib_amax.append(buf)
+
+    def kv_calibrate_freeze(self):
+        """P19: freeze per-channel scales = amax/127 (clipped) into
+        kv_scales and drop the calibration hooks."""
+        for handle in self._calib_handles:
+            handle.remove()
+        self._calib_handles = []
+        for li, buf in enumerate(self._calib_amax):
+            for ki, key in ((0, "k"), (1, "v")):
+                amax = buf[key]
+                assert amax is not None, "calibration saw no activations"
+                scale = (amax / 127.0).clamp_min(1e-6)
+                self.kv_scales[ki, li] = scale
+        self._calib_amax = []
+        n = self.kv_scales.numel()
+        print(f"[kv-int8] per-channel scales frozen ({n} values, "
+              f"range [{self.kv_scales.min().item():.4g}, "
+              f"{self.kv_scales.max().item():.4g}])", flush=True)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)

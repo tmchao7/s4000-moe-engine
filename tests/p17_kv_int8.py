@@ -37,24 +37,17 @@ MAX_TOKENS = 64
 
 
 def torch_reference(key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping):
-    """Bitwise-defined reference for the fused store kernel."""
+    """Bitwise-defined reference for the fused store kernel under GIVEN
+    per-channel scales [KVH, D] (P19: calibration-frozen, no scale writes)."""
     N, KVH, D = key.shape
     kf = key.to(torch.float32)
     vf = value.to(torch.float32)
-    amax_k = kf.abs().amax(dim=-1, keepdim=True)
-    s_k = (amax_k / 127.0).clamp_min(1e-6)
-    q_k = torch.floor(kf / s_k + 0.5).clamp_(-127.0, 127.0).to(torch.int8)
-    amax_v = vf.abs().amax(dim=-1, keepdim=True)
-    s_v = (amax_v / 127.0).clamp_min(1e-6)
-    q_v = torch.floor(vf / s_v + 0.5).clamp_(-127.0, 127.0).to(torch.int8)
+    q_k = torch.floor(kf / k_scale + 0.5).clamp_(-127.0, 127.0).to(torch.int8)
+    q_v = torch.floor(vf / v_scale + 0.5).clamp_(-127.0, 127.0).to(torch.int8)
     flat_kc = k_cache.view(-1, KVH, D)
     flat_vc = v_cache.view(-1, KVH, D)
-    flat_ks = k_scale.view(-1, KVH)
-    flat_vs = v_scale.view(-1, KVH)
     flat_kc[slot_mapping.long()] = q_k
     flat_vc[slot_mapping.long()] = q_v
-    flat_ks[slot_mapping.long()] = s_k.squeeze(-1)
-    flat_vs[slot_mapping.long()] = s_v.squeeze(-1)
 
 
 def mode_unit():
@@ -62,45 +55,43 @@ def mode_unit():
     torch.musa.set_device(0)
     N, KVH, D, BLOCKS = 512, 8, 128, 8
     g = torch.Generator(device="cpu").manual_seed(7)
-    # scale to realistic KV magnitudes (bf16 activations, some outliers)
+    # realistic magnitudes: bulk ~0.7, plus strong per-channel outliers
     key = (torch.randn(N, KVH, D, generator=g) * 0.7).to(torch.bfloat16).to("musa")
     value = (torch.randn(N, KVH, D, generator=g) * 0.7).to(torch.bfloat16).to("musa")
-    key[:8] *= 8.0                                   # outlier rows
+    key[:8] *= 8.0                                    # outlier tokens
+    key[:, 0, :4] *= 60.0                             # outlier CHANNELS (the I20 killer)
+    value[:, 2, :4] *= 60.0
     slot = torch.arange(N, dtype=torch.int32, device="musa")
 
-    pools_ref = torch.zeros(2, BLOCKS + 1, 256, KVH, D, dtype=torch.int8, device="musa")
-    scales_ref = torch.zeros(2, BLOCKS + 1, 256, KVH, dtype=torch.float32, device="musa")
-    torch_reference(key, value, pools_ref[0], pools_ref[1],
-                    scales_ref[0], scales_ref[1], slot)
+    # calibration: per-channel amax over the batch (running max, hook-equivalent)
+    amax_k = key.float().abs().amax(dim=0)            # [KVH, D]
+    amax_v = value.float().abs().amax(dim=0)
+    s_k = (amax_k / 127.0).clamp_min(1e-6)
+    s_v = (amax_v / 127.0).clamp_min(1e-6)
+
+    pools_ref = torch.zeros(2, 1, BLOCKS + 1, 256, KVH, D, dtype=torch.int8, device="musa")
+    torch_reference(key, value, pools_ref[0, 0], pools_ref[1, 0], s_k, s_v, slot)
 
     pools = torch.zeros_like(pools_ref)
-    scales = torch.zeros_like(scales_ref)
-    store_kvcache_int8(key, value, pools[0, 0], pools[1, 0],
-                       scales[0, 0], scales[1, 0], slot)
+    store_kvcache_int8(key, value, pools[0, 0], pools[1, 0], s_k, s_v, slot)
     ok = True
-    # Gate on the WRITTEN region only (slots 0..N-1): torch.equal over the
-    # full pool flagged identical-looking unwritten tail rows (zero-sign
-    # quirks), which are out of contract anyway.
-    n_k = N * KVH * D
-    n_s = N * KVH
-    checks = (("k_payload", pools[0].view(-1)[:n_k], pools_ref[0].view(-1)[:n_k]),
-              ("v_payload", pools[1].view(-1)[:n_k], pools_ref[1].view(-1)[:n_k]),
-              ("k_scale", scales[0].view(-1)[:n_s], scales_ref[0].view(-1)[:n_s]),
-              ("v_scale", scales[1].view(-1)[:n_s], scales_ref[1].view(-1)[:n_s]))
-    for name, a, b in checks:
+    for name, a, b in (("k_payload", pools[0, 0], pools_ref[0, 0]),
+                       ("v_payload", pools[1, 0], pools_ref[1, 0])):
         same = torch.equal(a, b)
         print(f"[unit] {name}: {'BITWISE' if same else 'MISMATCH'}", flush=True)
         if not same:
-            bad = (a != b).nonzero().flatten()[:8]
+            bad = (a != b).flatten().nonzero().flatten()[:8]
             print(f"[unit]   first diff flat idx: {bad.tolist()} "
-                  f"a={a[bad].tolist()} b={b[bad].tolist()}", flush=True)
+                  f"a={a.flatten()[bad].tolist()} b={b.flatten()[bad].tolist()}",
+                  flush=True)
         ok &= same
-    # roundtrip error on the realistic magnitude
-    q = pools_ref[0, :N // 256 + 1]
-    deq = (pools_ref[0].view(-1, KVH, D)[:N].float()
-           * scales_ref[0].view(-1, KVH)[:N].unsqueeze(-1)).to(torch.bfloat16)
-    rel = ((deq.float() - key.float()).abs().mean() / key.float().abs().mean()).item()
-    print(f"[unit] roundtrip rel err = {rel:.4%} (probe said ~0.67%)", flush=True)
+    # per-channel roundtrip error on the BULK (outlier channels excluded):
+    deq = (pools_ref[0, 0].view(-1, KVH, D)[:N].float() * s_k).to(torch.bfloat16)
+    bulk = key[:, :, 4:].float()
+    deq_bulk = deq[:, :, 4:].float()
+    rel = ((deq_bulk - bulk).abs().mean() / bulk.abs().mean()).item()
+    print(f"[unit] bulk-channel roundtrip rel err = {rel:.4%} "
+          f"(outlier channels clip by design)", flush=True)
     print(f"[unit] {'PASS' if ok else 'FAIL'}", flush=True)
     return 0 if ok else 1
 
@@ -172,7 +163,23 @@ def mode_gate():
     blocks_ratio = i8["kv_blocks"] / max(bf["kv_blocks"], 1)
     flips, compared = flip_stats(bf["tokens"], i8["tokens"])
     rate = flips / compared if compared else 1.0
-    # sanity: all finished at max length, no empties
+    # coherence: degenerate repetition + text similarity vs the bf16 arm
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    import difflib
+
+    def degenerate(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return max(counts.values()) >= 24 or len(set(tokens)) < 12
+
+    i8_texts = [tok.decode(t) for t in i8["tokens"]]
+    bf_texts = [tok.decode(t) for t in bf["tokens"]]
+    deg_i8 = sum(degenerate(t) for t in i8["tokens"])
+    deg_bf = sum(degenerate(t) for t in bf["tokens"])
+    sim = statistics.fmean(difflib.SequenceMatcher(
+        None, a, b).ratio() for a, b in zip(bf_texts, i8_texts))
     lens_bf = [len(t) for t in bf["tokens"]]
     lens_i8 = [len(t) for t in i8["tokens"]]
     sanity = (all(n == MAX_TOKENS for n in lens_bf + lens_i8)
@@ -184,19 +191,22 @@ def mode_gate():
         "flip_rate": round(rate, 5),
         "flips": flips,
         "tokens_compared": compared,
+        "coherence": {"degenerate_int8": deg_i8, "degenerate_bf16": deg_bf,
+                      "text_similarity_mean": round(sim, 3)},
         "decode8_ratio_i8_over_bf": round(perf_ratio, 3),
         "sanity_all_finished": sanity,
         "gates": {
             "capacity_bytes_2x": bytes_ratio >= 1.9,
             "capacity_blocks_2x": blocks_ratio >= 1.9,
             "flip_rate_le_2pct": rate <= 0.02,
+            "coherence": deg_i8 == 0 and deg_i8 <= deg_bf,
             "decode_step_le_5pct": perf_ratio <= 1.05,
             "sanity": sanity,
         },
     }
     verdict["gate_all"] = all(verdict["gates"].values())
     with open("/root/p17_data/gate.json", "w") as f:
-        json.dump(verdict, f, indent=1)
+        json.dump(verdict, f, indent=1, ensure_ascii=False)
     print(json.dumps(verdict, indent=1, ensure_ascii=False), flush=True)
     print(f"[gate] {'ALL GATES PASS' if verdict['gate_all'] else 'GATE FAIL'}", flush=True)
     return 0 if verdict["gate_all"] else 1

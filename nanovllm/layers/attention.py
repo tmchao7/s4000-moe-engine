@@ -32,15 +32,13 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
 
 def _gather_kv(cache, block_table, valid_len, block_size, scale=None):
     """Gather paged KV for one sequence. valid_len: int (tokens). Returns
-    (len, h, d) in bf16 — for an int8 pool the fused dequant rides the same
-    flat gather (P17; the I20 lesson bans standalone conversion passes in
-    production paths, and the prefill gather is this one site)."""
+    (len, h, d) in bf16 — for an int8 pool the dequant rides the same flat
+    gather (P19: per-channel [h, d] scale broadcasts over the page dims)."""
     num_blocks = (valid_len + block_size - 1) // block_size
     blocks = block_table[:num_blocks].long()
     kv = cache[blocks]
     if scale is not None:
-        s = scale[blocks]
-        kv = (kv.to(torch.float32) * s.unsqueeze(-1).to(torch.float32)).to(torch.bfloat16)
+        kv = (kv.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
     return kv.view(-1, *cache.shape[-2:])[:valid_len]
 
 
@@ -220,10 +218,8 @@ class Attention(nn.Module):
             v = v_cache[blocks].view(bs, full_kv_len, *v_cache.shape[-2:])
             if getattr(self, "kv_cache_is_int8", False):
                 from nanovllm.kernels.kv_int8 import dequant_gathered
-                ks = self.k_scale[blocks].view(bs, full_kv_len, k.size(-2))
-                vs = self.v_scale[blocks].view(bs, full_kv_len, v.size(-2))
-                k = dequant_gathered(k[:, :kv_len], ks[:, :kv_len])
-                v = dequant_gathered(v[:, :kv_len], vs[:, :kv_len])
+                k = dequant_gathered(k[:, :kv_len], self.k_scale)
+                v = dequant_gathered(v[:, :kv_len], self.v_scale)
             else:
                 k = k[:, :kv_len]
                 v = v[:, :kv_len]

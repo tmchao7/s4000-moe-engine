@@ -25,7 +25,7 @@
 | # | 项 | 门/判定(预注册,不可改) | 状态 |
 |---|---|---|---|
 | A | **int8 KV 池+量化写 kernel**(opt-in `kv_cache_dtype="int8"`;scale `[L,blocks+1,256,kvh]`;block_bytes 减半) | ① 量化 kernel 与 torch 参考逐位一致 ② 池块数 ≥1.8×(同 gpu-util) ③ 四套单测 | **判决 PASS(11-08)**:① BITWISE(正确池形状复核)② **2.0× 精确**(730→1460 块,block_bytes 减半)③ 全绿 |
-| B | **读侧融合 dequant**(paged decode kernel 两处 load 后乘 scale;`_gather_kv` gather 后 dequant) | ① LCP 翻转率 ≤2%(int8 有损,per-token-head absmax 探针往返误差 0.67%)+32-prompt 生成 sanity(完成率 100%,无乱码,平均长度偏差 ≤10%) ② decode 步时 ≤+5% vs bf16(CV≤5% 交错≥5) ③ 容量曲线:1.6× 档并发吞吐不塌 ④ 四套单测;门全过仍默认 bf16(opt-in) | **判决:机制 PASS,数值门 FAIL(11-08)**:② decode 步时 1.013× ✓ sanity ✓ ① **FAIL — 0.5(32/32 首 token 分叉,生成退化)**;**根因实测**:Qwen3 K per-head amax 196~492 vs 典型元素 0.5 → per-token-head absmax 步长淹没信号(逐件排除 plumbing:store/gather 逐位、paged+scale 4.8e-4、引擎内重算 0.0019);修复路径=per-layer-head 校准静态 scale(下轮);默认 bf16 不变;ISSUES I20 更新;报告 benchmarks/P17-kv-int8.md |
+| B | **读侧融合 dequant**(paged decode kernel 两处 load 后乘 scale;`_gather_kv` gather 后 dequant) | ① LCP 翻转率 ≤2%(int8 有损,per-token-head absmax 探针往返误差 0.67%)+32-prompt 生成 sanity(完成率 100%,无乱码,平均长度偏差 ≤10%) ② decode 步时 ≤+5% vs bf16(CV≤5% 交错≥5) ③ 容量曲线:1.6× 档并发吞吐不塌 ④ 四套单测;门全过仍默认 bf16(opt-in) | **判决:机制 PASS,数值门 FAIL(11-08)**:② decode 步时 1.013× ✓ sanity ✓ ① **FAIL — 0.5(32/32 首 token 分叉,生成退化)**;**根因实测**:Qwen3 K per-head amax 196~492 vs 典型元素 0.5 → per-token-head absmax 步长淹没信号(逐件排除 plumbing:store/gather 逐位、paged+scale 4.8e-4、引擎内重算 0.0019);**P19 修复尝试 per-channel 校准:机制逐位正确但质量门仍 FAIL(通道内动态范围 500× 超 int8 承载,fp8=MUSA 静默 no-op)→ 混合精度 outlier 通道下轮立项;默认 bf16 不变;ISSUES I20;报告 benchmarks/P17-kv-int8.md 与 P19-i20-review.md |
 
 ### P18 PD 小模型推进(吃 P16/P17 产出;M1/M2/M3 已 POSITIVE)
 
@@ -35,6 +35,14 @@
 | B | PD OpenAI 兼容端点(`/v1/chat/completions`) | 与 collocated api_server 同负载 A/B;冒烟客户端过 | 未跑 |
 | C | P 侧前缀复用 + D 侧优先级(吃 P16-B/C) | 重复前缀请求 P 侧 TTFT 下降可测;D 优先级门同 P16-C 口径 | 未跑 |
 | D | KV int8 传输(吃 P17;kv_channel index_select/index_copy_ 路径) | 传输字节 ≈½ 且传输时间下降;D 终态数值门同 P17-B;汇总组合收益 | 未跑 |
+
+### P19(2026-11-08 迭代轮:I20 修复尝试 + 全面 code review + 指标核查)
+
+| # | 项 | 门/判定 | 状态 |
+|---|---|---|---|
+| A | I20 修复:per-channel 校准静态 scale | 逐位 unit + 引擎连贯性/翻转≤2%/decode≤+5%/容量 2× | **机制逐位正确(store BITWISE/引擎内全行恒等/bulk 60 级);质量门 FAIL — 通道内动态范围 500× 超 int8 承载;fp8=MUSA 静默 no-op;混合精度 outlier 通道下轮立项**;报告 benchmarks/P19-i20-review.md |
+| B | 全面 code review(独立 agent 审 8 文件) | HIGH bug 修复+回归测试;风险/nit 全处理 | **修复:分块重排队×优先级=同 seq 单步重复调度(HIGH,t6 回归)+wait_steps 语义+校准异常安全+计数器重置+api 400+touch 泄漏+scale hoist**;7/7 回归全绿 |
+| C | 指标核查 | /metrics 新计数器 + priority 400 | **✓ 活体冒烟**(kv_lru_size/kv_prefix_hit_tokens_total 暴露;priority 非整数→400) |
 
 ### 范围注记
 

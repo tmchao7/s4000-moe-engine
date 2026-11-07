@@ -5,7 +5,7 @@
 
 ## 0. 三十秒状态
 
-- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;**HEAD 领先 origin 6 个本地 commit(隔夜轮,待用户审后 push)**:`bd43cba`(P16-A)→`2f63431`(B)→`b2074ac`(C)→`52cddf5`(P17+P16-D)+ 收官文档 commit。
+- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;**HEAD 领先 origin 7+ 个本地 commit(隔夜轮+P19,待用户审后 push)**;P19(11-08):I20 per-channel 修复尝试(机制正确/通道内动态范围 500× 仍超 int8)+ 独立 code review(修复 HIGH 重复调度 bug+8 项,详见 benchmarks/P19-i20-review.md)+ 指标核查(/metrics/priority 400)。
 - **服务器**:seetacloud `s4000`;收官时双卡 0 MiB、无进程、shm 干净;终回归 8/8 全绿(四套+p16-mixed+lru+prio+p17-unit)。
 - **生产栈(一个默认没动)**:`triton_paged` + `grouped_mm`/`bmm_dense` + eager + `stall_free` + TP2/EP2 + chunk-256。新特性全部 opt-in。
 - **隔夜轮一句话**:统一混合批(P16-A,混合步 −25%/−15%,opt-in)→ KV LRU(P16-B,PASS)→ 优先级调度(P16-C,高优 TTFT 42.7×,采用)→ 30B E1(P16-D,负结果,E1 闭合)→ KV int8(P17,机制全通/容量 2.0×,数值方案待换)→ PD Poisson(P18-A,POSITIVE 双档)。
@@ -26,16 +26,16 @@
 
 投机解码 NO-GO;I19 融合换步时否定;整图/分段图 TP2 否决(I29,**实验类命令用户已封存**);I30 否定;I8 闭合;fused RMSNorm/容量收缩/placement 不采用;split=0/chunk-2048 否决;host-sync/mixed-split/paged 采纳;E1 autotune **闭合(30B e2e 负结果)**;**per-token-head absmax int8 KV 数值方案否定(校准静态 scale 待立项)**;I35 已修。
 
-## 3. 下轮 Top-N(按 ROI)
+## 3. 下轮 Top-N(按 ROI;P19 后刷新)
 
 | 优先 | 项 | 说明 |
 |---|---|---|
-| 1 | **用户审 6 个本地 commit → push** | 隔夜轮全部成果在本地,远端未动 |
-| 2 | **I20 修复:per-layer-head 校准静态 scale** | 布局/读路径全就绪,只换 scale 来源;预期数值门可过 → int8 KV 转正(容量 2×) |
+| 1 | **用户审本地 commit → push** | 隔夜轮+P19 全部成果在本地(bd43cba..P19),远端未动 |
+| 2 | **I20 终局:混合精度 outlier 通道** | 校准挑高动态比通道保 bf16,其余 int8(~1.03× 存储);布局/读路径就绪;fp8 在 MUSA 是静默 no-op(工单素材) |
 | 3 | P16-A 默认翻转评估 | 8B 逐位 0 翻转+性能双 PASS;需 30B 链路确认后翻 `NANOVLLM_MIXED_UNIFIED` 默认 |
-| 4 | P16-B 优先级 × PD 组合(D 侧优先级=P18-C) | 优先级+LRU 已就绪,PD 控制面直接吃 |
-| 5 | P18-B PD OpenAI API 化 | `/v1/chat/completions` 端点形态已存在,套 PD 控制面 |
-| 6 | 用户亲自发厂商工单 | E-vendor-ticket.md(P15 新栈证据已并入) |
+| 4 | P18-C 优先级 × PD(D 侧优先级+P 侧前缀复用) | 优先级+LRU 已就绪,PD 控制面直接吃 |
+| 5 | P18-B PD OpenAI API 化 | `/v1/chat/completions` 端点形态已存在(含 priority 透传),套 PD 控制面 |
+| 6 | 用户亲自发厂商工单 | E-vendor-ticket.md + **fp8 cast 静默 no-op 新证据(P19)** |
 
 **不要做**:graph replay(封存);per-token-head absmax int8(已判死,换方案再战);norm/rope 单点融合;EAGLE3。
 

@@ -1,13 +1,17 @@
-"""P17: fused int8 KV store — quantize-and-write in one kernel (no standalone
-conversion pass; I20 measured a naive torch dequant pass at 5.7x a bf16 copy).
+"""P19 (I20 fix): int8 KV with PER-CHANNEL CALIBRATED STATIC scales.
 
-Per (token, kv_head) program: absmax over head_dim -> scale = max(amax/127,
-1e-6) -> q = floor(x/scale + 0.5) clamped to [-127, 127] (round-half-up;
-the torch reference in tests uses torch.floor(x + 0.5) so the gate is
-bitwise by construction).  int8 payload lands in the paged pool, the fp32
-scale in the parallel [block, token, kv_head] tensor (flat slot addressing,
-same index_put contract as store_kvcache: exactly one slot per token row,
-graph-capture safe).
+P17's per-token-head absmax failed on Qwen3: K carries extreme per-head
+outliers (amax 196~492 vs typical elements ~0.5), so the per-token scale
+(a head-wide max) quantizes the informative bulk to ±0/1 — relative error
+~100% and degenerate output.  Per-CHANNEL scales (one fp32 value per
+(layer, head, dim), frozen from a calibration pass) isolate outliers to
+their own channel and give every channel uniform ~0.8% relative error.
+Bonus: the scale is a per-head fp32[D] vector hoisted out of the paged
+kernel's KV loop — zero per-token scale traffic.
+
+Rounding: floor(x/scale + 0.5) (half-up), clamped to [-127, 127]; the torch
+reference in tests uses torch.floor so the bitwise gate holds by
+construction.
 """
 import torch
 import triton
@@ -20,42 +24,39 @@ def _store_kv_int8_kernel(
     stride_kn, stride_kh,
     KVH: tl.constexpr, D: tl.constexpr,
 ):
+    """One program per (token, kv_head).  KS/VS are per-channel scale
+    vectors [KVH, D] (fp32, calibration-frozen) — loaded once, no scale
+    writes.  Slot addressing matches store_kvcache's index_put contract."""
     n = tl.program_id(0)
     h = tl.program_id(1)
     slot = tl.load(SLOT_PTR + n).to(tl.int64)
     offs = tl.arange(0, D)
     base = n * stride_kn + h * stride_kh
+    s_k = tl.load(KS_PTR + h * D + offs)
+    s_v = tl.load(VS_PTR + h * D + offs)
 
     k = tl.load(K_PTR + base + offs).to(tl.float32)
-    k_amax = tl.max(tl.abs(k), axis=0)
-    k_s = tl.maximum(k_amax / 127.0, 1e-6)
-    k_q = tl.floor(k / k_s + 0.5)
+    k_q = tl.floor(k / s_k + 0.5)
     k_q = tl.minimum(tl.maximum(k_q, -127.0), 127.0)
     tl.store(KC_PTR + slot * KVH * D + h * D + offs, k_q.to(tl.int8))
-    tl.store(KS_PTR + slot * KVH + h, k_s)
 
     v = tl.load(V_PTR + base + offs).to(tl.float32)
-    v_amax = tl.max(tl.abs(v), axis=0)
-    v_s = tl.maximum(v_amax / 127.0, 1e-6)
-    v_q = tl.floor(v / v_s + 0.5)
+    v_q = tl.floor(v / s_v + 0.5)
     v_q = tl.minimum(tl.maximum(v_q, -127.0), 127.0)
     tl.store(VC_PTR + slot * KVH * D + h * D + offs, v_q.to(tl.int8))
-    tl.store(VS_PTR + slot * KVH + h, v_s)
 
 
 def store_kvcache_int8(key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping):
-    """key/value: [N, KVH, D] bf16 activations; k/v_cache: int8 pools viewed
-    per-layer [blocks+1, 256, KVH, D]; k/v_scale: fp32 [blocks+1, 256, KVH]."""
+    """key/value: [N, KVH, D] bf16 activations; k/v_cache: int8 per-layer
+    [blocks+1, 256, KVH, D]; k/v_scale: fp32 per-channel [KVH, D]."""
     N, KVH, D = key.shape
     assert key.stride(2) == 1 and value.stride(2) == 1
     assert key.stride(1) == D and value.stride(1) == D
     flat_k = k_cache.view(-1, KVH * D)
     flat_v = v_cache.view(-1, KVH * D)
-    flat_ks = k_scale.view(-1, KVH)
-    flat_vs = v_scale.view(-1, KVH)
     grid = (N, KVH)
     _store_kv_int8_kernel[grid](
-        key, value, flat_k, flat_v, flat_ks, flat_vs, slot_mapping,
+        key, value, flat_k, flat_v, k_scale, v_scale, slot_mapping,
         key.stride(0), key.stride(1),
         KVH=KVH, D=D,
         num_warps=1,
@@ -64,5 +65,6 @@ def store_kvcache_int8(key, value, k_cache, v_cache, k_scale, v_scale, slot_mapp
 
 def dequant_gathered(kv_i8, scale):
     """Torch dequant for gathered int8 KV (sdpa fallback paths only — the
-    production paged decode kernel dequantizes in-kernel, I20)."""
-    return (kv_i8.to(torch.float32) * scale.to(torch.float32).unsqueeze(-1)).to(torch.bfloat16)
+    production paged decode kernel dequantizes in-kernel, I20).
+    kv_i8: [..., KVH, D]; scale: [KVH, D] -> bf16."""
+    return (kv_i8.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)

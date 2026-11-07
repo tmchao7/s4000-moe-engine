@@ -135,13 +135,15 @@ class Scheduler:
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, "decode"
 
-    def _waiting_candidate(self):
+    def _waiting_candidate(self, touch: bool = True):
         """P16-C: highest priority (lowest value) first; within a tier the
         policy applies — FIFO for stall_free, most-cacheable for lpm.  The
         starvation guard outranks priority so a long-queued low tier still
-        makes progress (bounded fairness instead of hard starvation)."""
-        for seq in self.waiting:
-            seq.wait_steps += 1
+        makes progress (bounded fairness instead of hard starvation).
+
+        wait_steps is incremented once per schedule() pass (in
+        _schedule_stall_free), NOT per candidate pick — a per-pick count made
+        the starvation bound load-dependent (code-review finding)."""
         starved = [seq for seq in self.waiting if seq.wait_steps >= self.starvation_steps]
         if starved:
             candidate = max(starved, key=lambda seq: (seq.wait_steps, -seq.priority))
@@ -153,7 +155,7 @@ class Scheduler:
                     def cached_blocks(seq):
                         if seq.block_table:
                             return seq.num_cached_tokens // self.block_size
-                        value = self.block_manager.can_allocate(seq)
+                        value = self.block_manager.can_allocate(seq, touch=touch)
                         return value if value >= 0 else -1
                     candidate = max(tier, key=cached_blocks)
         self.waiting.remove(candidate)
@@ -207,13 +209,21 @@ class Scheduler:
                 decode_seqs.append(seq)
                 token_budget -= 1
 
+        # wait_steps advances once per scheduler pass (review finding: a
+        # per-pick increment made the starvation bound admission-count-dependent).
+        for seq in self.waiting:
+            seq.wait_steps += 1
         # Each waiting sequence contributes at most one bounded chunk per step.
         # A candidate whose KV cannot be admitted is skipped (and re-queued at
         # the head, preserving order) instead of blocking every later, possibly
         # smaller prompt: head-of-line blocking made one long unadmittable
-        # prompt starve the whole waiting queue (I8's TTFT collapse).
+        # prompt starve the whole waiting queue (I8's TTFT collapse).  Chunked
+        # seqs are likewise held out in `requeued` until after the loop — with
+        # priority picking, re-queuing mid-loop let one chunked seq be picked
+        # (and re-forwarded) several times in a single step (review finding).
         num_waiting = len(self.waiting)
         skipped = []
+        requeued = []
         for _ in range(num_waiting):
             if token_budget == 0 or len(decode_seqs) + len(prefill_seqs) >= seq_budget:
                 break
@@ -240,10 +250,11 @@ class Scheduler:
                 seq.status = SequenceStatus.RUNNING
                 self.running.append(seq)
             else:
-                self.waiting.append(seq)
+                requeued.append(seq)
 
         for seq in reversed(skipped):
             self.waiting.appendleft(seq)
+        self.waiting.extend(requeued)
         self.running.extendleft(reversed(decode_seqs))
         scheduled = decode_seqs + prefill_seqs
         if not scheduled:
