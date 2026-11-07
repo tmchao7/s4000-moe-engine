@@ -14,11 +14,11 @@
 | **S** | P7 投机解码 | S1–S6 |
 | **E** | 生态与厂商（autotune 手搓边界、runtime 限制） | E1–E6 |
 
-**统计（P14 后：口径未变，I 30 项 = 已关闭 19 + 未结 11；S 6 项；E 6 项；P14 只给 I8/I12/I20/I29/E4 增补证据，未新增关闭项。I12 引擎侧兜底已落地，仍留 🟢 观察）**
+**统计（P15 后：I 31 项 = 已关闭 19 + 未结 12（新增 I34）；S 6 项；E 6 项。P15 给 I29 增补新栈证据（维持）；I28 变体已工程化修入 nanovllm/pd/kv_channel.py。I12 引擎侧兜底已落地，仍留 🟢 观察）**
 
 | 系列 | 已关闭 | 未结 | 未结条目 |
 |---|---:|---:|---|
-| I 技术债 | 19 | 11 | I1、I2、I3、I12、I14、**I19**、I20、I27、I28、**I31**、**I32** |
+| I 技术债 | 19 | 12 | I1、I2、I3、I12、I14、**I19**、I20、I27、I28、**I31**、**I32**、**I34** |
 | S 投机解码 | 1 | 5 | S2–S6（S5 随 S1 搁置） |
 | E 生态厂商 | 0 | 6 | E1、E2（可手搓）、E3–E6（厂商侧） |
 
@@ -120,6 +120,10 @@
 ### I31 🟡 30B 进程首个 batch 与稳态逐位不同（一次性 warmup 态跃迁，P11 发现）
 
 30B TP2 生产栈 greedy decode,进程内第一个 batch 的 token 与之后所有 batch 不同(run1–4 两两逐位相同,跨 512-token chat prompts、b1/b8、64 decode;`tests/p11_30b_flip.py` 证据 `benchmarks/data/p11/p11_30b_flip_eager.json`)。**稳态 greedy 是逐位确定的**(MoE 原子加非确定性嫌疑排除)。含义:① 所有 token 一致性门必须**丢弃首 batch**(或先跑一个 warmup batch 再比对),否则把 warmup 态跃迁误判为数值漂移(本轮 p11_30b_ab 的 tokens_consistent=False 即此假象);② 机制未查(候选:首 batch 触发 JIT/autotune/allocator 布局一次性切换)。跨臂(eager vs segment)稳态逐位 0 翻转 = 分段图数值等价的最终证据。
+
+### I34 🟡 引擎 token 依赖状态历史：处女引擎与跑过流量的引擎在同 prompt 上近平局分叉（P15 发现，泛化 I31）
+
+0.6B TP1 paged eager，同引擎内先跑 6 个 PD 交接请求再跑 collocated 生成，与处女引擎的 collocated 结果比：**2/6 请求于中途近平局分叉（completion#10/#19）**，且每种状态历史下各自跨进程逐位确定（PD×2、BASE×2 全等）。含义：① **bitwise 对照臂必须同引擎同状态历史**——处女 baseline 不是合法参照（P15 M2 门已改为同引擎对照，`scripts/p15_pd_1p1d.py`）；② I31 的"首 batch 跃迁"实为"状态历史相关"的特例，机制候选同 I31（allocator 布局/JIT/autotune 一次性切换）；③ 对所有 token 门的影响与 I31 ①相同，但作用域从"首 batch"扩大到"任何状态历史差异"。证据：`/root/p15_data/pd_m2_verdict_*.json`（run1/run2 + in-engine collocated），报告 `benchmarks/P15-pd-autotune.md` §E。
 
 ### I32 🟡 api_server「默认启动」≠ 生产栈；30B 段图捕获的显存前提（P12 发现，两处）
 
