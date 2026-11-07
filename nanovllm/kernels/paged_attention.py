@@ -41,10 +41,22 @@ _PAGED_TUNED: tuple[tuple[int, tuple[int, int, int]], ...] = (
 )
 
 
+# P16-D: rank-synced runtime override (ModelRunner.call("set_paged_config",
+# "auto"|None)) so a single 30B load window can A/B the tuned table — env
+# vars cannot cross the TP worker boundary.
+_PAGED_CONFIG_OVERRIDE: list[str | None] = [None]
+
+
+def set_paged_config(value: str | None) -> None:
+    _PAGED_CONFIG_OVERRIDE[0] = value
+
+
 def _resolve_config(batch: int) -> tuple[int, int, int]:
     """(32,4,1) by default; NANOVLLM_PAGED_CONFIG=auto picks the tuned table,
     BN,warps,stages pins one explicitly."""
-    env = os.environ.get("NANOVLLM_PAGED_CONFIG", "")
+    env = _PAGED_CONFIG_OVERRIDE[0]
+    if env is None:
+        env = os.environ.get("NANOVLLM_PAGED_CONFIG", "")
     if env == "auto":
         for threshold, cfg in _PAGED_TUNED:
             if batch <= threshold:
@@ -61,10 +73,12 @@ if triton is not None:
     @triton.jit
     def _paged_decode_kernel(
         Q, K, V, BLOCK_TABLES, CONTEXT_LENS, OUT,
+        K_SCALE, V_SCALE,
         scale,
         stride_qb, stride_qh,
         stride_kp, stride_kt, stride_kh,
         stride_vp, stride_vt, stride_vh,
+        stride_ks, stride_vs,
         stride_btb,
         stride_ob, stride_oh,
         NUM_HEADS: tl.constexpr,
@@ -72,6 +86,7 @@ if triton is not None:
         HEAD_DIM: tl.constexpr,
         PAGE_SIZE: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        HAS_SCALE: tl.constexpr,
     ):
         batch = tl.program_id(0)
         q_head = tl.program_id(1)
@@ -104,7 +119,18 @@ if triton is not None:
                 + offs_d[None, :]
             )
             keys = tl.load(K + k_offsets, mask=valid[:, None], other=0.0)
-            logits = tl.sum(keys.to(tl.float32) * q32[None, :], axis=1) * scale
+            if HAS_SCALE:
+                # P17 int8 KV: per-token-head fp32 scale rides the same
+                # (page, token, kv_head) addressing as the payload.
+                k_s = tl.load(
+                    K_SCALE + pages * stride_ks + in_page * (NUM_KV_HEADS) + kv_head,
+                    mask=valid,
+                    other=0.0,
+                )
+                keys32 = keys.to(tl.float32) * k_s[:, None]
+            else:
+                keys32 = keys.to(tl.float32)
+            logits = tl.sum(keys32 * q32[None, :], axis=1) * scale
             logits = tl.where(valid, logits, -float("inf"))
 
             tile_max = tl.max(logits, axis=0)
@@ -119,7 +145,16 @@ if triton is not None:
                 + offs_d[None, :]
             )
             values = tl.load(V + v_offsets, mask=valid[:, None], other=0.0)
-            acc = acc * old_scale + tl.sum(probs[:, None] * values, axis=0)
+            if HAS_SCALE:
+                v_s = tl.load(
+                    V_SCALE + pages * stride_vs + in_page * (NUM_KV_HEADS) + kv_head,
+                    mask=valid,
+                    other=0.0,
+                )
+                values32 = values.to(tl.float32) * v_s[:, None]
+            else:
+                values32 = values.to(tl.float32)
+            acc = acc * old_scale + tl.sum(probs[:, None] * values32, axis=0)
             running_sum = running_sum * old_scale + tl.sum(probs, axis=0)
             running_max = new_max
 
@@ -129,6 +164,7 @@ if triton is not None:
 
 def paged_decode_attention(
     q, k_cache, v_cache, block_tables, context_lens, scale, max_context_len,
+    k_scale=None, v_scale=None,
 ):
     if triton is None:
         raise RuntimeError("triton is required for triton_paged attention")
@@ -149,12 +185,17 @@ def paged_decode_attention(
     # compiled kernel (and a captured graph) serves every context size.
     block_n, num_warps, num_stages = _resolve_config(batch)
     grid = (batch, num_heads)
+    has_scale = k_scale is not None
     _paged_decode_kernel[grid](
         q, k_cache, v_cache, block_tables, context_lens, output,
+        k_scale if has_scale else q,      # dummy ptr when unused (tl needs an arg)
+        v_scale if has_scale else q,
         scale,
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        k_scale.stride(0) if has_scale else 1,   # scale PAGE stride = 256*KVH
+        v_scale.stride(0) if has_scale else 1,
         block_tables.stride(0),
         output.stride(0), output.stride(1),
         NUM_HEADS=num_heads,
@@ -162,6 +203,7 @@ def paged_decode_attention(
         HEAD_DIM=head_dim,
         PAGE_SIZE=page_size,
         BLOCK_N=block_n,
+        HAS_SCALE=has_scale,
         num_warps=num_warps,
         num_stages=num_stages,
     )

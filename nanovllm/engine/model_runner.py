@@ -243,6 +243,14 @@ class ModelRunner:
         """
         self._mixed_unified = bool(enabled)
 
+    def set_paged_config(self, value: str | None):
+        """P16-D: rank-synced paged-kernel config override ("auto" = tuned
+        table, None = production default).  Env vars cannot cross the TP
+        worker boundary, so the 30B single-load A/B flips this through call().
+        """
+        from nanovllm.kernels import paged_attention
+        paged_attention.set_paged_config(value)
+
     def set_moe_backend(self, backend: str, decode_backend: str | None = None):
         """Set the MoE backend; ``decode_backend`` defaults to the same one."""
         assert backend in (
@@ -516,7 +524,11 @@ class ModelRunner:
         current = self.acc.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.model_dtype.itemsize
+        kv_int8 = config.kv_cache_dtype == "int8"
+        # P17: int8 KV stores one byte per element + a per-token-head fp32
+        # scale, halving block_bytes (~2x blocks at the same gpu-util).
+        kv_itemsize = 1 if kv_int8 else self.model_dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * kv_itemsize
         # An explicit positive block count wins over the utilisation heuristic:
         # graph capture needs contiguous headroom on top of the KV cache, and the
         # heuristic deliberately fills the device (capture then OOMs, e.g. 384 MiB
@@ -542,10 +554,24 @@ class ModelRunner:
             f"peak={peak / 2**30:.2f} GiB current={current / 2**30:.2f} GiB free={free / 2**30:.2f} GiB",
             flush=True,
         )
+        self.last_block_bytes = block_bytes
         # One extra block the BlockManager never sees: graph replay points the
         # padding rows' slot_mapping and block_tables at it, so the whole-bucket
         # replay cannot overwrite KV slot 0 of a live request.
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks + 1, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(
+            2, hf_config.num_hidden_layers, config.num_kvcache_blocks + 1, self.block_size, num_kv_heads, head_dim,
+            dtype=torch.int8 if kv_int8 else None,
+        )
+        if kv_int8:
+            # [K/V, layer, block, token, kv_head] — K and V quantize with
+            # their OWN per-token-head absmax, so scales are separate.
+            self.kv_scales = torch.zeros(
+                2, hf_config.num_hidden_layers, config.num_kvcache_blocks + 1,
+                self.block_size, num_kv_heads, dtype=torch.float32, device=self.device,
+            )
+        else:
+            self.kv_scales = None
+        self.kv_cache_is_int8 = kv_int8
         self.scratch_block_id = config.num_kvcache_blocks
         self.scratch_slot = config.num_kvcache_blocks * self.block_size
         layer_id = 0
@@ -553,6 +579,10 @@ class ModelRunner:
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                if kv_int8:
+                    module.k_scale = self.kv_scales[0, layer_id]
+                    module.v_scale = self.kv_scales[1, layer_id]
+                module.kv_cache_is_int8 = kv_int8
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):

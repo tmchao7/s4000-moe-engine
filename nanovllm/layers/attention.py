@@ -30,11 +30,17 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     flat_v[slot_mapping] = value
 
 
-def _gather_kv(cache, block_table, valid_len, block_size):
-    """Gather paged KV for one sequence. valid_len: int (tokens). Returns (len, h, d)."""
+def _gather_kv(cache, block_table, valid_len, block_size, scale=None):
+    """Gather paged KV for one sequence. valid_len: int (tokens). Returns
+    (len, h, d) in bf16 — for an int8 pool the fused dequant rides the same
+    flat gather (P17; the I20 lesson bans standalone conversion passes in
+    production paths, and the prefill gather is this one site)."""
     num_blocks = (valid_len + block_size - 1) // block_size
     blocks = block_table[:num_blocks].long()
     kv = cache[blocks]
+    if scale is not None:
+        s = scale[blocks]
+        kv = (kv.to(torch.float32) * s.unsqueeze(-1).to(torch.float32)).to(torch.bfloat16)
     return kv.view(-1, *cache.shape[-2:])[:valid_len]
 
 
@@ -99,6 +105,8 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.block_size = None  # set on first use from kv cache shape
         self.k_cache = self.v_cache = torch.tensor([])
+        self.k_scale = self.v_scale = None      # P17 int8 pools
+        self.kv_cache_is_int8 = False
         self.attention_backend = "sdpa"
         self.profiler = None
         self.layer_id = -1
@@ -115,7 +123,13 @@ class Attention(nn.Module):
             if self.block_size is None:
                 self.block_size = k_cache.size(1)
             with self._profile("attention.kv_store"):
-                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+                if getattr(self, "kv_cache_is_int8", False):
+                    from nanovllm.kernels.kv_int8 import store_kvcache_int8
+                    store_kvcache_int8(k, v, k_cache, v_cache,
+                                       self.k_scale, self.v_scale,
+                                       context.slot_mapping)
+                else:
+                    store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_mixed:
             # P16-A unified mixed batch: one forward over decode rows followed
             # by prefill rows.  Both row groups keep their exact production
@@ -154,6 +168,9 @@ class Attention(nn.Module):
             context = get_context()
             cu_q = context.cu_seqlens_q.tolist()
             cu_k = context.cu_seqlens_k.tolist()
+        int8 = getattr(self, "kv_cache_is_int8", False)
+        k_sc = self.k_scale if int8 else None
+        v_sc = self.v_scale if int8 else None
         outs = []
         for i in range(len(cu_q) - 1):
             sq, sk = cu_q[i + 1] - cu_q[i], cu_k[i + 1] - cu_k[i]
@@ -167,8 +184,8 @@ class Attention(nn.Module):
                 outs.append(_sdpa(q_i, k_i, v_i, self.scale, is_causal=True))
             else:                                                  # prefix cache hit
                 start = sk - sq
-                k_i = _expand_kv(_gather_kv(k_cache, block_tables[i], sk, self.block_size), self.num_heads).transpose(0, 1)
-                v_i = _expand_kv(_gather_kv(v_cache, block_tables[i], sk, self.block_size), self.num_heads).transpose(0, 1)
+                k_i = _expand_kv(_gather_kv(k_cache, block_tables[i], sk, self.block_size, scale=k_sc), self.num_heads).transpose(0, 1)
+                v_i = _expand_kv(_gather_kv(v_cache, block_tables[i], sk, self.block_size, scale=v_sc), self.num_heads).transpose(0, 1)
                 positions = torch.arange(start, sk, device=q.device)
                 allowed = torch.arange(sk, device=q.device) <= positions.unsqueeze(1)
                 outs.append(_sdpa(q_i, k_i, v_i, self.scale, attn_mask=allowed))
@@ -186,6 +203,8 @@ class Attention(nn.Module):
                     context_lens,
                     self.scale,
                     max_context_len,
+                    k_scale=self.k_scale if getattr(self, "kv_cache_is_int8", False) else None,
+                    v_scale=self.v_scale if getattr(self, "kv_cache_is_int8", False) else None,
                 )
         bs = q.size(0)
         block_size = self.block_size
@@ -199,8 +218,15 @@ class Attention(nn.Module):
         with self._profile("attention.gather_mask"):
             k = k_cache[blocks].view(bs, full_kv_len, *k_cache.shape[-2:])
             v = v_cache[blocks].view(bs, full_kv_len, *v_cache.shape[-2:])
-            k = k[:, :kv_len]
-            v = v[:, :kv_len]
+            if getattr(self, "kv_cache_is_int8", False):
+                from nanovllm.kernels.kv_int8 import dequant_gathered
+                ks = self.k_scale[blocks].view(bs, full_kv_len, k.size(-2))
+                vs = self.v_scale[blocks].view(bs, full_kv_len, v.size(-2))
+                k = dequant_gathered(k[:, :kv_len], ks[:, :kv_len])
+                v = dequant_gathered(v[:, :kv_len], vs[:, :kv_len])
+            else:
+                k = k[:, :kv_len]
+                v = v[:, :kv_len]
             arange = torch.arange(kv_len, device=q.device)
             valid = arange.unsqueeze(0) < context_lens.unsqueeze(1)     # (bs, kv_len)
             q = q.transpose(0, 1).unsqueeze(2)                          # (h, bs, 1, d)

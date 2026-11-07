@@ -31,6 +31,12 @@ class Config:
         "loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused"
     ] | None = None
     attention_backend: Literal["sdpa", "triton_paged"] = "triton_paged"
+    # P17: KV cache storage dtype.  "int8" stores per-token-head-absmax
+    # quantized values + fp32 scales ([blocks, 256, kv_heads] per layer);
+    # block_bytes halves, so the same gpu-util yields ~2x blocks.  Dequant is
+    # fused into the read paths (paged decode kernel / gather), never a
+    # standalone pass (I20 probe: naive dequant was 5.7x slower than a copy).
+    kv_cache_dtype: Literal["bf16", "int8"] = "bf16"
     expert_placement: Literal["linear", "round_robin", "profiled"] = "linear"
     expert_map_path: str | None = None
     scheduler_policy: Literal["fcfs", "stall_free", "stall_free_lpm"] = "fcfs"
@@ -57,6 +63,7 @@ class Config:
             None, "loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused",
         )
         assert self.attention_backend in ("sdpa", "triton_paged")
+        assert self.kv_cache_dtype in ("bf16", "int8")
         assert self.expert_placement in ("linear", "round_robin", "profiled")
         assert self.scheduler_policy in ("fcfs", "stall_free", "stall_free_lpm")
         assert self.prefill_chunk_size > 0
