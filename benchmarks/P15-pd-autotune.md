@@ -67,6 +67,26 @@
 8B 经 hf-mirror+aria2 下载(16GB,~12min)。M2 全链路:prefill 74–88ms(首请求含 JIT 0.88s)→ 传输 **18–27ms/块(8B 块=36 MiB)** → 导入 27–84ms → decode 1.36–1.50s/24 tok。卡0 在泄漏下 KV 只剩 37 块(1.3GiB,util 0.9 绕过毒化公式)仍全绿。**判定:PD==同引擎 collocated 6/6 bitwise + 处女 baseline 6/6 全等** → 调研的"≤8B 单机双卡 1P1D 成立"从推断变实测(0.6B+8B 双档)。I34 状态风味在 8B 未触发(与状态具体性一致,非系统效应)。
 工程化:`scripts/p15_pd_1p1d.py` 与 `tests/p15_pd_m1_kv.py` 已参数化 `--model`/`--gpu-util`(泄漏期 KV 公式被毒化时用 0.9)。
 
+## H. P15-C-M3: PD 并发化 + collocated vs PD 在线 A/B — **双档 POSITIVE**
+
+控制面升级(`scripts/p15_pd_serve.py`):collocated(TP2)/prefill(P)/decode(D) 三角色事件循环(select + 非阻塞增量组帧);D 侧 handoff 准入与 decode 步交错,KV 帧增量组装不阻塞解码;协议入 `nanovllm/pd/protocol.py`;修复非阻塞 socket 大载荷 sendall 的 BlockingIOError。
+
+A/B 口径:同 2 卡、同负载(闭式突发 6 长≈1k tok + 6 短, max_tokens 96)、客户端边界同构;collocated=TP2 生产形态。**门(预注册 PLAN §1 C-M3):PD ITL p95 < collocated → 正向。**
+
+| 模型 | 臂 | ITL p50 | p95 | p99 | client e2e 均值 | 吞吐 |
+|---|---|---|---|---|---|---|
+| 0.6B | collocated | 0.115 | 0.143 | 0.167 | 16.65 s | 0.492 rps |
+| 0.6B | PD | **0.059** | **0.107** | 0.339⚠️ | **8.58 s (−48%)** | 0.453 rps |
+| 8B | collocated | 0.138 | 0.156 | 0.198 | 19.38 s | 0.413 rps |
+| 8B | PD | **0.083** | **0.130** | **0.150** | **11.50 s (−41%)** | 0.301 rps |
+
+- **0.6B:ITL p95 比值 0.753×(PASS)**;p99 有 0.34s 尖刺(KV 导入打断 decode,如实记录)。
+- **8B:ITL p95 比值 0.839×(PASS),全分位改善**(p50 −40% / p99 −24%),e2e −41%。
+- **吞吐 PD −15~27%**:P 侧 handoff 串行化(prefill 队列均值 4.3/7.2s)+ 每侧 TP1——**与调研预告一致:PD 赢 SLO 不赢吞吐**(vLLM 文档同结论)。
+- **方法论注记**:PD 侧每卡 TP1,去除了 TP2 的每层 MCCL allreduce——小模型上这一项本身就压 ITL;ITL 优势含此混淆。两臂是"同 2 卡各自的标准服务形态"的架构公平口径;若要隔离纯分离效应,需加 collocated-TP1 对照(单卡,资源减半,对 collocated 不公平)——列为可选补测。
+- **简历口径**:从零自研 PD 分离(控制面/可插拔 KV 通道/bitwise 交接契约),0.6B+8B 在线 A/B 实测 ITL 尾部改善、吞吐换延迟的结构性权衡得到数据验证。
+- Step0(p99/p50 2.3–6.3×)→ M3(ITL p95 −16~25%)完整闭环:干扰存在 → 分离后干扰消除。
+
 ## G. 泄漏终局与新机器接管(11-07 晚)
 
 泄漏的宿主级结论经三轮实测钉死:**容器重启、完整关机-开机、AutoDL 克隆实例(数据卷就绑在原宿主机)均无法清除**——22GB 无主显存写在宿主 GPU 驱动里,只有平台侧重置宿主机才能清。三份证据:i29_engine_probe.json + 原实例三次生命周期读数一致(22224/179MiB,PCIe 27:00.0/2f:00.0)。**该现象本身是 I29 的最重形态实证,已并入厂商工单素材。**
