@@ -27,6 +27,12 @@ from nanovllm.utils.context import get_context
 # layer and a data-dependent shape, so it is eager-only and defaults off.
 _CAPACITY_SHRINK = [os.environ.get("NANOVLLM_MOE_CAPACITY_SHRINK", "0") == "1"]
 
+# P16-A unified mixed batch: default = ONE grouped_mm dispatch over the whole
+# mixed batch (bmm_dense is banned at prefill sizes — prefill OOM).  Setting
+# NANOVLLM_MIXED_MOE=split keeps per-row-group backends inside the single
+# forward (decode rows keep bmm_dense) as the numeric-gate fallback.
+_MIXED_MOE_SPLIT = [os.environ.get("NANOVLLM_MIXED_MOE", "unified") == "split"]
+
 
 def set_capacity_shrink(enabled: bool) -> None:
     _CAPACITY_SHRINK[0] = bool(enabled)
@@ -483,6 +489,19 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 expert_map=self.global_to_local_i32,
             )
 
+    def _moe_dispatch(self, hidden_states, topk_ids, topk_weights, backend):
+        """Single-backend expert dispatch, shared by the plain and mixed paths."""
+        if backend == "vllm_fused":
+            return self._forward_vllm_fused(hidden_states, topk_ids, topk_weights)
+        if backend == "bmm_dense":
+            return self._forward_bmm_dense(hidden_states, topk_ids, topk_weights)
+        if backend in ("grouped_mm", "fused_grouped_mm"):
+            return self._forward_grouped_mm(
+                hidden_states, topk_ids, topk_weights,
+                fused=backend == "fused_grouped_mm",
+            )
+        return self._forward_loop(hidden_states, topk_ids, topk_weights)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         with self._profile("moe.router_topk"):
             router_logits = self.gate(hidden_states)
@@ -509,18 +528,23 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights.to(hidden_states.dtype)
 
-        backend = self.moe_backend if get_context().is_prefill else self.decode_moe_backend
-        if backend == "vllm_fused":
-            out = self._forward_vllm_fused(hidden_states, topk_ids, topk_weights)
-        elif backend == "bmm_dense":
-            out = self._forward_bmm_dense(hidden_states, topk_ids, topk_weights)
-        elif backend in ("grouped_mm", "fused_grouped_mm"):
-            out = self._forward_grouped_mm(
-                hidden_states, topk_ids, topk_weights,
-                fused=backend == "fused_grouped_mm",
+        ctx = get_context()
+        if ctx.is_mixed and _MIXED_MOE_SPLIT[0]:
+            # Split fallback: per-row-group backends inside the single forward;
+            # each group reproduces the legacy sub-pass kernel inputs exactly.
+            n = ctx.num_decode_rows
+            out = torch.empty_like(hidden_states)
+            if n:
+                out[:n] = self._moe_dispatch(
+                    hidden_states[:n], topk_ids[:n], topk_weights[:n],
+                    self.decode_moe_backend or self.moe_backend,
+                )
+            out[n:] = self._moe_dispatch(
+                hidden_states[n:], topk_ids[n:], topk_weights[n:], self.moe_backend,
             )
         else:
-            out = self._forward_loop(hidden_states, topk_ids, topk_weights)
+            backend = self.moe_backend if ctx.is_prefill else self.decode_moe_backend
+            out = self._moe_dispatch(hidden_states, topk_ids, topk_weights, backend)
         with self._profile("moe.ep_all_reduce"):
             # defer_reduce: P10 segment-graph prototype — this combine moves
             # out of the captured segment; run_model all_reduces eagerly.

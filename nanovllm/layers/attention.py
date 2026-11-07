@@ -116,15 +116,42 @@ class Attention(nn.Module):
                 self.block_size = k_cache.size(1)
             with self._profile("attention.kv_store"):
                 store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        if context.is_mixed:
+            # P16-A unified mixed batch: one forward over decode rows followed
+            # by prefill rows.  Both row groups keep their exact production
+            # kernels (paged triton decode / per-seq SDPA prefill); everything
+            # around attention (norms, rope, MoE, the two per-layer allreduce)
+            # runs once for the whole batch.
+            n = context.num_decode_rows
+            with self._profile("attention.mixed_decode"):
+                out_dec = self._forward_decode(
+                    q[:n], k_cache, v_cache,
+                    context.block_tables[:n],
+                    context.decode_context_lens,
+                    context.decode_max_context_len,
+                )
+            with self._profile("attention.mixed_prefill"):
+                out_pre = self._forward_prefill(
+                    q[n:], k[n:], v[n:], k_cache, v_cache,
+                    context.cu_seqlens_q_list, context.cu_seqlens_k_list,
+                    context.block_tables[n:],
+                )
+            return torch.cat([out_dec, out_pre], dim=0)
         if context.is_prefill:
             with self._profile("attention.prefill"):
-                return self._forward_prefill(q, k, v, k_cache, v_cache, context)
-        return self._forward_decode(q, k_cache, v_cache, context)
+                return self._forward_prefill(
+                    q, k, v, k_cache, v_cache,
+                    context.cu_seqlens_q_list, context.cu_seqlens_k_list,
+                    context.block_tables,
+                )
+        return self._forward_decode(
+            q, k_cache, v_cache,
+            context.block_tables, context.context_lens, context.max_context_len,
+        )
 
-    def _forward_prefill(self, q, k, v, k_cache, v_cache, context):
-        cu_q = context.cu_seqlens_q_list
-        cu_k = context.cu_seqlens_k_list
+    def _forward_prefill(self, q, k, v, k_cache, v_cache, cu_q, cu_k, block_tables):
         if cu_q is None or cu_k is None:
+            context = get_context()
             cu_q = context.cu_seqlens_q.tolist()
             cu_k = context.cu_seqlens_k.tolist()
         outs = []
@@ -133,21 +160,21 @@ class Attention(nn.Module):
             if sq == 0 or sk == 0:
                 continue
             q_i = q[cu_q[i]:cu_q[i + 1]].transpose(0, 1)          # (h, sq, d)
-            if context.block_tables is None:                       # no prefix cache
+            if block_tables is None:                               # no prefix cache
                 # expand kv heads BEFORE transpose: layout here is (seq, kh, d)
                 k_i = _expand_kv(k[cu_k[i]:cu_k[i + 1]], self.num_heads).transpose(0, 1)
                 v_i = _expand_kv(v[cu_k[i]:cu_k[i + 1]], self.num_heads).transpose(0, 1)
                 outs.append(_sdpa(q_i, k_i, v_i, self.scale, is_causal=True))
             else:                                                  # prefix cache hit
                 start = sk - sq
-                k_i = _expand_kv(_gather_kv(k_cache, context.block_tables[i], sk, self.block_size), self.num_heads).transpose(0, 1)
-                v_i = _expand_kv(_gather_kv(v_cache, context.block_tables[i], sk, self.block_size), self.num_heads).transpose(0, 1)
+                k_i = _expand_kv(_gather_kv(k_cache, block_tables[i], sk, self.block_size), self.num_heads).transpose(0, 1)
+                v_i = _expand_kv(_gather_kv(v_cache, block_tables[i], sk, self.block_size), self.num_heads).transpose(0, 1)
                 positions = torch.arange(start, sk, device=q.device)
                 allowed = torch.arange(sk, device=q.device) <= positions.unsqueeze(1)
                 outs.append(_sdpa(q_i, k_i, v_i, self.scale, attn_mask=allowed))
         return torch.cat(outs, dim=1).transpose(0, 1)              # (sq_total, h, d)
 
-    def _forward_decode(self, q, k_cache, v_cache, context):
+    def _forward_decode(self, q, k_cache, v_cache, block_tables, context_lens, max_context_len):
         if self.attention_backend == "triton_paged":
             from nanovllm.kernels.paged_attention import paged_decode_attention
             with self._profile("attention.triton_paged"):
@@ -155,21 +182,20 @@ class Attention(nn.Module):
                     q,
                     k_cache,
                     v_cache,
-                    context.block_tables,
-                    context.context_lens,
+                    block_tables,
+                    context_lens,
                     self.scale,
-                    context.max_context_len,
+                    max_context_len,
                 )
         bs = q.size(0)
         block_size = self.block_size
-        context_lens = context.context_lens
-        max_blocks = context.block_tables.size(1)
-        blocks = context.block_tables.clamp(min=0).long()
+        max_blocks = block_tables.size(1)
+        blocks = block_tables.clamp(min=0).long()
         # Never pass the uninitialized tail of the last KV block into SDPA.
         # Some MUSA SDPA kernels can propagate NaNs from masked positions before
         # applying the boolean mask, making decode depend on allocator contents.
         full_kv_len = max_blocks * block_size
-        kv_len = context.max_context_len or full_kv_len
+        kv_len = max_context_len or full_kv_len
         with self._profile("attention.gather_mask"):
             k = k_cache[blocks].view(bs, full_kv_len, *k_cache.shape[-2:])
             v = v_cache[blocks].view(bs, full_kv_len, *v_cache.shape[-2:])

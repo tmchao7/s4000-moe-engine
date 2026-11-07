@@ -55,7 +55,17 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context()
-        if context.is_prefill:
+        if context.is_mixed:
+            # P16-A unified mixed batch: decode rows [0, n) each sample; every
+            # prefill sequence samples its last chunk row (cu_seqlens_q is
+            # prefill-relative).  Output rows follow the batch's seq order
+            # (decode seqs first) so the sampler's per-seq temperatures align.
+            n = context.num_decode_rows
+            dec_idx = torch.arange(n, device=x.device, dtype=torch.long)
+            pre_idx = context.cu_seqlens_q[1:].long() - 1 + n
+            last_indices = torch.cat([dec_idx, pre_idx])
+            x = x[last_indices].contiguous()
+        elif context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)

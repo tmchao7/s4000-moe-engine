@@ -43,6 +43,14 @@ def set_host_sync_fix(enabled: bool) -> None:
 # through its own prepare/forward; runtime-switchable for A/B.
 _MIXED_SPLIT = [os.environ.get("NANOVLLM_MIXED_SPLIT", "1") == "1"]
 
+# P16-A unified mixed batch: ONE forward over decode rows + prefill rows
+# (vLLM V1 / SGLang MIXED shape) instead of the legacy two-sub-forward split.
+# Attention keeps per-group production kernels; MoE runs once (grouped_mm).
+# Default off until the pre-registered gates pass; NANOVLLM_MIXED_UNIFIED=1
+# opts in.  The runtime switch is the rank-synced instance method
+# ``set_mixed_unified`` (call it through ModelRunner.call on TP2).
+_MIXED_UNIFIED = [os.environ.get("NANOVLLM_MIXED_UNIFIED", "0") == "1"]
+
 # I29 segmented-graph prototype (P10): capture per-layer segment graphs with
 # ZERO collectives inside (the two per-layer all_reduces run eagerly between
 # segment replays).  TP2 whole-graph replay wedges (I29); TP1 graphs (no
@@ -96,6 +104,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self._mixed_unified = _MIXED_UNIFIED[0]
 
         _trace_init(rank, "start")
         dist.init_process_group(
@@ -224,6 +233,15 @@ class ModelRunner:
             # it destroys the process group itself.
             dist.barrier()
         return result
+
+    def set_mixed_unified(self, enabled: bool):
+        """P16-A unified mixed batch runtime switch.
+
+        Instance flag so a TP2 flip goes through call() to both ranks; a bare
+        module flag would leave rank1 on the legacy split and desynchronize
+        the step.
+        """
+        self._mixed_unified = bool(enabled)
 
     def set_moe_backend(self, backend: str, decode_backend: str | None = None):
         """Set the MoE backend; ``decode_backend`` defaults to the same one."""
@@ -544,6 +562,24 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        return self._prepare_rows(seqs, mixed=False)
+
+    def prepare_mixed(self, seqs: list[Sequence]):
+        """P16-A unified mixed batch: decode rows first, then prefill rows,
+        ONE forward (vLLM V1 / SGLang MIXED shape).  Raises ValueError when
+        the row groups are not contiguous decode-first; run() then falls back
+        to the legacy _run_mixed split."""
+        return self._prepare_rows(seqs, mixed=True)
+
+    def _prepare_rows(self, seqs: list[Sequence], mixed: bool):
+        n_dec = 0
+        dec_ctx_lens = []
+        if mixed:
+            while n_dec < len(seqs) and not seqs[n_dec].is_prefill:
+                dec_ctx_lens.append(len(seqs[n_dec]))
+                n_dec += 1
+            if not all(seq.is_prefill for seq in seqs[n_dec:]):
+                raise ValueError("mixed batch rows not contiguous decode-first")
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -559,14 +595,22 @@ class ModelRunner:
             seqlen_k = end
             if seq.is_prefill:
                 input_ids.extend(seq[start:end])
+                # Mixed context keeps cu_seqlens PREFILL-ONLY: the decode group
+                # addresses attention through block_tables + context_lens.
+                cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+                cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+                max_seqlen_q = max(seqlen_q, max_seqlen_q)
+                max_seqlen_k = max(seqlen_k, max_seqlen_k)
             else:
                 assert seqlen_q == 1
                 input_ids.append(seq.last_token)
+                if not mixed:
+                    dec_ctx_lens.append(len(seq))
+                    cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+                    cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+                    max_seqlen_q = max(seqlen_q, max_seqlen_q)
+                    max_seqlen_k = max(seqlen_k, max_seqlen_k)
             positions.extend(range(start, end))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
             start_block = start // self.block_size
@@ -580,7 +624,13 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if mixed:
+            # Decode rows always need block tables for the paged kernel, even
+            # when no prefill seq has a prefix-cache hit.  Prefill rows then
+            # take the gather path (reads the KV store_kvcache just wrote —
+            # same values as the fresh-kv path).
+            block_tables = self.prepare_block_tables(seqs)
+        elif cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
@@ -588,9 +638,18 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
-                    cu_seqlens_q_list=cu_q_list if _SYNC_FIX[0] else None,
-                    cu_seqlens_k_list=cu_k_list if _SYNC_FIX[0] else None)
+        if mixed:
+            dec_lens = torch.tensor(dec_ctx_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+            set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
+                        cu_seqlens_q_list=cu_q_list if _SYNC_FIX[0] else None,
+                        cu_seqlens_k_list=cu_k_list if _SYNC_FIX[0] else None,
+                        is_mixed=True, num_decode_rows=n_dec,
+                        decode_context_lens=dec_lens,
+                        decode_max_context_len=max(dec_ctx_lens))
+        else:
+            set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
+                        cu_seqlens_q_list=cu_q_list if _SYNC_FIX[0] else None,
+                        cu_seqlens_k_list=cu_k_list if _SYNC_FIX[0] else None)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -693,9 +752,19 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], mode: str) -> list[int]:
         with self.profiler.range("runner.prepare", mode=mode):
             temperatures, all_greedy = self.prepare_sample(seqs) if self.rank == 0 else (None, True)
-            if mode == "mixed" and _MIXED_SPLIT[0]:
-                return self._run_mixed(seqs, temperatures, all_greedy)
-            input_ids, positions = self.prepare_decode(seqs) if mode == "decode" else self.prepare_prefill(seqs)
+            unified = False
+            if mode == "mixed" and self._mixed_unified:
+                try:
+                    input_ids, positions = self.prepare_mixed(seqs)
+                    unified = True
+                except ValueError:
+                    unified = False    # non-contiguous groups: legacy split
+            if mode == "mixed" and not unified:
+                if _MIXED_SPLIT[0]:
+                    return self._run_mixed(seqs, temperatures, all_greedy)
+                input_ids, positions = self.prepare_prefill(seqs)
+            elif not unified:
+                input_ids, positions = self.prepare_decode(seqs) if mode == "decode" else self.prepare_prefill(seqs)
         with self.profiler.range("runner.forward", mode=mode):
             logits = self.run_model(input_ids, positions, mode)
         with self.profiler.range("runner.sample", mode=mode):

@@ -1,14 +1,15 @@
-# HANDOFF — 当前交接(滚动更新;本版 = P15 收官,2026-11-07)
+# HANDOFF — 当前交接(滚动更新;本版 = P16 进行中,P15 收官于 2026-11-07)
 
 > 本文是**唯一交接文档**(历史版本在 git 历史)。接手先读本文,再按 [AGENTS.md](../AGENTS.md) 核验环境与命令。规则不变:先写门再跑;一次一个 GPU 任务;负结果照录;本地 commit(用户授权后才 push);到点无论进度必须停下写交接、清服务器。
 > 配套:[docs/PLAN.md](./PLAN.md)(迭代计划与冻结门)、[docs/ISSUES.md](./ISSUES.md)(台账)、[docs/CLOSEOUT.md](./CLOSEOUT.md)、[docs/E-vendor-ticket.md](./E-vendor-ticket.md)(厂商工单,**待用户亲自发**)、[docs/PD-DISAGG-SURVEY.md](./PD-DISAGG-SURVEY.md)(PD 立项调研)。`docs/RESUME.md` 只在本地不入库。
 
 ## 0. 三十秒状态
 
-- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;HEAD 已 push(P15 全量,2026-11-07)。
-- **服务器**:新 seetacloud 实例(ssh 别名 `s4000`,**克隆到的新宿主机**,旧实例带宿主级泄漏可释放)。双卡 0 MiB、模型 0.6B/8B/30B 齐(9/9 shard 校验)、四套单测全绿、30B 冒烟通过。
+- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;P15 全量已 push,P16 进行中(本地 commit)。
+- **服务器**:新 seetacloud 实例(ssh 别名 `s4000`)。双卡 0 MiB、模型 0.6B/8B/30B 齐(9/9 shard 校验)、四套单测全绿、30B 冒烟通过。
 - **生产栈(未变)**:`triton_paged` + `grouped_mm`(prefill)/`bmm_dense`(decode) + `enforce_eager=True` + `stall_free` + TP2/EP2 + chunk-256。**默认值一个没动**。
-- **P15 一句话**:合成线(快赢 → I29 复测 → PD)全部判决。**E1 autotune 内核 2× 但数值门 FAIL(默认不翻,opt-in);I29 新栈维持(形态变为 init 楔 + 驱动级残留);PD 分离单机双卡小模型线全闭环——M1/M2 bitwise + M3 在线 A/B POSITIVE(ITL p95 −16~25%)**。
+- **P16-A 一句话(已判决)**:统一混合批(一步单 pass,vLLM V1/SGLang MIXED 形态)——**混合步 0.6B −25%/8B −15%,在线 pooled p95 −2.4%;数值门 0.6B 0.56%>0.5% FAIL(GEMM 批组成固有,split 回退同值;8B 逐位 0 翻转;legacy 自身历史敏感性 0.294%)→ opt-in `NANOVLLM_MIXED_UNIFIED=1`,默认不变**。报告 benchmarks/P16-mixed-unified.md。
+- **P16 待做**:B LRU 淘汰 / C 优先级调度 / D 30B E1;之后 P17 KV int8、P18 PD 推进(PLAN §1)。
 - **I29 红线(用户明令)**:**不要再运行 graph replay 类实验**(`tests/p15_i29_engine_probe.py` 保留作历史证据,其楔死会留下宿主级 22GB 无主显存,容器内不可清)。
 
 ## 1. P15 结论(报告 `benchmarks/P15-pd-autotune.md`)
@@ -50,3 +51,6 @@
 4. `scripts/` 无 `__init__.py` → 跨脚本共享代码放 `nanovllm/pd/` 等正式包;非阻塞 socket 大载荷 sendall 会 BlockingIOError(发送侧临时切阻塞);同进程第二引擎是已知失败模式。
 5. `NANOVLLM_PAGED_CONFIG`:`auto`=tuned 表;`BN,warps,stages`=钉死;缺省=生产 (32,4,1)。泄漏期 KV 预算被设备级 used 毒化时,引擎构建用 `--gpu-util 0.9` 绕过。
 6. (继承)1k 冷态一律 `--prompt-seed-per-repeat`;tiny 不能跑 triton_paged,bitwise 门只在 0.6B paged;EADDRINUSE 单独重跑;MaxStartups 冷却 60–90 s;锚定 pgrep(`[p]` 括号);api_server 默认 ≠ 生产栈(须 `--decode-moe-backend bmm_dense`);`/tmp/tiny_moe` 用 `scripts/make_tiny_moe.py` 重建。
+7. **(P16-A 新增)在线 p95 判定必须交错 ≥3 重复后 pool**:单次 A/B 曾判 FAIL(p95 ratio 1.079),交错 3 重复后反转 PASS(0.976)——单次在线差异默认当噪声。
+8. **(P16-A 新增)ABA 门必须有丢弃式暖机段**:进程首个段吃 triton JIT/首触分配(legacy rep1 1.07s vs 稳态 0.17s),双臂各暖一段再计 rep,否则 CV 门必挂。
+9. **(P16-A 新增)TP2 运行时开关一律走 `runner.call("set_xxx")` 实例方法**(rank 同步);裸模块级 flag 会让 rank1 停在旧路径。`NANOVLLM_MIXED_UNIFIED=1` 启用统一混合批(默认 legacy split);`NANOVLLM_MIXED_MOE=split` 为 MoE 行组分发回退(数值上与 unified 无差,翻转源=GEMM 批组成)。
