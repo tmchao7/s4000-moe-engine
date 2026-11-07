@@ -5,7 +5,7 @@
 
 ## 0. 三十秒状态
 
-- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;**HEAD 领先 origin 9 个本地 commit(隔夜轮+P19+P20,待用户审后 push)**。
+- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;**HEAD 领先 origin 11 个本地 commit(隔夜轮+P19/P20/P21,待用户审后 push)**。P21(11-08):P18-C 前缀复用 5.7×+priority×PD 全链路(修 2 控制面 bug)+P18-B OpenAI 端点冒烟。
 - **P19(11-08)**:I20 per-channel 修复尝试(机制逐位正确)+ 独立 code review(修复 HIGH 重复调度 bug + 8 项,t6 回归)+ 指标核查(/metrics/priority 400);报告 benchmarks/P19-i20-review.md。
 - **P20(11-08)**:I20 终局 — 混合精度 outlier 通道(per-(layer,kv_head) bf16 维 ≤4 + 侧池 + split-sum)机制逐位正确但质量门 FAIL → **I20 终判:本模型 K/V 动态范围对 int8 不可用**;**P16-A 30B 证据 PASS(ratio 0.977 + flips=0 逐位)**,证据链完整(0.6B/8B/30B),默认维持 opt-in、门修订提案留用户;顺带修复 P19 遗留 bug(paged 读误用 store scales)。
 - **服务器**:seetacloud `s4000`;收官时双卡 0 MiB、无进程、shm 干净;终回归 8/8 全绿(四套+p16-mixed+lru+prio+p17-unit)。
@@ -35,7 +35,7 @@
 | 1 | **用户审本地 commit → push** | 隔夜轮+P19 全部成果在本地(bd43cba..P19),远端未动 |
 | 2 | ~~I20~~ **已终判(P20):int8 对本模型不可用** | 三种方案(per-token/per-channel/混合精度)机制全对、质量门连续 FAIL;除非厂商 fp8 落地(MUSA cast 静默 no-op 已入工单素材),否则放弃容量 2× 奖池 |
 | 3 | P16-A 默认翻转评估 | 8B 逐位 0 翻转+性能双 PASS;需 30B 链路确认后翻 `NANOVLLM_MIXED_UNIFIED` 默认 |
-| 4 | P18-C 优先级 × PD(D 侧优先级+P 侧前缀复用) | 优先级+LRU 已就绪,PD 控制面直接吃 |
+| 4 | ~~P18-C/P18-B~~ **已完成(P21)** | 前缀复用 5.7× / priority 全链路 / OpenAI 端点;PD 控制面修 2 bug(双 FIFO);剩余=PD 流式输出+多实例 |
 | 5 | P18-B PD OpenAI API 化 | `/v1/chat/completions` 端点形态已存在(含 priority 透传),套 PD 控制面 |
 | 6 | 用户亲自发厂商工单 | E-vendor-ticket.md + **fp8 cast 静默 no-op 新证据(P19)** |
 

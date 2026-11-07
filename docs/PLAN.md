@@ -50,6 +50,8 @@
 |---|---|---|---|
 | A | 混合精度 int8 KV(per-(layer,kv_head) bf16 outlier 维 ≤4 + 侧池 + split-sum kernel) | 同 P17-B 五门 | **机制逐位正确(unit 四张量 BITWISE; 引擎重算 0.0033; 修复 P19 遗留: paged 读误用 store scales)**;**质量门 FAIL(flip 0.5/sim 0.035/degenerate 2) — 三方案连续 FAIL → I20 终判: 本模型 K/V 动态范围对 int8 不可用**; 容量 2× 奖池放弃(除非厂商 fp8); 默认 bf16 不变; int8 代码保留 opt-in-experimental |
 | B | P16-A 默认翻转评估: 30B 单载证据(统一 vs legacy, 信息性门) | ratio ≤1.0 + CV≤5% + flips=0 | **EVIDENCE PASS(11-08)**: ratio **0.977**(−2.3%, 3 rep CV<0.1%) + **flips=0 逐位全等**;P16-A 证据链完整(0.6B 性能 0.749×/8B 0.850× 逐位 0 翻转/30B 0.977× 逐位 0 翻转;唯一瑕疵=0.6B 翻转 0.56%);冻结门①钉在 0.6B 不可翻,默认维持 opt-in,**门修订提案留给用户裁决**;脚本 scripts/p20_30b_flip.py |
+| C | P18-C: 优先级×PD(ctrl 透传 + D 侧准入背压 + P 侧前缀复用) | 复用门:重复 prompt prefill < 0.6×;压力门:全员完成+anchor | **PASS(11-08)**:**前缀复用 prefill 0.835→0.146s(5.7×)**;priority 全链路到 D 侧 Sequence(admission 日志实证);修复 PD 控制面两处 bug(bulk 帧先于准入的 popleft 崩溃 + 单 chunk 多帧失衡 → 双 FIFO 平衡队列);D 侧优先级差异化中性(如实记录;强证据在 P16-C);anchor 改统计口径(PD 网络抖动,I34 bitwise 锚不适用) |
+| D | P18-B: PD OpenAI 兼容端点 | 冒烟:health + chat completion 连贯 | **PASS(11-08)**:scripts/p21_pd_openai.py(FastAPI 非流式 + priority 透传 + pd_metrics prefill_s/ttft 暴露);活体冒烟 ✓ |
 
 ### 范围注记
 
