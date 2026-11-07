@@ -119,7 +119,7 @@
 
 ### I31 🟡 30B 进程首个 batch 与稳态逐位不同（一次性 warmup 态跃迁，P11 发现）
 
-30B TP2 生产栈 greedy decode,进程内第一个 batch 的 token 与之后所有 batch 不同(run1–4 两两逐位相同,跨 512-token chat prompts、b1/b8、64 decode;`tests/p11_30b_flip.py` 证据 `benchmarks/data/p11/p11_30b_flip_eager.json`)。**稳态 greedy 是逐位确定的**(MoE 原子加非确定性嫌疑排除)。含义:① 所有 token 一致性门必须**丢弃首 batch**(或先跑一个 warmup batch 再比对),否则把 warmup 态跃迁误判为数值漂移(本轮 p11_30b_ab 的 tokens_consistent=False 即此假象);② 机制未查(候选:首 batch 触发 JIT/autotune/allocator 布局一次性切换)。跨臂(eager vs segment)稳态逐位 0 翻转 = 分段图数值等价的最终证据。
+30B TP2 生产栈 greedy decode,进程内第一个 batch 的 token 与之后所有 batch 不同(run1–4 两两逐位相同,跨 512-token chat prompts、b1/b8、64 decode;`tests/archive/p11_30b_flip.py` 证据 `benchmarks/data/p11/p11_30b_flip_eager.json`)。**稳态 greedy 是逐位确定的**(MoE 原子加非确定性嫌疑排除)。含义:① 所有 token 一致性门必须**丢弃首 batch**(或先跑一个 warmup batch 再比对),否则把 warmup 态跃迁误判为数值漂移(本轮 p11_30b_ab 的 tokens_consistent=False 即此假象);② 机制未查(候选:首 batch 触发 JIT/autotune/allocator 布局一次性切换)。跨臂(eager vs segment)稳态逐位 0 翻转 = 分段图数值等价的最终证据。
 
 ### I34 🟡 引擎 token 依赖状态历史：处女引擎与跑过流量的引擎在同 prompt 上近平局分叉（P15 发现，泛化 I31）
 
@@ -133,7 +133,7 @@
 
 - **现象**:分段图离线 b1 **−23.7%**,在线四档 TPOT p95 反而**慢 5.9–14.7%**(A' 0.1968/0.2519/0.2372/0.2691 vs B 0.2108/0.2743/0.2707/0.2848);同 session 的 B2 复跑把 B' 复现到 0.1% 内,排除机时污染。
 - **机制**:捕获与 replay 按桶(`model_runner.py:709` → `[1,2,4,8,16,32,48,64]`),`cap = next(x for x in graph_bs if x >= bs)`(`:835`)**整桶执行**;在线矩阵实测 max_concurrency 14–30 落在桶之间,batch 14 按 16 跑、21–27 按 32 跑。被 pad 的行只把 `slot_mapping`/`block_tables` 指向 scratch 块(数值无害,I22),但 attention/MoE 的**计算是真的**。
-- **为什么门没抓到**:P11 的 30B 双轨门只测 `b1/b8/b32`(`tests/p11_30b_ab.py:61`),恰好全是桶边界,pad 比 = 1.0 → b9–b31 是结构性空白。
+- **为什么门没抓到**:P11 的 30B 双轨门只测 `b1/b8/b32`(`tests/archive/p11_30b_ab.py:61`),恰好全是桶边界,pad 比 = 1.0 → b9–b31 是结构性空白。
 - **与既有观测自洽**:b8 起进入设备饱和区(host launch 收益被 eager AR 与设备计算抵平),b32 已是 +3.8% 回退;在线并发正落在这条带上。
 - **处置**:段图维持默认关(仅单流可显式开)。若要在多并发下复活:① 12–32 间加密桶(步长 4,图数 768→~1200,先核图池显存);② `cap/bs > 1.15` 自动回退 eager;③ **离线门必须补 b12/b20/b24**。
 - **普适教训**:任何"按桶捕获"的路径,验收门里必须有**非桶边界**的 batch 点,否则 padding 税必然漏。
