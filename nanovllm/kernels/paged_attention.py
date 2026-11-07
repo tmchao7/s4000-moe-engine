@@ -11,6 +11,8 @@ on the MTT S4000 for head_dim=128 and context lengths up to this project's
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 try:
@@ -19,6 +21,39 @@ try:
 except ImportError:  # pragma: no cover - exercised only on non-accelerator hosts
     triton = None
     tl = None
+
+
+# Tuned on the 2026-11 S4000 image (torch 2.11 + triton 3.2.0, mtgpu) by
+# tests/p15_paged_autotune.py: per-batch winners, kernel-level geomean ~2.0x
+# over the historical (32, 4, 1) point that shipped untuned.  NOT the default:
+# the retile changes the online-softmax accumulation order and the 0.6B e2e
+# gate measured a 0.81% per-step top-1 flip rate on identical contexts
+# (tests/p15_paged_gate.py) — above the 0.5% frozen L2 bar — so the tuned
+# table ships as an opt-in until a contract change is accepted for it
+# (same class as the I4 sdpa<->paged divergence).  Dispatch keys on the
+# launch-time batch, constant across a captured graph bucket.
+DEFAULT_CONFIG = (32, 4, 1)
+_PAGED_TUNED: tuple[tuple[int, tuple[int, int, int]], ...] = (
+    (1, (128, 8, 1)),
+    (8, (128, 2, 2)),
+    (16, (64, 2, 1)),
+    (1 << 30, (32, 1, 1)),
+)
+
+
+def _resolve_config(batch: int) -> tuple[int, int, int]:
+    """(32,4,1) by default; NANOVLLM_PAGED_CONFIG=auto picks the tuned table,
+    BN,warps,stages pins one explicitly."""
+    env = os.environ.get("NANOVLLM_PAGED_CONFIG", "")
+    if env == "auto":
+        for threshold, cfg in _PAGED_TUNED:
+            if batch <= threshold:
+                return cfg
+        return _PAGED_TUNED[-1][1]
+    if env:
+        bn, warps, stages = (int(x) for x in env.split(","))
+        return bn, warps, stages
+    return DEFAULT_CONFIG
 
 
 if triton is not None:
@@ -112,6 +147,7 @@ def paged_decode_attention(
     # ``max_context_len`` is accepted for API compatibility only: the kernel
     # bounds its loop with the per-sequence runtime context length, so a single
     # compiled kernel (and a captured graph) serves every context size.
+    block_n, num_warps, num_stages = _resolve_config(batch)
     grid = (batch, num_heads)
     _paged_decode_kernel[grid](
         q, k_cache, v_cache, block_tables, context_lens, output,
@@ -125,8 +161,8 @@ def paged_decode_attention(
         NUM_KV_HEADS=num_kv_heads,
         HEAD_DIM=head_dim,
         PAGE_SIZE=page_size,
-        BLOCK_N=32,
-        num_warps=4,
-        num_stages=1,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return output

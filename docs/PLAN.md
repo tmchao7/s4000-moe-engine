@@ -9,7 +9,17 @@
 
 **已判决(负结果也是结论)**:投机解码 NO-GO(α≈0 且 c=0.39);**I19 判决(P11):b1 固定等待主体 = 逐算子 host launch 开销,分段 replay 可回收 36.2 ms/步**(单算子融合被否定、replay 有效——两条自洽);整图 graph 否决(I29:TP2 引擎级间歇性 MCCL replay 楔死,barrier 无效),**分段图(图内零 MCCL)离线验证成立但在线否决(P12)+ 修复验证后仍转正失败(P13:padding 税已除,残余 AR 串行化 +1.0~4.7%)→ 服务化分支关闭,定格单流开关**;**I30 关闭(P13 ABA:现树快于 pre-P8 栈 23–51%,P9 回归主张被否定)**;**I8 长上下文闭合(P13:冷缓存塌=chunk 粒度,chunk-1024 解;准入=稳定性)**;**split=0 与 chunk-2048 默认化均否决(P10 实测)**;profiled placement 不采用;fused RMSNorm / bmm 容量收缩不采用;host-sync 移除与 mixed-split 已采纳默认开;30B 首 batch 为一次性 warmup 态(I31,token 门必丢首 batch)。
 
-## 1. P12 迭代内容(按优先级;门与判定树见 `benchmarks/P11-serving.md` 与本节)
+## 1. P15 迭代内容(2026-11-07 立项,合成一条线:快赢 → I29 复测 → PD 1P1D;新实例 s4000,栈=torch 2.11.0.post1+triton 3.2.0+transformers 5.13,四套单测+30B 冒烟已全绿)
+
+| # | 项 | 门/判定(预注册,不可改) | 状态 |
+|---|---|---|---|
+| A | **E1 paged kernel autotune** | ① 数值:非 bitwise → L2 翻转门(<0.5%)+首 token 100% ② 性能 ≥5% CV≤5% ③ 四套单测 | **判决 FAIL(11-07)**:内核 1.59–2.90×(b1→b32 geomean ~2×)但无全局 bitwise 配置,0.6B LCP 口径翻转率 0.81%>0.5% 门 → **默认保持 (32,4,1),tuned 表降级 `NANOVLLM_PAGED_CONFIG=auto` opt-in**;报告 benchmarks/P15-pd-autotune.md §A |
+| B | **I29 新栈复测** | 引擎级 0.6B TP2 paged replay ×3 判定 | **纯张量梯子 7/8 全绿零楔死**(96AR/128k/bmm/2400ops/六桶全过;1 案例 probe 自身 compile bug);⚠️ 旧栈纯张量同样全绿 → 不构成解除,**引擎级探针待跑**(网关断连排队) |
+| C | **PD 1P1D 主线** | Step 0 ITL 2× 门 / M1 bitwise / M2 PD tokens==collocated bitwise + 阶段计时 | **Step 0 GO(11-07,零 GPU)**:ITL p99/p50=2.3–6.3× 全场景 ≥2×(高负载 6.32×、1k 长上下文 5.69×最重)→ 继续;**M1**:单序列 extract→pinned→import bitwise 全等 ✓ + arm2 同块恢复 ✓,arm3(换块×多序列×cache-hit)调试中;**M2 代码就绪**(scripts/p15_pd_1p1d.py + TcpKVChannel)待网关恢复跑 |
+| D | (并行,零 GPU)用户亲自发送 `docs/E-vendor-ticket.md`;E2(vllm_fused 调优配置,非生产路径)降级 backlog | — | 待用户 |
+| E | backlog(过 A–C 后再排):KV cache 淘汰(LRU)、优先级/SLO 分级调度、I20 KV int8(须融 kernel) | — | 未排 |
+
+## 1b. P13 收官存档(2026-10-30 全部判决,报告 benchmarks/P13-*.md)
 
 > P13 夜间轮执行状态(10-29 23:28 → 10-30 11:45,五项全收官,报告 `benchmarks/P13-*.md`):**① I30 关闭**(ABA 三加载:现树快于 pre-P8 旧栈 23–51%,P9 回归主张否定,旧树已删);**② I33 修复验证+分支关闭**(密桶 1056 图零失败 + pad 回退;padding 税证实并消除:0.9 档 +14.7%→+2.3%;残余 AR 串行化 +4.7% 超 F2 门 → 段图定格单流开关,默认不变);**③ I8/I26 闭合**(冷缓存塌=chunk 粒度,chunk-1024 砍冷 TTFT −56~57%;零 429 零崩;⚠️ 跨 repeat 确定性 prompt→暖缓存口径伪象);**④ 容量下界 1.070 req/s**(1.6× 档双口径 100%,拐点未探到);**⑤ 厂商工单包成文**(docs/E-vendor-ticket.md)。默认值全部未动;`_SEG_BUCKETS`/`_SEG_PAD_RATIO` 以默认惰性保留。
 
