@@ -1,3 +1,4 @@
+import gc
 import os
 import pickle
 import time
@@ -168,6 +169,17 @@ class ModelRunner:
                 if hasattr(self, attr):
                     delattr(self, attr)
         self.acc.synchronize()
+        # Drop the device tensors we own and release the caching allocator's
+        # reserved segments.  k_cache/v_cache are views into self.kv_cache held
+        # by model modules, so deleting self.model releases both.  Without this,
+        # back-to-back LLM builds in one process (p2/p6 run six configs
+        # sequentially) see each other's device-level "used" in the KV budget
+        # heuristic and the second build asserts "no KV cache memory".
+        for attr in ("model", "kv_cache"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        gc.collect()
+        self.acc.empty_cache()
         dist.destroy_process_group()
 
     def loop(self):

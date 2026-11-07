@@ -19,6 +19,12 @@
 
 ## 2. GPU 软件栈可用性（实测）
 
+> 2026-11-07 换新 seetacloud 实例（ssh 别名 `s4000`，AutoDL 容器，Ubuntu 22.04，driver 5.2.0-server）后全套重测通过：torch 2.11.0.post1 + torch_musa 2.11.0.post1 + triton 3.2.0（mtgpu）+ transformers 5.13.0。四套单测全过 + 30B TP2 生产栈加载/生成冒烟通过。旧实例的"未测组件"结论以新栈为准重验。
+>
+> **torch_musa 2.11 分配器行为差异**：`llm.exit()` 后 caching allocator 仍攥着 reserved 段（21 GB 级）不还给驱动，同进程连续构建第二个 LLM 时 `allocate_kv_cache` 的设备级 used 核算会误判 → 已在 `ModelRunner.exit()` 修复（drop model/kv_cache + `gc.collect()` + `empty_cache()`，见 model_runner.py）。p2/p6 六配置连跑依赖此修复。
+>
+> **模型下载实测速率**：modelscope CDN 单流仅 3–10 MB/s；hf-mirror + `aria2c -x16 -s16 -k4M` 达 ~22 MiB/s，31 GB 约 22 min。hf-mirror 对突发小文件会间歇性 403/超时（aria2 rc=22/rc=29），脚本幂等重跑 + curl 兜底即可。
+
 | 组件 | 状态 | 备注 |
 |---|---|---|
 | torch_musa bf16（matmul/SDPA） | ✅ | SDPA 数值/shape 正常 |
