@@ -134,9 +134,16 @@ class TcpKVChannel:
         torch.musa.synchronize()
         k_bytes = _tensor_to_bytes(self.buf.k[:n])
         v_bytes = _tensor_to_bytes(self.buf.v[:n])
-        self.sock.sendall(self.MAGIC_HEADER.pack(n, len(k_bytes), len(v_bytes)))
-        self.sock.sendall(k_bytes)
-        self.sock.sendall(v_bytes)
+        # the peer reads non-blocking (assembler) but sendall needs blocking:
+        # a 29-36 MB payload always overflows the socket buffer otherwise
+        was_blocking = self.sock.getblocking()
+        self.sock.setblocking(True)
+        try:
+            self.sock.sendall(self.MAGIC_HEADER.pack(n, len(k_bytes), len(v_bytes)))
+            self.sock.sendall(k_bytes)
+            self.sock.sendall(v_bytes)
+        finally:
+            self.sock.setblocking(was_blocking)
         self.bytes_moved += len(k_bytes) + len(v_bytes)
 
     def recv_blocks(self, block_table: list[int]) -> None:
@@ -162,3 +169,43 @@ class TcpKVChannel:
             chunks.append(chunk)
             n -= len(chunk)
         return b"".join(chunks)
+
+
+class KVFrameAssembler:
+    """Incremental reassembly of TcpKVChannel frames from a non-blocking socket.
+
+    Feed raw socket chunks to ``feed``; complete frames surface as
+    ``(n_blocks, k_bytes, v_bytes)`` tuples.  Lets the decode side interleave
+    KV reception with engine steps instead of blocking on one bulk transfer.
+    """
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._need = TcpKVChannel.MAGIC_HEADER.size
+        self._header = None
+
+    def feed(self, chunk: bytes):
+        self._buf += chunk
+        frames = []
+        while True:
+            if len(self._buf) < self._need:
+                break
+            if self._header is None:
+                self._header = TcpKVChannel.MAGIC_HEADER.unpack(
+                    self._buf[:self._need])
+                n, k_len, v_len = self._header
+                self._need = n * 0 + k_len + v_len
+                del self._buf[:TcpKVChannel.MAGIC_HEADER.size]
+                if self._need == 0:  # zero-size frame (defensive)
+                    frames.append(self._header)
+                    self._header = None
+                    self._need = TcpKVChannel.MAGIC_HEADER.size
+                continue
+            k_len, v_len = self._header[1], self._header[2]
+            k_bytes = bytes(self._buf[:k_len])
+            v_bytes = bytes(self._buf[k_len:k_len + v_len])
+            del self._buf[:k_len + v_len]
+            frames.append((self._header[0], k_bytes, v_bytes))
+            self._header = None
+            self._need = TcpKVChannel.MAGIC_HEADER.size
+        return frames
