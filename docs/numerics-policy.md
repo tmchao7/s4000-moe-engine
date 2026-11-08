@@ -55,7 +55,7 @@ IEEE-754 浮点加法不满足结合律，`(a+b)+c ≠ a+(b+c)`，所以两者�
 | token 平均一致率 | 0.509 | 与"翻转后整段不同"自洽（≈65/128） |
 | 12 组人工判读 | **12/12 语义等价，0 退化** | 差异全是措辞/框架选择（例："降低显存/提高速度/降低功耗" vs "计算量/内存/延迟"） |
 
-**结论**：一旦在某个近平局翻转，后续文本必然整体不同——**编辑距离度量的是"措辞"，不是"质量"**。业界（DeepInfer）明确建议用"真实 prompt 人工/任务级一致性评估"而非 token 距离。因此 L3 定为：首 token + 退化检查 + **人工判读样本**（本次 12 组，见 `benchmarks/P6-L3-review.md`）+ LCP 只报告。
+**结论**：一旦在某个近平局翻转，后续文本必然整体不同——**编辑距离度量的是"措辞"，不是"质量"**。业界（DeepInfer）明确建议用"真实 prompt 人工/任务级一致性评估"而非 token 距离。因此 L3 定为：首 token + 退化检查 + **人工判读样本**（本次 12 组，见 `benchmarks/archive/P6-L3-review.md`）+ LCP 只报告。
 
 **L3 的已知缺口（诚实记录）**：计划中的"交叉困惑度"需要**多位置 logits**，而引擎目前只回 last-token logits（`embed_head.py:58-60`，与 S2 同一处改动）。交叉 PPL 作为后续项，落地后补测——那时可以把 L3 的人工判读从样本扩大成全量自动打分。
 
@@ -78,4 +78,4 @@ IEEE-754 浮点加法不满足结合律，`(a+b)+c ≠ a+(b+c)`，所以两者�
 
 - 决策 JSON：`benchmarks/p6-attention-equivalence-decision.json`
 - 数据：`benchmarks/data/p6b/p6_attention_equivalence.json`
-- 旧决策（历史）：`benchmarks/p6-attention-ab-decision.json`（`keep_sdpa`，基于 token 一致率门）
+- 旧决策（历史）：`benchmarks/data/p6b/p6-attention-ab-decision.json`（`keep_sdpa`，基于 token 一致率门）

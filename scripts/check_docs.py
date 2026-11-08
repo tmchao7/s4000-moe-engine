@@ -11,8 +11,10 @@ mechanically get wrong:
   2. dead relative links            — every `(xxx.md...)` / `(assets/...)`
      target in a tracked markdown file must exist on disk.
   3. image targets                  — every README image path must exist.
-  4. command paths                  — code spans inside README/benchmark
-     fenced blocks that name repo scripts/tests must point at real files.
+  4. command paths                  — code spans (fenced blocks AND inline
+     backtick spans) that name repo scripts/tests must point at real files —
+     the TEST-MATRIX mapping table and cross-doc references live in inline
+     code, and renames/archivals previously drifted past the fence-only check.
 
 Exit 0 = clean, 1 = problems listed.  Pure CPU, stdlib only.
 Run:  python3 scripts/check_docs.py
@@ -69,6 +71,18 @@ def main() -> int:
                 target = REPO / m.group(1)
                 if not target.exists():
                     problems.append(f"{rel}: command names missing file {m.group(1)}")
+
+        # inline code spans: same existence rule for tests/scripts paths.
+        # Covers the TEST-MATRIX mapping table and prose cross-references,
+        # which sit in backticks rather than fences (P26 audit gap).
+        seen = set()
+        for m in COMMAND.finditer(text):
+            target = m.group(1)
+            if target in seen:
+                continue
+            seen.add(target)
+            if not (REPO / target).exists():
+                problems.append(f"{rel}: inline-code path missing file {target}")
 
         # 2/3. links and images (relative targets resolve against the FILE's
         # directory — markdown semantics, not the repo root).  Scan with

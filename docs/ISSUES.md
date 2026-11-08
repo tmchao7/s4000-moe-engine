@@ -23,7 +23,7 @@
 | E 生态厂商 | 0 | 6 | E1、E2(可手搓)、E3–E6(厂商侧) |
 
 已关闭 24 项(I 23 + S1):I4、I5、I6、I7、I8、I9、I10、I11、I13、I15、I21、I22、I23、I24(部分修)、I25、I26、**I29、I30、I33**、**I35、I36、I37、I38**、S1。
-> 编号：I16–I18 已迁入 E 系列（E2/E5/E6），不再单独计数，故 I 系列实际 30 项（I1–I15、I19–I33）。
+> 编号：I16–I18 已迁入 E 系列（E2/E5/E6），不再单独计数，故 I 系列实际 35 项（I1–I15、I19–I38）。
 > I8 已用有效跑闭合（1.0–1.15k token、384/384、rank1 存活）；三档 SLO 0% 是真实容量结论（瓶颈在 TTFT），P13 补齐机理与解法（见 I8 条目 P13 终局）。
 
 状态图例：🔴 阻塞主路径／决定立项　🟡 收益被冻结或覆盖缺口　🟢 工程债/低优　⚪ 厂商 runtime，我们不可修
@@ -66,7 +66,7 @@
 
 - **L3 的关键发现（推翻了初版门）**：初版用字符级编辑距离 p95 ≤8% → 实测 **p95 65%、仅 20/100 条请求完全一致**，看似"质量崩了"。但 **LCP 中位 42.5 / 均值 60.7（共 128）** + 首 token 100% 一致 → 现象是"先一致 1/3~1/2，遇一次近平局翻转后整段走不同分支"。12 组人工判读全部语义等价（例："降低显存/提高速度/降低功耗" vs "计算量/内存/延迟"）。**编辑距离度量的是措辞，不是质量**，故 L3 改为"首 token + 退化 + 人工判读"。
 - **当前决策**：`benchmarks/p6-attention-equivalence-decision.json` = **`adopt_triton_paged`**，L5 已过；`nanovllm/config.py:33` 与 `api_server.py` 默认值已改为 `triton_paged`，sdpa 保留为显式 opt-in 与历史参考后端。
-- **证据**：`benchmarks/P6-serving-v4.md`、`benchmarks/data/p6b/p6_attention_equivalence.json`、`p6_L3_review.json`、`p6_attention_logits_i4.json`、`benchmarks/P6-L3-review.md`
+- **证据**：`benchmarks/archive/P6-serving-v4.md`、`benchmarks/data/p6b/p6_attention_equivalence.json`、`p6_L3_review.json`、`p6_attention_logits_i4.json`、`benchmarks/archive/P6-L3-review.md`
 ### I8 ✅ 已闭合（10-27 19:42，重设计后有效跑）：长上下文可服务，但容量在 0.435 QPS 就崩
 - **有效跑**：`prompt_mode=unique`、`--prompt-tokens 1024`（tokenizer 校准 68 词 → 1,018 token；逐请求实际 1,018–1,154）、`--max-model-len 4096`、三档 0.5/0.75/1.0、128 请求/档、64 token 输出；栈 = 新默认（paged + bmm_dense + stall_free）。
 - **有效性**：384/384 成功且 `[DONE]`；5 s watchdog 全程 rank1 存活（只有 spawn 前第一条为空）；长度门按字面未过（二/三档 p50 1,154，超 ±6% 到 +12.7%），但落在 0.99–1.13× 目标区间，按"长度区间有效"使用并在报告中注明。
@@ -74,7 +74,7 @@
 - **失败定位**：**TTFT，不是 decode**。50% 档满足 TTFT≤2 s 的请求 0/128，满足 TPOT≤0.5 s 的 83/128；空闲时同长度单请求 TTFT **0.368 s**、TPOT **0.144 s**。→ 单请求能力正常，崩在"1k prefill 与 decode 混跑 + 无准入控制"的排队。
 - **与上轮无效跑的区别**：上轮 18,354 token、8/128 完成、rank1 死亡；本轮 1.0–1.15k token、384/384、rank1 存活。**这次的 0% SLO 是真实容量结论，不是故障。**
 - **下一步**：I26 准入/背压 → I23 mixed step 后端 → prefill chunk 曲线 → 重定长上下文目标 QPS（0.87 是 137-token 口径）。
-- **证据**：`benchmarks/P6-i8-long-context.md`、`benchmarks/data/p6d/p6_i8_long_unique_v2.json`（sha256 `1249e49bcb3de838500bf0e0e9007310597ee27957deddb0c54017cfacaa297e`）、`i8_watch.log`（`dd3b0c1e…`）
+- **证据**：`benchmarks/archive/P6-i8-long-context.md`、`benchmarks/data/p6d/p6_i8_long_unique_v2.json`（sha256 `1249e49bcb3de838500bf0e0e9007310597ee27957deddb0c54017cfacaa297e`）、`i8_watch.log`（`dd3b0c1e…`）
 - **P13 终局（10-30，机理+解法闭合）**：I26 准入在 1k 负载端到端验证（1536+ 请求零 429、零崩、无雪崩）；**冷缓存 1k 塌方的机理 = chunk 粒度**——chunk-256 冷 TTFT p50 3.30/4.14/5.07 s 全档塌，chunk-1024 砍到 1.449/1.784/2.201 s（−56~57%），0.5 档冷态即过 ≤2 s 门（90.6% SLO）。**⚠️ 口径发现**：跨 repeat 的 unique prompt 确定性重建 → rep2/3 全命中前缀缓存，"三 repeat 中位"实测的是暖缓存路径（rep2/3 两臂均 100%）；冷容量必须看 rep1 或改 seed-per-repeat。**P14 已根治客户端侧**：`benchmark_online.py --prompt-seed-per-repeat`（默认关=行为不变；开启后 repeat 1 沿用 `--seed`，repeat k 用 `seed+(k-1)*1000003`，各 repeat prompt 串与首词全不相同；实际 seed 写入结果 JSON 的 `prompt_seeds_used`），单测 `test_prompt_seed_per_repeat_changes_unique_prompts`。**P14 实测**：开 seed-per-repeat 的 1k 冷态跑三 repeat 前缀命中增量均为 0（真冷）；chunk-2048 冷态 1.0 档 TTFT p50 1.08–1.12 s **过 ≤2 s 门**（chunk-1024 为 2.2 s），代价是最大 ITL p95 ~1.2–1.5 s、slo_strict 仅 18–24%（见 `benchmarks/archive/P14-serving.md`）。推荐配置：1k 场景 chunk=1024（冷）/前缀缓存（暖）/准入（稳定）三件套；chunk-256 短 prompt 默认不动（P10 门仍有效）。证据：`benchmarks/archive/P13-longctx.md`。
 
 ### I12 🟢 崩溃进程 teardown 卡死（P14：引擎侧兜底已落地）
@@ -97,7 +97,7 @@
 - **逐层计时已完成（10-27，两次重复）**：0.6B TP1 eager b1 → **launch/CPU-bound，不是单 kernel 慢**。步时 53.7–61.2 ms，kernel 设备时间 29.3–32.4 ms → `device_busy = 0.478–0.603`（门 <0.70）；每步 **2,401 次 launch**（35 种 kernel，平均 **13.5 µs**/launch）；每层 host 发射 1.84–2.13 ms × 28 ≈ 整步步时 → **CPU 发射是关键路径，GPU 空转约 40%**。
 - **成本构成**：top-15 kernel 占设备时间 74%，几乎全是 RMSNorm/RoPE/mask 的逐元素小 kernel（Cast fp32↔bf16、Mul/Add/Rsqrt/Pow/Select/Concat）；真正的 flash attention 只有 28 次 / 2.3 ms，GEMV/GEMM 合计 ~3.4 ms。**算力不是瓶颈，是"小 kernel 洪水"。**
 - **下一步（按 ROI）**：① **纯 eager 的 norm/rope 融合**（消掉每层几十次 launch，不依赖图，可逐项 A/B）——新发现的可执行方向；② 图路径（I1/I2）仍是 63.2→40.0 ms 的现成 23 ms，但被 replay 漂移卡住；③ 30B TP2 抽查一次，确认 launch-bound 在 MCCL 下仍成立。
-- **证据**：`benchmarks/P6-layer-timing.md`、`benchmarks/data/p6d/p6_layer_timing_06.json`（sha256 `ec7e02078d8bb9695737f91c5bb7f9fa8739a4259ff7119f740806db9377eef3`）、`/root/p7_step_overhead_06.json`、`benchmarks/P7-phase0.md` §2
+- **证据**：`benchmarks/archive/P6-layer-timing.md`、`benchmarks/data/p6d/p6_layer_timing_06.json`（sha256 `ec7e02078d8bb9695737f91c5bb7f9fa8739a4259ff7119f740806db9377eef3`）、`/root/p7_step_overhead_06.json`、`benchmarks/archive/P7-phase0.md` §2
 
 ### P8 规划新增(2026-10-28 执行轮更新;结论标注在每条)
 
@@ -116,7 +116,7 @@
 - **I26 KV admission/backpressure(✅ 本轮修复,端到端待 L3)**:`add_request` 校验 `prompt+max_tokens > max_model_len → 400`、`> KV 容量 → 429 + requests_rejected 计数`;scheduler 容量不足返空批次(mode="empty")不 assert;HOL `can_allocate==-1` 改跳过候选继续尝试 + `kv_admission_skips_total` 计数(FIFO 序保持);单测 6/6(`tests/p8_scheduler_gaps.py`)。
 - **I27 sdpa-decode 图的烘焙形状数值限制(🆕 本轮定位)**:capture 时 context_lens=256 固化 kv 窗口形状,SDPA 归约切分随 shape 变 → 1-ulp 级漂移与近平局翻转(tiny MoE graph 5/5 自洽但不等于 eager);paged kernel 循环边界在 device 上,不受影响 → 生产路径(paged)graph==eager bitwise。sdpa 模型要用图需按运行时窗口分桶捕获。
 - **I28 torch.musa 跨块步长视图 D2H 拷贝返回不一致数据(🆕 平台 bug 嫌疑)**:`kv_cache[:, :, blk, 0]`([2,L,kh,d] strided view)的 `.cpu()` 返回 NaN 垃圾,同位置 K/V 分读与 device 侧逐层扫描干净,`.contiguous()` 后仍复现;workaround = contiguous 化或分 K/V 读;影响所有"整读跨块切片"的诊断代码。
-- **I29 TP2 引擎级图 replay 楔死(P9 定性收口,10-28;P14 追加线索见末尾)**:**间歇性 rendezvous 楔死,非结构确定性**。P9 分级探针(`tests/archive/p9_mccl_graph_probe.py` + `p8_graph_padfix --tp 2`)实测:① 纯张量图(96 图内 AR、b32 payload、48×bmm+AR、~2400 节点、**六桶共享 pool 完整复刻引擎 capture/replay 协议**)TP2 全绿零楔死;② TP1 引擎级从未楔死(P8 0.6B/8B 5/5);③ **0.6B TP2 paged 首次 replay 即楔死(3/3 复现,最小复现,2 min 加载)**;④ 0.6B TP2 sdpa 撞过 2 次 generate 后楔死 → paged 提高首中概率但非必要;⑤ **replay 前后 barrier(`NANOVLLM_GRAPH_REPLAY_BARRIER=1`,默认关)不是解**。必要成分 = 引擎 replay 路径(graph_vars 每步 fill/scratch 填充/replay 后贴 eager compute_logits/采样节奏)× TP2 collectives。崩溃形态多变(对称自旋/单 rank 死+另一 rank 旋),均需按 PID kill(I12)。**30B 图双轨门维持结构性阻断,默认 eager 不变**。复活条件:分段图(attention eager + linear/MoE 进图)或厂商 MUSAGraph+MCCL 修复后用本探针回归。证据:`benchmarks/archive/P9-graph.md`、`benchmarks/data/p9/p9_mccl_graph_probe*.json`、`p9_06b_padfix.log`。**P10 进展(分段图原型,`NANOVLLM_SEGMENT_GRAPH=1`,默认关)**:每层两段(AR 全部移出图)的 segment graph 在 TP2 **捕获可行**(tiny 16 图双 rank)且 **replay 首次稳定跑通**(3×3×8 token 零楔死、自洽、token 与整图一致;`tests/p10_segment_smoke.py`)——但全程 LAUNCH_BLOCKING 下;异步捕获仍撞 I3 族偶发与一次 wedge,padfix 双引擎上下文捕获 illegal memory access 未解;0.6B paged GB 门未跑。见 `benchmarks/archive/P10-graph.md`。**P11 进展(两进程口径 + S2/S4 双过,分段路线转已验证)**:padfix 加 `--phase eager|graph` 两进程口径绕开双引擎上下文后,**0.6B TP2 paged S2 主判决 PASS**(224 图/rank 零失败、GB 5/5 bitwise、GC、GA、零楔死,LB 下)+ **异步门 PASS**(无 LB 捕获首攻成功 + GB 5/5 bitwise——分段图在生产模式数值正确且稳定)。P10 的异步偶发与双引擎 illegal access 本轮 3/3 全部未复现(含 SEG_DEBUG 打点版)——illegal access 降级为偶发未复现、打点开关保留。**P11 P4 收口(全梯子验证完成)**:8B 门 PASS(288 图零失败、GB 5/5 bitwise、异步零楔死)+ **30B 双轨门五项全 PASS**(768 图/rank 零失败、跨臂逐位 0 翻转 b1/b8/b32、显存 +0.00 GiB、b1 decode **−23.7%**(152.85→116.63 ms)超 ≥+15% 转正门;b8 持平、b32 +3.8% 真实回退)。**I19 固定等待判决:b1 的 ~36 ms/步确为逐算子 host launch 开销,replay 可回收**。**P12 终局:L3 在线 A/B 判定 FAIL**——四档 TPOT p95 比 eager 慢 5.9–14.7%(门②③均不过),B2 同 session 复跑把 B' 复现到 0.1% 内;归因见 I33。**分段图不转正,默认 eager 不变,仅单流场景可显式开**。见 `benchmarks/archive/P11-graph.md`、`benchmarks/archive/P12-serving.md` §P0 判定。**P14 追加（联网线索 + 实测）**：摩尔线程 [MCCL×MUSA Graph 文档](https://docs.mthreads.com/musa-sdk/version-5.2.0/libraries/mccl/mccl_user_guide_2.4/usage/musagraph.zh-CN/) 明言「被捕获与未捕获的 MCCL 操作混用时，多通信器从同一线程 `musaGraphLaunch` 已观察到死锁」，开关 `MCCL_GRAPH_MIXING_SUPPORT`（默认 0）。我们的引擎正是「图内 AR + replay 后 eager AR」混用，仓库此前从未设过任何 `MCCL_*`。0.6B TP2 paged 整图最小复现，交错 ×(3+5) 实测：base **0/8**、`=0` **0/3**、`=1` **3/9** 完整通过（GA/GB/GC 全 PASS、与 eager 逐位一致，单 run 36 s），Fisher 单侧 p≈0.07。**判定：缓解非修复**——混用是成分之一但不是唯一楔死源；30B 整图红线不放开、默认不改。详见 `benchmarks/archive/P14-mccl-mixing.md`。未排除：8B TP2 复测、`MCCL_GRAPH_HELPER_DISABLE`。
+- **I29 TP2 引擎级图 replay 楔死(P9 定性收口,10-28;P14 追加线索见末尾)**:**间歇性 rendezvous 楔死,非结构确定性**。P9 分级探针(`tests/archive/p9_mccl_graph_probe.py` + `p8_graph_padfix --tp 2`)实测:① 纯张量图(96 图内 AR、b32 payload、48×bmm+AR、~2400 节点、**六桶共享 pool 完整复刻引擎 capture/replay 协议**)TP2 全绿零楔死;② TP1 引擎级从未楔死(P8 0.6B/8B 5/5);③ **0.6B TP2 paged 首次 replay 即楔死(3/3 复现,最小复现,2 min 加载)**;④ 0.6B TP2 sdpa 撞过 2 次 generate 后楔死 → paged 提高首中概率但非必要;⑤ **replay 前后 barrier(`NANOVLLM_GRAPH_REPLAY_BARRIER=1`,默认关)不是解**。必要成分 = 引擎 replay 路径(graph_vars 每步 fill/scratch 填充/replay 后贴 eager compute_logits/采样节奏)× TP2 collectives。崩溃形态多变(对称自旋/单 rank 死+另一 rank 旋),均需按 PID kill(I12)。**30B 图双轨门维持结构性阻断,默认 eager 不变**。复活条件:分段图(attention eager + linear/MoE 进图)或厂商 MUSAGraph+MCCL 修复后用本探针回归。证据:`benchmarks/archive/P9-graph.md`、`benchmarks/data/p9/p9_mccl_graph_probe*.json`、`p9_06b_padfix.log`。**P10 进展(分段图原型,`NANOVLLM_SEGMENT_GRAPH=1`,默认关)**:每层两段(AR 全部移出图)的 segment graph 在 TP2 **捕获可行**(tiny 16 图双 rank)且 **replay 首次稳定跑通**(3×3×8 token 零楔死、自洽、token 与整图一致;`tests/archive/p10_segment_smoke.py`)——但全程 LAUNCH_BLOCKING 下;异步捕获仍撞 I3 族偶发与一次 wedge,padfix 双引擎上下文捕获 illegal memory access 未解;0.6B paged GB 门未跑。见 `benchmarks/archive/P10-graph.md`。**P11 进展(两进程口径 + S2/S4 双过,分段路线转已验证)**:padfix 加 `--phase eager|graph` 两进程口径绕开双引擎上下文后,**0.6B TP2 paged S2 主判决 PASS**(224 图/rank 零失败、GB 5/5 bitwise、GC、GA、零楔死,LB 下)+ **异步门 PASS**(无 LB 捕获首攻成功 + GB 5/5 bitwise——分段图在生产模式数值正确且稳定)。P10 的异步偶发与双引擎 illegal access 本轮 3/3 全部未复现(含 SEG_DEBUG 打点版)——illegal access 降级为偶发未复现、打点开关保留。**P11 P4 收口(全梯子验证完成)**:8B 门 PASS(288 图零失败、GB 5/5 bitwise、异步零楔死)+ **30B 双轨门五项全 PASS**(768 图/rank 零失败、跨臂逐位 0 翻转 b1/b8/b32、显存 +0.00 GiB、b1 decode **−23.7%**(152.85→116.63 ms)超 ≥+15% 转正门;b8 持平、b32 +3.8% 真实回退)。**I19 固定等待判决:b1 的 ~36 ms/步确为逐算子 host launch 开销,replay 可回收**。**P12 终局:L3 在线 A/B 判定 FAIL**——四档 TPOT p95 比 eager 慢 5.9–14.7%(门②③均不过),B2 同 session 复跑把 B' 复现到 0.1% 内;归因见 I33。**分段图不转正,默认 eager 不变,仅单流场景可显式开**。见 `benchmarks/archive/P11-graph.md`、`benchmarks/archive/P12-serving.md` §P0 判定。**P14 追加（联网线索 + 实测）**：摩尔线程 [MCCL×MUSA Graph 文档](https://docs.mthreads.com/musa-sdk/version-5.2.0/libraries/mccl/mccl_user_guide_2.4/usage/musagraph.zh-CN/) 明言「被捕获与未捕获的 MCCL 操作混用时，多通信器从同一线程 `musaGraphLaunch` 已观察到死锁」，开关 `MCCL_GRAPH_MIXING_SUPPORT`（默认 0）。我们的引擎正是「图内 AR + replay 后 eager AR」混用，仓库此前从未设过任何 `MCCL_*`。0.6B TP2 paged 整图最小复现，交错 ×(3+5) 实测：base **0/8**、`=0` **0/3**、`=1` **3/9** 完整通过（GA/GB/GC 全 PASS、与 eager 逐位一致，单 run 36 s），Fisher 单侧 p≈0.07。**判定：缓解非修复**——混用是成分之一但不是唯一楔死源；30B 整图红线不放开、默认不改。详见 `benchmarks/archive/P14-mccl-mixing.md`。未排除：8B TP2 复测、`MCCL_GRAPH_HELPER_DISABLE`。
 ### I30 ✅ 已关闭（P13 ABA 定案，10-30）：「现行栈回归」主张被否定，方向反转
 
 **终局（同 session ABA：旧树 d5779b6 → 现树 → 旧树，三加载）**：现树两档 TPOT p95（0.9:0.2612、1.0:0.2894）**全部 12 个 repeat 配对快于旧树 23–51%**（旧树 1.0 档 0.580/0.588，slo_standard 仅 ~75%；现树 6/6 全 100% 双口径）。判定脚本标 INVALID 仅因旧臂自身 CV 8.5–12.1%（旧栈慢且噪），关闭条件「当前两档均≤两旧臂」逐字满足且余量压倒。**P9 的 0.387–0.397 与 v4 单跑 0.327 归入机时状态/单跑口径伪象**（与 P12 臂 A′ 0.2691 互证）。v4 门 TPOT p95 ≤0.343 保持为生产回归门（现树 0.26–0.29 达标）。证据：`benchmarks/archive/P13-i30.md`、`benchmarks/data/p13/aba_*.json`。历史记录：P9 发现 0.87 档 0.387–0.397 超 v4 门 0.343 → P10 排除 mixed-split 税 → P11 复核中止 → P13 ABA 定案关闭。
@@ -185,7 +185,7 @@
 
 ### E1 🟢（已解闸，低优先）手搓 paged decode kernel 的 autotune
 - **可做性**：✅ 单点注入。`nanovllm/kernels/paged_attention.py:128-130` 写死 `BLOCK_N=32, num_warps=4, num_stages=1`；全仓库无 `@triton.autotune`。
-- **方案**：扫 `BLOCK_N∈{16,32,64,128} × warps∈{2,4,8} × stages∈{1..4}`（≤64 组）× 桶 `(batch∈{1,4,16,32,64}, kv∈{≤1k,≤4k,>4k})`；计时复用 `scripts/p6_moe_microbench.py` 的 `time_call` + 子进程隔离；产出 `configs/paged_decode_MTT_S4000.json` + sha256 绑定 kernel 源。预算：一发 30B 加载 30–60 min。
+- **方案**：扫 `BLOCK_N∈{16,32,64,128} × warps∈{2,4,8} × stages∈{1..4}`（≤64 组）× 桶 `(batch∈{1,4,16,32,64}, kv∈{≤1k,≤4k,>4k})`；计时复用 `scripts/archive/p6_moe_microbench.py` 的 `time_call` + 子进程隔离；产出 `configs/paged_decode_MTT_S4000.json` + sha256 绑定 kernel 源。预算：一发 30B 加载 30–60 min。
 - **硬约束**：`context_len` 必须保持 runtime 循环边界（不然破坏 kernel 复用）；**autotune 只改性能，不改变 SDPA↔paged 的 bf16 数值路径差异（I4）**——不要指望 autotune 解决 I4。
 - **触发条件**：**已满足**——I4 已于 10-27 转正（L1–L5 全过，paged 成为默认）。现在可做，但与 I19 的 norm/rope 融合相比 ROI 更低，排在 P8 计划之后。
 
@@ -215,11 +215,11 @@
 
 ---
 
-## 4. 已关闭（8 项）
+## 4. 已关闭明细（早期 8 项，P6 时代遗留；均计入 §0 的「已关闭 24 项」，此处存档结论与证据）
 
 | ID | 结论 | 证据 / commit |
 |---|---|---|
-| I5 | 采用栈 b64 = **141.48 tok/s**（CV 0.0028，3/3 无崩溃，token 三轮一致；vs P5 默认 111.75 **+26.6%**） | `/root/p6_i5_i6.json`，`benchmarks/P6-i5-i6-i7.md` §1 |
+| I5 | 采用栈 b64 = **141.48 tok/s**（CV 0.0028，3/3 无崩溃，token 三轮一致；vs P5 默认 111.75 **+26.6%**） | `/root/p6_i5_i6.json`，`benchmarks/archive/P6-i5-i6-i7.md` §1 |
 | I6 | 前缀缓存 hot 使 TTFT p95 **1.256→0.934 s（-25.6%）**，吞吐仅 +1.5%（价值在首字延迟） | 同上 §2 |
 | I7 | 拐点**不是锐利点**：同一目标负载两次跑出 100% vs 84.4% → **高方差软边界 80–100%**，硬饱和在 ≥1.09 目标 QPS（0.94 req/s / 60 tok/s） | `/root/p6_i7_knee.json`，同上 §3 |
 | I9 | TPOT 非单调已解释：由瞬时并发决定（29→0.414 s，45→0.593 s），并发由 Poisson 到达尖峰决定 | 同上 §3 |

@@ -100,6 +100,13 @@ def main():
               attention_backend="triton_paged", max_model_len=1024,
               max_num_seqs=8, gpu_memory_utilization=0.5,
               scheduler_policy="stall_free")
+    try:
+        return _mixed_body(llm, args)
+    finally:
+        llm.exit()
+
+
+def _mixed_body(llm, args):
     runner = llm.model_runner
     verdict = {"arms": {}, "structural": {}}
     ok = True
@@ -246,7 +253,6 @@ def main():
     print(json.dumps({k: v for k, v in verdict.items() if k != "arms"},
                      indent=1, ensure_ascii=False), flush=True)
     print(f"[p16-mixed] {'PASS' if ok else 'FAIL'}", flush=True)
-    llm.exit()
     return 0 if ok else 1
 
 

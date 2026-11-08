@@ -75,9 +75,9 @@ TP2 通信量：每层 2 次 allreduce（attention 后 + MoE 后）。PCIe Gen5 
 
 分层设门，任何一层失败都不进入性能测量：
 
-1. **逐层数值参考**：`tests/p2_ground_truth.py` 用手写 PyTorch（CPU、无 KV cache、无 TP）对 tiny checkpoint 做贪心生成；tiny 模型的 TP1 输出必须与它逐 token 一致。
-2. **并行等价**：`tests/p2_tp_check.py`（TP1==TP2）、`tests/p2_grouped_mm.py`（TP1/TP2 × loop/grouped_mm，外加 round_robin 放置）必须四路 token 完全一致。
-3. **解码确定性**：`tests/p2_determinism.py` 反复重建引擎、不做 KV 清零，要求多次结果相同（复现并锁死 MUSA SDPA 读 KV 尾部未初始化数据的 bug）。
+1. **逐层数值参考**：`tests/archive/p2_ground_truth.py` 用手写 PyTorch（CPU、无 KV cache、无 TP）对 tiny checkpoint 做贪心生成；tiny 模型的 TP1 输出必须与它逐 token 一致。
+2. **并行等价**：`tests/archive/p2_tp_check.py`（TP1==TP2）、`tests/p2_grouped_mm.py`（TP1/TP2 × loop/grouped_mm，外加 round_robin 放置）必须四路 token 完全一致。
+3. **解码确定性**：`tests/archive/p2_determinism.py` 反复重建引擎、不做 KV 清零，要求多次结果相同（复现并锁死 MUSA SDPA 读 KV 尾部未初始化数据的 bug）。
 4. **30B 端到端**：固定 4 条中英文 prompt 贪心输出连贯；`scripts/p2_benchmark.py --verify-prompts` 会把 token id 与冻结的参考逐 id 比对，不一致就**在性能测量前退出**。
 5. **FP8 反量化**：加载器对每个本 rank 拥有的参数做写入覆盖断言，杜绝"静默漏权重"造成的假通过。
 

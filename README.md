@@ -16,11 +16,11 @@
 
 跑在摩尔线程 MTT S4000（MUSA 全栈，无 FP8 算力）上的 Qwen3-30B-A3B 双卡 MoE 推理引擎。TP2/EP2、自研 Triton paged attention、stall-free 混批调度、OpenAI 兼容流式服务。引擎底座是 MIT 协议的 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)（约 1.4k 行）；MUSA 适配、MoE 模型、调度/服务化和全部平台能力是本项目写的，上游版权见 [LICENSE](LICENSE)。
 
-所有性能结论出自预注册冻结门的 A/B 实验：先写判据再跑，跑完不改阈值，负结果照录——P0 到 P26 共 27 轮，每一轮都有报告、证据 JSON 和 sha256。
+所有性能结论出自预注册冻结门的 A/B 实验：先写判据再跑，跑完不改阈值，负结果照录——P0 到 P26 共 27 轮，判决台账见 [docs/PLAN.md](docs/PLAN.md) §1；实验轮的报告与证据 JSON+sha256 在 [benchmarks/](benchmarks/) 及 [benchmarks/archive/](benchmarks/archive/)（P25 评审报告在 docs/P25-review.md），纯整理轮以台账判决为准。
 
 ## 结果
 
-图表由 [`scripts/render_metrics.py`](scripts/render_metrics.py) 从 `benchmarks/data/` 的证据 JSON 生成，一条命令可重渲；每个数字都能对到对照臂、冻结门和存档文件。
+图表由 [`scripts/render_metrics.py`](scripts/render_metrics.py) 从 `benchmarks/data/` 的证据 JSON 生成，一条命令可重渲；每个数字都能对到对照臂、冻结门和存档文件。注意：**证据 JSON 不入库**（`benchmarks/data/` 在 .gitignore，边界说明见 [benchmarks/README.md](benchmarks/README.md)）——新 clone 上重渲需先自产 measurements；对页面上数字以各轮报告 md+sha256 为准。徽章 141.5 tok/s (b64) 与下方 `offline_moe_throughput.png` 的 b64 ≈120 tok/s **口径不同**：前者出自 [benchmarks/archive/P6-nightly.md](benchmarks/archive/P6-nightly.md)（b64、128-in/128-out、I5 栈），后者出自 p2 消融（b64、128-in/32-out、fcfs），同为存档实测、非同一负载，引用时注明口径。
 
 | 端到端加速（8B 基线） | 30B 离线吞吐 × MoE 后端 |
 |---|---|
@@ -73,6 +73,7 @@ PYTHONPATH=. python3 tests/p8_scheduler_gaps.py   # 调度缺口单测 6/6
 
 ```bash
 PYTHONPATH=. python3 scripts/p2_benchmark.py \
+  --model /data/models/Qwen3-30B-A3B-Instruct-2507-FP8 \
   --batches 1,2,4,8,16,32,64 --prompt-len 128 --output-len 32 --repeats 3 \
   --moe-backends loop,grouped_mm --scheduler-policy fcfs \
   --verify-prompts --reference-outputs benchmarks/p2-reference-8tok.json \
@@ -95,7 +96,7 @@ PYTHONPATH=. python3 scripts/benchmark_online.py --model qwen3-30b-a3b \
   --output benchmarks/data/online.json
 ```
 
-图表重渲（改了 benchmark 数据之后跑一次，PNG 与 README 数字保持同源）：
+图表重渲（改了 benchmark 数据之后跑一次，PNG 与 README 数字保持同源；`benchmarks/data/` 不入库，新 clone 需先跑 benchmark 生成数据）：
 
 ```bash
 python3 scripts/render_metrics.py    # 需要 matplotlib + SciencePlots

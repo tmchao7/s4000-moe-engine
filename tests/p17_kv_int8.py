@@ -143,27 +143,29 @@ def mode_arm(kv_dtype):
               attention_backend="triton_paged", max_model_len=1024,
               max_num_seqs=8, gpu_memory_utilization=0.5,
               kv_cache_dtype=kv_dtype)
-    sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS, ignore_eos=True)
-    import time
-    decode_steps = []
-    t0 = time.perf_counter()
-    outs = llm.generate(PROMPTS, sp, use_tqdm=False)
-    wall = time.perf_counter() - t0
-    for _ in range(3):
-        llm.scheduler.block_manager.clear_prefix_cache()
-        t1 = time.perf_counter()
-        llm.generate(PROMPTS[:8], sp, use_tqdm=False)
-        decode_steps.append(time.perf_counter() - t1)
-    result = {
-        "kv_dtype": kv_dtype,
-        "kv_blocks": int(llm.model_runner.config.num_kvcache_blocks),
-        "block_bytes": int(getattr(llm.model_runner, "last_block_bytes", 0) or 0),
-        "tokens": [list(o["token_ids"]) for o in outs],
-        "wall_s": round(wall, 2),
-        "timed8_med_s": round(statistics.median(decode_steps), 3),
-        "n_prompts": len(PROMPTS),
-    }
-    llm.exit()
+    try:
+        sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS, ignore_eos=True)
+        import time
+        decode_steps = []
+        t0 = time.perf_counter()
+        outs = llm.generate(PROMPTS, sp, use_tqdm=False)
+        wall = time.perf_counter() - t0
+        for _ in range(3):
+            llm.scheduler.block_manager.clear_prefix_cache()
+            t1 = time.perf_counter()
+            llm.generate(PROMPTS[:8], sp, use_tqdm=False)
+            decode_steps.append(time.perf_counter() - t1)
+        result = {
+            "kv_dtype": kv_dtype,
+            "kv_blocks": int(llm.model_runner.config.num_kvcache_blocks),
+            "block_bytes": int(getattr(llm.model_runner, "last_block_bytes", 0) or 0),
+            "tokens": [list(o["token_ids"]) for o in outs],
+            "wall_s": round(wall, 2),
+            "timed8_med_s": round(statistics.median(decode_steps), 3),
+            "n_prompts": len(PROMPTS),
+        }
+    finally:
+        llm.exit()
     out = f"/root/p17_data/arm_{kv_dtype}.json"
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as f:

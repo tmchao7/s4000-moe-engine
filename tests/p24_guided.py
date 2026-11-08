@@ -190,9 +190,11 @@ def main():
               attention_backend="triton_paged", max_model_len=2048,
               max_num_seqs=8, gpu_memory_utilization=0.35,
               scheduler_policy="stall_free")
-    g2_g3_engine(llm)
-    ratio = g5_overhead(llm)
-    llm.exit()
+    try:
+        g2_g3_engine(llm)
+        ratio = g5_overhead(llm)
+    finally:
+        llm.exit()
     ok = ratio <= 1.10
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:

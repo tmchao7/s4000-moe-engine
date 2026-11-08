@@ -6,7 +6,7 @@
 
 | 需求 | 说明 |
 |---|---|
-| GPU | 摩尔线程 MTT 系列(MUSA 架构);正确性门 1 张 ≥16GB 即可,30B 双卡 TP2 建议 2×48GB |
+| GPU | 摩尔线程 MTT 系列(MUSA 架构);正确性门(p2/p6 全六配置含 TP2)需 2 张、每张 ≥16GB——单卡只能跑 TP1 子集;30B 双卡 TP2 建议 2×48GB |
 | 系统 | Ubuntu 22.04(实测),x86_64 |
 | 驱动 | MUSA SDK 5.2+(`mthreads-gmi` 可见双卡) |
 
@@ -14,7 +14,7 @@
 
 | 组件 | 版本 | 来源 |
 |---|---|---|
-| Python | 3.10+ | 系统 |
+| Python | 3.10–3.12(实测 3.10;pyproject 声明上限 <3.13) | 系统 |
 | torch + torch_musa | 2.11 + 2.11.post1 | 摩尔线程官方 torch_musa 发行 wheel |
 | MCCL | 2.11(随 torch_musa) | 同上 |
 | Triton | 3.2.0(mtgpu backend,随栈) | 同上 |
@@ -31,11 +31,11 @@ mthreads-gmi | grep MiB   # 空闲时应为 0MiB
 
 ## 3. 模型
 
-- **tiny MoE**(正确性门用,~10MB,无需下载):`python3 scripts/make_tiny_moe.py` 生成到 `/tmp/tiny_moe`。
+- **tiny MoE**(正确性门用,约 78MB fp32 随机权重):生成时必须从一个真实 Qwen3 tokenizer 目录拷贝 tokenizer 文件——先完成下方 0.6B 下载(或自备任一 Qwen3 目录),再 `python3 scripts/make_tiny_moe.py --tokenizer-from <Qwen3 目录>` 生成到 `/tmp/tiny_moe`(缺 tokenizer.json/tokenizer_config.json 会 assert 失败)。
 - **Qwen3-0.6B / Qwen3-8B**:HuggingFace 下载 `Qwen/Qwen3-0.6B`、`Qwen/Qwen3-8B`(bf16)。
 - **Qwen3-30B-A3B-Instruct-2507-FP8**:HuggingFace 下载(存储为 FP8,加载期反量化 bf16;数据盘需要 ~31GB)。
 
-路径约定:脚本内 argparse 默认值指向 `MODEL_DIR` 占位的实际位置,用 `--model` 或 `NANOVLLM_MODEL` 环境变量指向你的本地路径。
+路径约定:脚本内 argparse 默认值指向仓库所有者服务器的私有路径(不可照抄),用 `--model` 指向你的本地路径;`NANOVLLM_MODEL` 环境变量仅 `example.py` 识别,压测/回归脚本不读它。
 
 ## 4. 复现链路(顺序执行)
 

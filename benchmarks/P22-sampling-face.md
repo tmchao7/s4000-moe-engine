@@ -1,6 +1,6 @@
 # P22-A — 采样面补齐(对齐 vLLM/SGLang 服务层)
 
-日期:2026-11-08 | 门:PLAN.md P22-A(预注册) | 测试:`tests/p22_sampler_face.py`(t0–t7)、`tests/p22_baseline_greedy.py`(改造前基线)、`scripts/p22_api_smoke.py`(API 冒烟)、`scripts/p22_30b_final.py`(30B 收官窗口) | commit `89536b8`(引擎)/`4fd27fe`(api)/本报告
+日期:2026-11-08 | 门:PLAN.md P22-A(预注册) | 测试:`tests/p22_sampler_face.py`(t0–t7)、`tests/p22_baseline_greedy.py`(改造前基线)、`scripts/p22_api_smoke.py`(API 冒烟)、`scripts/archive/p22_30b_final.py`(30B 收官窗口) | commit `89536b8`(引擎)/`4fd27fe`(api)/本报告
 
 ## 0. 一句话
 
@@ -40,7 +40,7 @@
 
 ## 4. 30B 收官窗口(单载,生产栈:TP2/triton_paged/bmm_dense/stall_free/eager)
 
-一次 30B 加载窗口(`scripts/p22_30b_final.py`,数据 `/root/p22_data/final_30b.json`),**全程 PASS**:
+一次 30B 加载窗口(`scripts/archive/p22_30b_final.py`,数据 `/root/p22_data/final_30b.json`),**全程 PASS**:
 
 | 检查 | 结果 |
 |---|---|

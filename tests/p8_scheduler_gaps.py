@@ -123,7 +123,9 @@ if __name__ == "__main__":
             try:
                 fn()
                 print(f"PASS {name}")
-            except AssertionError as exc:
+            except Exception as exc:  # noqa: BLE001 — record ANY failure and keep
+                # running the remaining tests (matching p16_* suites); rc stays
+                # fail-closed so the regression gate still turns red.
                 failures += 1
-                print(f"FAIL {name}: {exc}")
+                print(f"FAIL {name}: {exc!r}")
     sys.exit(1 if failures else 0)

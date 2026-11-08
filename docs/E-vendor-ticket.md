@@ -1,6 +1,6 @@
 # 厂商工单包:MUSA Graph 引擎级 replay 楔死 + 图可执行上限求证(I29/E4/E6/I32-②)
 
-> 状态:待发送(2026-10-29 整理;10-30 P14 补充;**2026-11-08 P20 补充 fp8 e4m3 cast 静默 no-op 证据,见 §4**;外发须用户亲自操作)。发送渠道:摩尔线程开发者论坛 developer.mthreads.com / vllm-musa GitHub issues。
+> 状态:待发送(2026-10-29 整理;10-30 P14 补充;**2026-11-08 P20 补充 fp8 e4m3 cast 静默 no-op 证据,见 §4a**;外发须用户亲自操作)。发送渠道:摩尔线程开发者论坛 developer.mthreads.com / vllm-musa GitHub issues。
 > 我们是自研推理引擎(基于 nano-vllm fork),非商业客户;但报告带最小复现与分级探针。官方文档称 S4000 上 MUSA Graph 默认开启,与我们观测的引擎级楔死矛盾——这正是要请厂商澄清的核心。
 
 ## 0. 环境版本
@@ -61,20 +61,7 @@ torchada README:"The MUSA driver caps the number of live graph *executables* per
 
 设备楔死后 watchdog 10 分钟才杀,且报错点漂移(报在下一个 barrier,不在真实现场)。已用自研硬 watchdog(`--verify-watchdog-s`,超时 `os._exit(97)`)自救。请求:更短的可配置 watchdog、报错点对齐、以及 §1 的图级诊断。
 
-## 5. 我方证据清单(随工单附)
-
-- `tests/archive/p9_mccl_graph_probe.py`(分级探针,独立进程+watchdog)
-- `tests/archive/p8_graph_padfix.py --tp 2`(引擎级复现 harness,两进程口径)
-- `benchmarks/archive/P9-graph.md`、`benchmarks/archive/P11-graph.md`、`benchmarks/archive/P12-serving.md`(全过程与冻结门)
-- 分段图替代实现作为 workaround 已验证:`NANOVLLM_SEGMENT_GRAPH=1`(图内零 MCCL,每层两段,all-reduce eager 在段间)——0.6B/8B/30B 离线门全过、768 图零失败、跨臂逐位 0 翻转;但在 TP2 上只能作为 workaround,批量 ≥8 时因桶 padding 与段间 eager AR 净负(详见 P12)。
-- 运行环境:`docs/musa-pitfalls.md` 记录的其他平台坑(跨块 strided view D2H 返回垃圾 I28、FP8 逐 expert 反量化 351 s 等)。
-
-## 6. 姿态与诉求
-
-我们不需要商业支持,只求:① 引擎级 replay 楔死的已知限制/修复计划;② 图可执行上限的官方口径与 torch_musa 直连轮换路线图;③ 图级 debug/dump 工具。若 ①短期无解,分段图(图内零 MCCL)是我们的既定路线,请帮忙审阅其 capture/replay 姿势是否符合 runtime 预期(代码 ~200 行,`model_runner.py::capture_segment_graphs`)。
-
-
-## 4. 问题四(P20 新增):torch float8_e4m3fn 在 MUSA 上 cast 静默不量化
+## 4a. 问题四补充(P20 新增):torch float8_e4m3fn 在 MUSA 上 cast 静默不量化
 
 **现象**:`torch.float8_e4m3fn` dtype 存在且 `tensor.to(torch.float8_e4m3fn)` 不报错,但 **cast 后数值完全未量化**——含 492.0 的张量 cast 再转回 fp32 后仍为 492.0(e4m3 最大值 448,正确实现必然 clip 到 448 并带 ~3% 相对误差;实测误差恰为 0)。
 
@@ -89,3 +76,15 @@ print(y)   # 期望 [0.5, 100, 448](clip),实测 [0.5, 100, 492] — cast 是 no
 **影响**:静默错误比崩溃更危险——任何依赖 fp8 量化收益的路径(如 KV cache fp8)会得到"看起来成功、实际未量化"的结果。**请求确认**:torch_musa 的 float8 cast 是否已实现?若未实现,建议 cast 时显式 raise 而非静默拷贝;若已实现,请提供正确性验证口径。
 
 **环境**:torch 2.11.0.post1 + torch_musa 2.11,MTT S4000。
+
+## 5. 我方证据清单(随工单附)
+
+- `tests/archive/p9_mccl_graph_probe.py`(分级探针,独立进程+watchdog)
+- `tests/archive/p8_graph_padfix.py --tp 2`(引擎级复现 harness,两进程口径)
+- `benchmarks/archive/P9-graph.md`、`benchmarks/archive/P11-graph.md`、`benchmarks/archive/P12-serving.md`(全过程与冻结门)
+- 分段图替代实现作为 workaround 已验证:`NANOVLLM_SEGMENT_GRAPH=1`(图内零 MCCL,每层两段,all-reduce eager 在段间)——0.6B/8B/30B 离线门全过、768 图零失败、跨臂逐位 0 翻转;但在 TP2 上只能作为 workaround,批量 ≥8 时因桶 padding 与段间 eager AR 净负(详见 P12)。
+- 运行环境:`docs/musa-pitfalls.md` 记录的其他平台坑(跨块 strided view D2H 返回垃圾 I28、FP8 逐 expert 反量化 351 s 等)。
+
+## 6. 姿态与诉求
+
+我们不需要商业支持,只求:① 引擎级 replay 楔死的已知限制/修复计划;② 图可执行上限的官方口径与 torch_musa 直连轮换路线图;③ 图级 debug/dump 工具。若 ①短期无解,分段图(图内零 MCCL)是我们的既定路线,请帮忙审阅其 capture/replay 姿势是否符合 runtime 预期(代码 ~200 行,`model_runner.py::capture_segment_graphs`)。

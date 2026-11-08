@@ -203,8 +203,10 @@ class KVFrameAssembler:
                 n, k_len, v_len = self._header
                 self._need = n * 0 + k_len + v_len
                 del self._buf[:TcpKVChannel.MAGIC_HEADER.size]
-                if self._need == 0:  # zero-size frame (defensive)
-                    frames.append(self._header)
+                if self._need == 0:  # zero-size frame (defensive; the peer
+                    # never sends n==0, but keep the documented frame shape
+                    # (n_blocks, k_bytes, v_bytes) instead of a raw int tuple)
+                    frames.append((self._header[0], b"", b""))
                     self._header = None
                     self._need = TcpKVChannel.MAGIC_HEADER.size
                 continue

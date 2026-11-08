@@ -1,12 +1,12 @@
 # MUSA / 摩尔线程 S4000 踩坑记录
 
-> 环境：AutoDL 容器，2× MTT S4000（48GB），驱动 5.2.0 / MUSA SDK 5.2.0，torch 2.11.0.post1 + torch_musa 2.11.0.post1，vllm-musa 0.29.1.dev（预装），transformers 5.13.0，Python 3.10.12，Ubuntu 22.04。
+> 环境：租用 MUSA GPU 容器实例，2× MTT S4000（48GB），驱动 5.2.0 / MUSA SDK 5.2.0，torch 2.11.0.post1 + torch_musa 2.11.0.post1，vllm-musa 0.29.1.dev（预装），transformers 5.13.0，Python 3.10.12，Ubuntu 22.04。
 > 每条按「现象 → 根因 → 解法/结论」记录。持续更新。
 
 ## 1. 模型下载链路
 
-- **现象**：`source /etc/network_turbo` 后 HuggingFace 仍不可达；直连报 `[Errno 101] Network is unreachable`。
-- **根因**：本地区不在 AutoDL 学术加速覆盖范围（`/etc/network_turbo` 明确提示"该地区学术加速暂未支持"）。
+- **现象**：租用平台提供的网络加速脚本对本地区不覆盖，开启后 HuggingFace 仍不可达；直连报 `[Errno 101] Network is unreachable`。
+- **根因**：本地区不在该平台学术加速的覆盖范围（加速脚本自身提示"该地区学术加速暂未支持"）。
 - **解法**：`export HF_ENDPOINT=https://hf-mirror.com`，实测 ~30–70MB/s。
 
 - **现象**：hf-mirror 下大文件到一半报 `CAS Client Error: 401 Unauthorized`（xet 协议）。
@@ -19,7 +19,7 @@
 
 ## 2. GPU 软件栈可用性（实测）
 
-> 2026-11-07 换新租用 GPU 容器实例（ssh 别名 `s4000`，Ubuntu 22.04，driver 5.2.0-server）后全套重测通过：torch 2.11.0.post1 + torch_musa 2.11.0.post1 + triton 3.2.0（mtgpu）+ transformers 5.13.0。四套单测全过 + 30B TP2 生产栈加载/生成冒烟通过。旧实例的"未测组件"结论以新栈为准重验。
+> 2026-11-07 换新租用 GPU 容器实例（Ubuntu 22.04，driver 5.2.0-server）后全套重测通过：torch 2.11.0.post1 + torch_musa 2.11.0.post1 + triton 3.2.0（mtgpu）+ transformers 5.13.0。四套单测全过 + 30B TP2 生产栈加载/生成冒烟通过。旧实例的"未测组件"结论以新栈为准重验。
 >
 > **torch_musa 2.11 分配器行为差异**：`llm.exit()` 后 caching allocator 仍攥着 reserved 段（21 GB 级）不还给驱动，同进程连续构建第二个 LLM 时 `allocate_kv_cache` 的设备级 used 核算会误判 → 已在 `ModelRunner.exit()` 修复（drop model/kv_cache + `gc.collect()` + `empty_cache()`，见 model_runner.py）。p2/p6 六配置连跑依赖此修复。
 >
@@ -50,7 +50,7 @@
   ```bash
   pkill -9 -f "VLLM::EngineCor[e]"; pkill -9 -f "WorkerPro[c]"; pkill -9 -f "p0_vllm_baselin[e]"
   ```
-- **性能现实**：Qwen3-8B TP2 聚合吞吐不随并发扩展（1/8/32 并发 = 6.4/7.6/8.4 tok/s），详见 `benchmarks/P0-vllm-musa-baseline.md`。每步 ~120ms，72 次 PCIe allreduce 疑似占一半。
+- **性能现实**：Qwen3-8B TP2 聚合吞吐不随并发扩展（1/8/32 并发 = 6.4/7.6/8.4 tok/s），详见 `benchmarks/archive/P0-vllm-musa-baseline.md`。每步 ~120ms，72 次 PCIe allreduce 疑似占一半。
 
 ## 4. transformers 5.x
 
@@ -62,7 +62,7 @@
 
 - **`pkill -f` 自匹配**：`ssh host 'pkill -f foo'` 时，远端 shell 的命令行本身含 `foo`，pkill 会把自己的会话杀掉 → ssh 报 `Connection closed`。解法：正则括号技巧 `pkill -f "fo[o]"`。
 - **容器中继 ssh/scp 不稳定**：scp 大概率闪断（`Connection closed`）。小文件用 `ssh host 'cat > path' < local_file` 传（实测稳定）；长任务用 `setsid nohup ... &` 完全脱离会话，ssh 断了不影响。
-- **磁盘布局**：系统盘 30G（几乎全空，放 Qwen3-8B）+ 数据盘 50G（放 FP8 checkpoint），合计 80G；该实例数据盘不支持扩容。
+- **磁盘布局**：租用实例常见为小系统盘 + 独立数据盘，且部分实例数据盘不支持扩容——31GB 的 30B FP8 checkpoint 只能放数据盘，容量与扩容限制要提前规划。
 
 ## 6. 性能基线速查
 

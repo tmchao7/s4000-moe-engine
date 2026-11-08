@@ -1,6 +1,6 @@
 # P23 — overlap scheduler(vLLM V1/SGLang 同款单飞流水线)
 
-日期:2026-11-08 | 门:PLAN.md §0a P23(预注册) | 测试:`tests/p23_overlap.py`(分进程三阶段)、`scripts/probe_p23b.py`/`probe_p23c.py`(根因探针) | commit 本轮
+日期:2026-11-08 | 门:PLAN.md §0a P23(预注册) | 测试:`tests/p23_overlap.py`(分进程三阶段)、`scripts/archive/probe_p23b.py`/`probe_p23c.py`(根因探针) | commit 本轮
 
 ## 0. 一句话
 

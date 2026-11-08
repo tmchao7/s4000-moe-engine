@@ -246,7 +246,13 @@ def e2e(model_path):
               attention_backend="triton_paged", max_model_len=2048,
               max_num_seqs=32, gpu_memory_utilization=0.35,
               scheduler_policy="stall_free")
+    try:
+        return _e2e_body(llm)
+    finally:
+        llm.exit()
 
+
+def _e2e_body(llm):
     # t5: defaults greedy == pre-change capture (bitwise no-op gate)
     sp = SamplingParams(temperature=0, max_tokens=48, ignore_eos=True)
     outs = llm.generate(PROMPTS, [sp] * len(PROMPTS), use_tqdm=False)
@@ -329,7 +335,6 @@ def e2e(model_path):
     ratio = k / b
     print(f"t7 decode median: default {b * 1e3:.2f}ms top_p0.9 {k * 1e3:.2f}ms "
           f"ratio={ratio:.4f} (interleaved x3)")
-    llm.exit()
     return ratio
 
 

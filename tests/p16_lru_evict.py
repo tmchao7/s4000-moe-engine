@@ -200,48 +200,50 @@ def part2_engine(out_dir):
               attention_backend="triton_paged", max_model_len=1024,
               max_num_seqs=4, gpu_memory_utilization=0.5,
               num_kvcache_blocks=24)   # slack so hot blocks survive the churn
-    bm = llm.scheduler.block_manager
-    sp_hot = SamplingParams(temperature=0, max_tokens=8, ignore_eos=True)
-    sp_cold = SamplingParams(temperature=0, max_tokens=4, ignore_eos=True)
+    try:
+        bm = llm.scheduler.block_manager
+        sp_hot = SamplingParams(temperature=0, max_tokens=8, ignore_eos=True)
+        sp_cold = SamplingParams(temperature=0, max_tokens=4, ignore_eos=True)
 
-    def run_cycle_workload():
-        hot_outs, hot_hits = [], []
-        for cycle in range(3):
-            t0 = time.perf_counter()
-            before = bm.prefix_cache_hit_tokens
-            out = llm.generate([HOT], sp_hot, use_tqdm=False)
-            hot_hits.append(bm.prefix_cache_hit_tokens - before)
-            hot_outs.append([list(o["token_ids"]) for o in out])
-            for c in COLD:
-                llm.generate([c], sp_cold, use_tqdm=False)
-            print(f"  cycle{cycle}: hot_hit_tokens={hot_hits[-1]} "
-                  f"({time.perf_counter() - t0:.2f}s)", flush=True)
-        return hot_outs, hot_hits
+        def run_cycle_workload():
+            hot_outs, hot_hits = [], []
+            for cycle in range(3):
+                t0 = time.perf_counter()
+                before = bm.prefix_cache_hit_tokens
+                out = llm.generate([HOT], sp_hot, use_tqdm=False)
+                hot_hits.append(bm.prefix_cache_hit_tokens - before)
+                hot_outs.append([list(o["token_ids"]) for o in out])
+                for c in COLD:
+                    llm.generate([c], sp_cold, use_tqdm=False)
+                print(f"  cycle{cycle}: hot_hit_tokens={hot_hits[-1]} "
+                      f"({time.perf_counter() - t0:.2f}s)", flush=True)
+            return hot_outs, hot_hits
 
-    verdict = {"arms": {}}
-    # arm1: LRU on (default)
-    bm.lru_enabled = True
-    llm.scheduler.block_manager.clear_prefix_cache()
-    hot_on, hits_on = run_cycle_workload()
-    verdict["arms"]["lru_on"] = {"hot_hits": hits_on}
-    # arm2: LRU off (FIFO), identical workload + cleared cache
-    bm.lru_enabled = False
-    llm.scheduler.block_manager.clear_prefix_cache()
-    hot_off, hits_off = run_cycle_workload()
-    bm.lru_enabled = True
-    verdict["arms"]["lru_off"] = {"hot_hits": hits_off}
+        verdict = {"arms": {}}
+        # arm1: LRU on (default)
+        bm.lru_enabled = True
+        llm.scheduler.block_manager.clear_prefix_cache()
+        hot_on, hits_on = run_cycle_workload()
+        verdict["arms"]["lru_on"] = {"hot_hits": hits_on}
+        # arm2: LRU off (FIFO), identical workload + cleared cache
+        bm.lru_enabled = False
+        llm.scheduler.block_manager.clear_prefix_cache()
+        hot_off, hits_off = run_cycle_workload()
+        bm.lru_enabled = True
+        verdict["arms"]["lru_off"] = {"hot_hits": hits_off}
 
-    # gate ②: placement-only change -> tokens bitwise identical
-    flat_on = [t for occ in hot_on for t in occ]
-    flat_off = [t for occ in hot_off for t in occ]
-    verdict["bitwise_equal"] = flat_on == flat_off
-    torch_ok &= flat_on == flat_off
-    # gate ④: hot-prefix retention — LRU total hits >= FIFO total hits
-    verdict["hot_hits"] = {"lru_on": sum(hits_on), "lru_off": sum(hits_off)}
-    torch_ok &= sum(hits_on) >= sum(hits_off)
-    verdict["engine_ok"] = torch_ok
-    llm.exit()
-    return torch_ok
+        # gate ②: placement-only change -> tokens bitwise identical
+        flat_on = [t for occ in hot_on for t in occ]
+        flat_off = [t for occ in hot_off for t in occ]
+        verdict["bitwise_equal"] = flat_on == flat_off
+        torch_ok &= flat_on == flat_off
+        # gate ④: hot-prefix retention — LRU total hits >= FIFO total hits
+        verdict["hot_hits"] = {"lru_on": sum(hits_on), "lru_off": sum(hits_off)}
+        torch_ok &= sum(hits_on) >= sum(hits_off)
+        verdict["engine_ok"] = torch_ok
+        return torch_ok
+    finally:
+        llm.exit()
 
 
 def main():

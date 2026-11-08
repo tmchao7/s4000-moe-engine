@@ -89,6 +89,14 @@ def b1_mixed_split(model):
               attention_backend="triton_paged", max_model_len=2048,
               max_num_seqs=8, gpu_memory_utilization=0.35,
               scheduler_policy="stall_free")
+    try:
+        return _b1_mixed_split_body(llm)
+    finally:
+        llm.exit()
+
+
+def _b1_mixed_split_body(llm):
+    from nanovllm import SamplingParams      # (b1's LLM import lives in the caller)
     body = "大模型推理系统需要在吞吐与延迟之间做精细权衡，prefill 计算密集而 decode 访存密集。" * 4
 
     for tag, logprobs in (("no-logprobs", None), ("with-logprobs", 3)):
@@ -118,7 +126,6 @@ def b1_mixed_split(model):
             assert n_lp == n_tok and n_lp >= 3 * len(sids), \
                 f"b1[{tag}]: lp rows {n_lp} != token rows {n_tok}"
         print(f"PASS b1 mixed-split {tag} (mixed_seen, {len(events)} events)")
-    llm.exit()
 
 
 def main():

@@ -41,21 +41,23 @@ def run_engine():
               tensor_parallel_size=1, attention_backend="triton_paged",
               max_model_len=2048, max_num_seqs=32, gpu_memory_utilization=0.35,
               scheduler_policy="stall_free")
-    sp = SamplingParams(temperature=0, max_tokens=48, ignore_eos=True)
-    outs = llm.generate(PROMPTS, [sp] * len(PROMPTS), use_tqdm=False)
-    tokens = [list(o["token_ids"]) for o in outs]
+    try:
+        sp = SamplingParams(temperature=0, max_tokens=48, ignore_eos=True)
+        outs = llm.generate(PROMPTS, [sp] * len(PROMPTS), use_tqdm=False)
+        tokens = [list(o["token_ids"]) for o in outs]
 
-    sp2 = SamplingParams(temperature=0, max_tokens=64, ignore_eos=True)
-    for p in TIMING_PROMPTS:
-        llm.add_request(p, sp2)
-    dec_fw = []
-    while not llm.is_finished():
-        _, num = llm.step()
-        m = llm.last_step_metrics
-        if m["mode"] == "decode" and m["forward_s"] > 0:
-            dec_fw.append(m["forward_s"])
-    llm.exit()
-    return tokens, dec_fw
+        sp2 = SamplingParams(temperature=0, max_tokens=64, ignore_eos=True)
+        for p in TIMING_PROMPTS:
+            llm.add_request(p, sp2)
+        dec_fw = []
+        while not llm.is_finished():
+            _, num = llm.step()
+            m = llm.last_step_metrics
+            if m["mode"] == "decode" and m["forward_s"] > 0:
+                dec_fw.append(m["forward_s"])
+        return tokens, dec_fw
+    finally:
+        llm.exit()
 
 
 def main():

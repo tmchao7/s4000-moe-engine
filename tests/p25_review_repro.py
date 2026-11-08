@@ -24,9 +24,25 @@ dropping the parked batch.
 Run:  PYTHONPATH=. python3 tests/p25_review_repro.py   # rc 0 = fix verified
 """
 import importlib.util
+import os
+import shutil
 import sys
 import types
 from pathlib import Path
+
+# The engine modules below use 3.10+ syntax (dataclass(slots=True), PEP 604
+# unions) and pyproject declares requires-python ">=3.10,<3.13".  Dev boxes
+# often default `python3` to something older, which dies with an opaque
+# "dataclass() got an unexpected keyword argument 'slots'": re-exec onto the
+# newest compliant interpreter on PATH instead (no-op on 3.10+; honest rc=1
+# error if none exists).
+if sys.version_info < (3, 10):
+    _py = next((shutil.which(c) for c in ("python3.12", "python3.11", "python3.10")
+                if shutil.which(c)), None)
+    if _py is None:
+        sys.exit("p25_review_repro: engine modules need Python >= 3.10 "
+                 f"(running {sys.version.split()[0]}); no python3.10-3.12 on PATH")
+    os.execv(_py, [_py, os.path.abspath(__file__), *sys.argv[1:]])
 
 # Load the three pure-Python modules directly, bypassing nanovllm/__init__
 # (which pulls torch/transformers/tqdm).  Keeps this repro runnable anywhere

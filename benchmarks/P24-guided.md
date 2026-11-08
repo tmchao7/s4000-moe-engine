@@ -1,6 +1,6 @@
 # P24 — 结构化输出(xgrammar,vLLM/SGLang 同款后端)
 
-日期:2026-11-08 | 门:PLAN.md §0a P24(预注册) | 测试:`tests/p24_guided.py`、`scripts/p22_api_smoke.py`(7/8 号用例)、`scripts/p24_30b_final.py` | commit 本轮
+日期:2026-11-08 | 门:PLAN.md §0a P24(预注册) | 测试:`tests/p24_guided.py`、`scripts/p22_api_smoke.py`(7/8 号用例)、`scripts/archive/p24_30b_final.py` | commit 本轮
 
 ## 0. 一句话
 

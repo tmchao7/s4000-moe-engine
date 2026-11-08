@@ -4,16 +4,19 @@ Finding 1 (speculative pre-check): the per-seq launch-time block check is now
 CUMULATIVE (BlockManager.total_launch_shortfall); under KV pressure the
 speculative pass defers the whole batch instead of letting may_append_at run
 the free list off its end (IndexError).  t3 runs the P23-t4 preemption load
-under overlap and requires completion.
+under overlap and requires completion AND that the cumulative gate actually
+fired (defers > 0; judged record: defers=3) — a scheduler that stops
+deferring under this fixed load has lost the cumulative-gate semantics.
 
 Finding 2 (runtime disable): set_scheduler_overlap(False) now DRAINS — the
 parked speculative batch is launched (its launch-time block coverage holds
 exactly once the in-flight batch is collected) instead of dropped; dropping
 it stranded may_append_at allocations and corrupted boundary-crossing rows'
-KV slot mapping.  t1 flips mid-flight and requires bitwise equality with a
-pure-serial reference; t2 toggles overlap every two steps across the whole
-block-boundary zone (lengths sweep 541->924, crossing 768) and requires the
-same, ending back on overlap.
+KV slot mapping.  t1 starts from overlap ON (re-enabled after the pure-serial
+reference arm), disables mid-flight and requires bitwise equality with that
+reference; t2 toggles overlap every two steps across the whole block-boundary
+zone (lengths sweep 541->924, crossing 768) and requires the same, ending
+back on overlap.
 
 Pure-CPU unit coverage for finding 1 lives in tests/p25_review_repro.py.
 
@@ -69,34 +72,40 @@ def stage_a(args):
               attention_backend="triton_paged", max_model_len=1024,
               max_num_seqs=16, gpu_memory_utilization=0.35,
               scheduler_policy="stall_free", scheduler_overlap=True)
-    sp = SamplingParams(temperature=0, max_tokens=384, ignore_eos=True)
+    try:
+        sp = SamplingParams(temperature=0, max_tokens=384, ignore_eos=True)
 
-    # Reference: pure serial from the start (overlap off while idle).
-    llm.set_scheduler_overlap(False)
-    ref, _ = run_with_flip(llm, PROMPTS, sp, {})
-    print(f"[p25] reference serial arm done ({len(ref)} finals)", flush=True)
+        # Reference: pure serial from the start (overlap off while idle).
+        llm.set_scheduler_overlap(False)
+        ref, _ = run_with_flip(llm, PROMPTS, sp, {})
+        print(f"[p25] reference serial arm done ({len(ref)} finals)", flush=True)
 
-    # t1: single mid-flight disable; the parked batch must be drained.
-    llm.scheduler.block_manager.clear_prefix_cache()
-    finals1, _ = run_with_flip(llm, PROMPTS, sp, {8: False})
-    verdict["t1_drain_bitwise_equal"] = ref == finals1
-    ok &= verdict["t1_drain_bitwise_equal"]
-    print(f"[p25] t1 mid-flight disable drain bitwise: "
-          f"{verdict['t1_drain_bitwise_equal']}", flush=True)
+        # t1: single mid-flight disable; the parked batch must be drained.
+        # Re-enable overlap first (the reference arm above turned it off for
+        # the whole serial run) so t1 starts on the pipeline and the flip at
+        # step 8 exercises the real disable-drain path (mirrors p23_overlap).
+        llm.scheduler.block_manager.clear_prefix_cache()
+        llm.set_scheduler_overlap(True)
+        finals1, _ = run_with_flip(llm, PROMPTS, sp, {8: False})
+        verdict["t1_drain_bitwise_equal"] = ref == finals1
+        ok &= verdict["t1_drain_bitwise_equal"]
+        print(f"[p25] t1 mid-flight disable drain bitwise: "
+              f"{verdict['t1_drain_bitwise_equal']}", flush=True)
 
-    # t2: toggle every two steps across the block-boundary zone (lengths
-    # sweep ~541->924, crossing 768); the window's last flips leave overlap
-    # ON, so the arm ends under the resumed pipeline.
-    llm.scheduler.block_manager.clear_prefix_cache()
-    flips = {s: (s // 2) % 2 == 1 for s in range(60, 500)}
-    finals2, _ = run_with_flip(llm, PROMPTS, sp, flips)
-    verdict["t2_toggle_aba_bitwise_equal"] = ref == finals2
-    ok &= verdict["t2_toggle_aba_bitwise_equal"]
-    print(f"[p25] t2 toggle ABA bitwise: "
-          f"{verdict['t2_toggle_aba_bitwise_equal']}", flush=True)
+        # t2: toggle every two steps across the block-boundary zone (lengths
+        # sweep ~541->924, crossing 768); the window's last flips leave overlap
+        # ON, so the arm ends under the resumed pipeline.
+        llm.scheduler.block_manager.clear_prefix_cache()
+        flips = {s: (s // 2) % 2 == 1 for s in range(60, 500)}
+        finals2, _ = run_with_flip(llm, PROMPTS, sp, flips)
+        verdict["t2_toggle_aba_bitwise_equal"] = ref == finals2
+        ok &= verdict["t2_toggle_aba_bitwise_equal"]
+        print(f"[p25] t2 toggle ABA bitwise: "
+              f"{verdict['t2_toggle_aba_bitwise_equal']}", flush=True)
 
-    verdict["stage_pass"] = ok
-    llm.exit()
+        verdict["stage_pass"] = ok
+    finally:
+        llm.exit()
     print("STAGE_JSON " + json.dumps(verdict), flush=True)
     return verdict
 
@@ -111,22 +120,27 @@ def stage_b(args):
               max_num_seqs=16, gpu_memory_utilization=0.5,
               num_kvcache_blocks=12, scheduler_policy="stall_free",
               scheduler_overlap=True)
-    sp = SamplingParams(temperature=0, max_tokens=384, ignore_eos=True)
-    sid_name = {llm.add_request(p, sp): p for p in PROMPTS}
-    pre0 = llm.scheduler.preemptions
-    n_final = 0
-    while not llm.is_finished():
-        outputs, _ = llm.step()
-        n_final += len(outputs)
-    pre = llm.scheduler.preemptions - pre0
-    m = llm.metrics()
-    llm.exit()
-    verdict = {
-        "t3_finals": n_final,
-        "t3_preemptions": pre,
-        "t3_defers": m["engine_overlap_defers_total"],
-        "stage_pass": n_final == len(PROMPTS),
-    }
+    try:
+        sp = SamplingParams(temperature=0, max_tokens=384, ignore_eos=True)
+        sid_name = {llm.add_request(p, sp): p for p in PROMPTS}
+        pre0 = llm.scheduler.preemptions
+        n_final = 0
+        while not llm.is_finished():
+            outputs, _ = llm.step()
+            n_final += len(outputs)
+        pre = llm.scheduler.preemptions - pre0
+        m = llm.metrics()
+        verdict = {
+            "t3_finals": n_final,
+            "t3_preemptions": pre,
+            "t3_defers": m["engine_overlap_defers_total"],
+            # Completion alone would pass even if the scheduler drifted back to
+            # per-seq pre-checks (which can silently stop deferring); require
+            # the cumulative gate to have actually fired (judged run: 3).
+            "stage_pass": n_final == len(PROMPTS) and m["engine_overlap_defers_total"] > 0,
+        }
+    finally:
+        llm.exit()
     print(f"[p25] t3 pressure: finals={n_final}/{len(PROMPTS)} pre={pre} "
           f"defers={verdict['t3_defers']}", flush=True)
     print("STAGE_JSON " + json.dumps(verdict), flush=True)

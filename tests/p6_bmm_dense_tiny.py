@@ -2,15 +2,21 @@
 
 ``bmm_dense`` computes the same math as ``grouped_mm`` but through dense batched
 GEMMs with capacity padding, so its bf16 accumulation order differs.  Greedy
-tokens should agree on the tiny model; this probe reports the exact agreement
-instead of asserting it, because a near-tie can legitimately flip one token.
+tokens should agree on the tiny model; a near-tie can legitimately flip one
+token, so by DEFAULT the six-config exact agreement is only REPORTED (printed)
+and does not gate the rc.  ``--strict`` turns it into a hard gate: any token
+mismatch across the six configs exits rc=1 (the judged runs on record are
+exact; the strict gate is deliberately opt-in and not yet wired into
+tests/run_regression.sh — see docs/TEST-MATRIX.md G6).
 
 Run:
   PYTHONPATH=. python3 tests/p6_bmm_dense_tiny.py
+  PYTHONPATH=. python3 tests/p6_bmm_dense_tiny.py --strict   # gate the rc on
+      # six-config token identity
   PYTHONPATH=. python3 tests/p6_bmm_dense_tiny.py --with-graph   # also exercises
       # the capture/replay comparison; tiny capture is itself flaky (see
-      # docs/P6-open-issues.md I3), so it is opt-in and does NOT gate the rc:
-      # the six-config token-identity gate above is the regression criterion.
+      # docs/P6-open-issues.md I3, in git history), so it is opt-in and does
+      # NOT gate the rc.
 """
 import argparse
 import sys
@@ -54,6 +60,8 @@ def run(tp, backend, max_tokens, decode_backend=None, enforce_eager=True,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument("--strict", action="store_true",
+                        help="gate the rc on six-config token identity (default: report only)")
     parser.add_argument("--with-graph", action="store_true",
                         help="also run the graph-vs-eager comparison (capture is flaky; not part of the gate)")
     args = parser.parse_args()
@@ -71,6 +79,9 @@ def main():
         print(f"[bmm-tiny] {key} token agreement vs tp1-loop: {agreement:.3f}", flush=True)
     exact = all(value == results["tp1-loop"] for value in results.values())
     print(f"[bmm-tiny] exact match across all six configs: {exact}", flush=True)
+    if args.strict and not exact:
+        print("[bmm-tiny] STRICT: six-config token identity FAILED", flush=True)
+        return 1
 
     # End-to-end graph path: prefill stays grouped_mm, decode runs bmm_dense
     # from captured graphs.  Tokens must match the eager decode-only switch.
@@ -95,4 +106,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

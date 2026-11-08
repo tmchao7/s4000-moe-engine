@@ -287,7 +287,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         useful rows, but ``torch.bmm`` runs at GEMM efficiency while
         ``torch._grouped_mm`` is fixed-overhead bound at decode sizes: measured
         on the production shapes this is 1.3-1.95x faster than grouped_mm
-        (scripts/p6_moe_microbench.py) and, unlike ``_grouped_mm``, it is
+        (scripts/archive/p6_moe_microbench.py) and, unlike ``_grouped_mm``, it is
         capturable, so decode can run from a MUSA graph.
 
         Weights are consumed in their native layout -- no transposed copy.
@@ -341,7 +341,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         P6 capture attempt.  ``vendor_moe.fused_experts_zero_copy`` passes the
         transposed *view* instead and removes only those two asserts in memory;
         the Triton kernel reads strides explicitly and is numerically identical
-        (tests/p6_vendor_zero_copy.py, including graph replay).
+        (tests/archive/p6_vendor_zero_copy.py, including graph replay).
 
         The MUSA vendor fast path (S4000_ops: gemv/mutlass) aborts with an
         illegal memory access at our prefill sizes (>=1024 tokens), so the

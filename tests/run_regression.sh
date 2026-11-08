@@ -12,7 +12,15 @@
 set -u
 cd "$(dirname "$0")/.."
 MODEL_FLAG=""
-if [ "${1:-}" = "--model" ]; then MODEL_FLAG="--model $2"; fi
+if [ $# -gt 0 ]; then
+  if [ "$1" = "--model" ] && [ $# -ge 2 ]; then
+    MODEL_FLAG="--model $2"
+  else
+    echo "[regression] bad usage: $*" >&2
+    echo "[regression] usage: bash tests/run_regression.sh [--model <path/to/Qwen3-0.6B>]" >&2
+    exit 2
+  fi
+fi
 OUT_DIR=${REGRESSION_OUT:-/tmp/regression}
 mkdir -p "$OUT_DIR"
 rc_all=0

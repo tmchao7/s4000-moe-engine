@@ -1116,7 +1116,8 @@ class ModelRunner:
         # memory leaves the small buckets usable instead of losing the whole
         # capture.  (Measured: the graph pool itself is cheap -- ``MUSAGraph()``
         # and a tiny capture cost <0.1 GiB; the ~15.6 GiB seen on the 30B work up
-        # is spent *inside* the vendor MoE call, see docs/HANDOFF-P6-next.md T1.)
+        # is spent *inside* the vendor MoE call, see HANDOFF-P6-next.md T1 in
+        # git history — that handoff doc is no longer in the repo.)
         for bs in self.graph_bs:
             # MCCL collectives must be recorded by every rank at the same point
             # in the capture.  Without these barriers rank 0 can start capturing
