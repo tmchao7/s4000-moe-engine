@@ -9,7 +9,18 @@
 
 **已判决(负结果也是结论)**:投机解码 NO-GO(α≈0 且 c=0.39);**I19 判决(P11):b1 固定等待主体 = 逐算子 host launch 开销,分段 replay 可回收 36.2 ms/步**(单算子融合被否定、replay 有效——两条自洽);整图 graph 否决(I29:TP2 引擎级间歇性 MCCL replay 楔死,barrier 无效),**分段图(图内零 MCCL)离线验证成立但在线否决(P12)+ 修复验证后仍转正失败(P13:padding 税已除,残余 AR 串行化 +1.0~4.7%)→ 服务化分支关闭,定格单流开关**;**I30 关闭(P13 ABA:现树快于 pre-P8 栈 23–51%,P9 回归主张被否定)**;**I8 长上下文闭合(P13:冷缓存塌=chunk 粒度,chunk-1024 解;准入=稳定性)**;**split=0 与 chunk-2048 默认化均否决(P10 实测)**;profiled placement 不采用;fused RMSNorm / bmm 容量收缩不采用;host-sync 移除与 mixed-split 已采纳默认开;30B 首 batch 为一次性 warmup 态(I31,token 门必丢首 batch)。
 
+## 0a. P22 采样面补齐(2026-11-08 立项;对齐 vLLM/SGLang 服务层;用户裁决只做 A,B/C 入 backlog)
+
+| # | 项 | 门/判定(预注册,不可改) | 状态 |
+|---|---|---|---|
+| A | **采样面补齐**:top_p/top_k/min_p + presence/frequency/repetition penalty + stop_token_ids(引擎级) + logprobs(top-k) + skip_special_tokens + `/v1/completions`(流式+非流式) | ① t1/t1b/t3 掩码与 penalty 对独立 CPU 参考逐位 ② t2 支撑集封闭(200 抽 0 泄漏) ③ **t4 全默认与逐字 legacy 体 bitwise 相等(硬门)** ④ t5 0.6B 默认 greedy 与改造前基线 bitwise ⑤ t7 默认步时 ≤±1%;top_p 激活 ≤+10% ⑥ API 冒烟 6 项 ⑦ 回归(四套+特性套) ⑧ 30B 单载窗口(一致性+步时 CV+旋钮 sanity) | **判决 PASS(11-08)**:①–⑧ 全过(t5 基线逐位全等;t7 默认 +0.47%、top_p 激活 1.091 贴门照录;API 冒烟 6/6;回归 8/9 套绿,p16-priority 引擎门=P16-C 已照录负结果;⑧ 30B 单载:greedy 自一致逐位 True + 步时 181.57ms CV=0.0004 + 旋钮/stop/logprobs sanity 全 True);**全默认走逐字 legacy 路径,per-request opt-in,生产栈零默认变更**;报告 benchmarks/P22-sampling-face.md |
+| B | overlap scheduler(vLLM V1/SGLang 同款;schedule+prepare 与 GPU forward 重叠) | 未立项 | backlog(盘点完成:全引擎每步唯一硬同步=model_runner.py `.tolist()`,严格串行无 overlap;旗舰件但动 step 主循环,需 opt-in+bitwise 门+抢占回退同步) |
+| C | 结构化输出 xgrammar | 未立项 | backlog(纯 CPU 编译+torch 算子 bitmask,MUSA 无厂商风险) |
+
+其余 backlog:n>1 并行采样、seed(MUSA RNG 语义厂商风险)、tools、swap 抢占/KV offload、PD 流式/多实例。
+
 ## 1. P16–P18 迭代内容(2026-11-07 立项;用户三方向合成:统一混合 batch + KV 调度做足 → KV int8 量化 → PD 小模型推进;30B 只做点睛)
+
 
 ### P16 引擎做足
 

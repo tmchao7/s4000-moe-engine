@@ -10,7 +10,7 @@
 ![Parallel](https://img.shields.io/badge/Parallel-TP2%20%2B%20EP2-0D9488)
 ![Offline](https://img.shields.io/badge/Offline-141.5%20tok%2Fs%20%28b64%29-1B9E77)
 ![Online](https://img.shields.io/badge/Online-%E2%89%A51.07%20req%2Fs%20%C2%B7%20100%25%20SLO-7C3AED)
-![Verdicts](https://img.shields.io/badge/Rounds-P0%E2%80%93P21%20all%20judged-111827)
+![Verdicts](https://img.shields.io/badge/Rounds-P0%E2%80%93P22%20all%20judged-111827)
 
 </div>
 
@@ -79,7 +79,7 @@
 详细设计见 [docs/architecture.md](docs/architecture.md);当前迭代计划见 [docs/PLAN.md](docs/PLAN.md);问题台账见 [docs/ISSUES.md](docs/ISSUES.md) 与 [docs/CLOSEOUT.md](docs/CLOSEOUT.md)。
 
 <details>
-<summary><b>📈 当前进度（P0–P21 全部判决完毕 — 点击展开）</b></summary>
+<summary><b>📈 当前进度（P0–P22 全部判决完毕 — 点击展开）</b></summary>
 
 | 阶段 | 状态 | 关键数字 |
 |---|---|---|
@@ -92,6 +92,9 @@
 | P13 硬骨头攻坚 | 完成 | **I30 关闭**(同 session ABA:现树快于 pre-P8 栈 23–51%);**I33 修复验证并关闭分支**(密桶 1056 图零失败 + pad 回退,padding 税证实并消除 0.9 档 +14.7%→+2.3%,残余 AR 串行化 +4.7% 超门 → 段图定格单流开关);**I8 闭合**(冷缓存塌=chunk 粒度);**容量下界 1.070 req/s** |
 | P14 收官补测 | 完成 | `--prompt-seed-per-repeat` 根治暖缓存伪象;I12 exit 看门狗;**容量拐点 1.6–1.8×、硬饱和 ≈1.2 req/s**;1k 冷态 1.0 档 chunk-2048 过 TTFT 门(1.08–1.12 s);I29 官方线索(MCCL 混用,缓解非修复) |
 | P15 autotune + PD 分离 | 完成 | E1 kernel autotune 内核 **1.59–2.90×**(数值门 FAIL→默认不翻,opt-in);I29 新栈维持(init 楔+驱动级残留);**PD 分离单机双卡全闭环**:M1/M2 bitwise 交接 + **在线 A/B ITL p95 −16~25%、client e2e −41~48%**(吞吐换延迟,实测验证);新发现 I34(token 依赖引擎状态历史) |
+| P16–P18 隔夜轮(调度做足/KV 量化/PD) | 完成 | **统一混合批**混合步 −25%/−15%(opt-in);**KV LRU 淘汰**(两级 victim,默认开);**优先级调度**高优 TTFT **42.7×**;KV int8 容量 2.0×/数值方案待换;**PD Poisson 双档 POSITIVE**(0.79×/0.82×);30B E1 负结果闭合 |
+| P19–P21 收敛与整理 | 完成 | **I20 终判**(int8 三方案机制全对/质量门连续 FAIL——本模型 K/V 通道内动态范围 ~500× 超 int8 网格);P16-A 30B 证据(0.977+0 翻转);PD 前缀复用 **5.7×** + priority×PD 全链路 + PD OpenAI 端点;整理轮(目录树去 AI 味/过期文档清理/CLOSEOUT 遗留问题总账) |
+| P22 采样面对齐(vLLM/SGLang 服务层) | 完成 | **top_p/top_k/min_p + presence/frequency/repetition penalty + 引擎级 stop_token_ids + logprobs(top-k) + /v1/completions(流式+非流式)**;默认参数走逐字 legacy 路径(改造前基线 bitwise 全等);top_p 激活 TPOT +9.1%;API 冒烟 6/6 |
 
 正确性门:tiny TP1/TP2 × loop/grouped/bmm 六配置逐 token 全等;跨后端比较采用"候选确定性 + 五层等价门"(数值契约见 [docs/numerics-policy.md](docs/numerics-policy.md))。历史轮次报告(P0–P14)在 [benchmarks/archive/](benchmarks/archive/),当前轮在 [benchmarks/](benchmarks/)。
 

@@ -8,6 +8,7 @@
 |---|---|
 | 生产栈定型 | triton_paged + grouped_mm/bmm_dense + eager + stall_free + TP2/EP2;30B 双卡 100% SLO,在线 ≥1.07 req/s,离线 141.5 tok/s(b64) |
 | 调度/服务化 | stall_free + chunked prefill + 前缀缓存 + LRU 淘汰 + 优先级/SLO 分级(高优 TTFT 42.7×)+ host-sync 移除 + 统一混合批(混合步 −25%/−15%,opt-in) |
+| 采样/服务面(P22) | top_p/top_k/min_p + 三种 penalty + 引擎级 stop_token_ids + logprobs + /v1/completions(流式);默认参数逐字 legacy 路径(改造前基线 bitwise 全等),全 per-request opt-in |
 | PD 分离 | 单机双卡 1P1D 全链路:bitwise 交接 + 在线 A/B ITL p95 0.753×/0.839×;Poisson 双档 POSITIVE(0.79×/0.82×);P 侧前缀复用 5.7×;OpenAI 端点 |
 | 平台适配 | MUSA 全栈移植 + Triton-mtgpu 内核(paged/fused-moE)+ I28/I31/I34 等平台坑闭环 |
 
