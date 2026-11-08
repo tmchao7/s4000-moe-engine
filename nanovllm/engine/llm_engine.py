@@ -204,9 +204,9 @@ class LLMEngine:
         )
         num_tokens = batch.num_scheduled_tokens if mode != "decode" else -len(seqs)
         forward_start = perf_counter()
-        token_ids = self.model_runner.call("run", seqs, mode)
+        token_ids, logprobs = self.model_runner.call("run", seqs, mode)
         forward_elapsed = perf_counter() - forward_start
-        self.last_token_events = self.scheduler.postprocess(seqs, token_ids, mode)
+        self.last_token_events = self.scheduler.postprocess(seqs, token_ids, mode, logprobs)
         self.step_count += 1
         self.prefill_tokens_total += prefill_tokens
         self.decode_tokens_total += decode_tokens

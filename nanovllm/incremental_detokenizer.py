@@ -11,8 +11,8 @@ def _replace_none(tokens):
             tokens[index] = ""
 
 
-def _convert_prompt_ids_to_tokens(tokenizer, prompt_ids):
-    tokens = tokenizer.convert_ids_to_tokens(prompt_ids[-7:], skip_special_tokens=True)
+def _convert_prompt_ids_to_tokens(tokenizer, prompt_ids, skip_special_tokens=True):
+    tokens = tokenizer.convert_ids_to_tokens(prompt_ids[-7:], skip_special_tokens=skip_special_tokens)
     if isinstance(tokens, str):
         tokens = [tokens]
     _replace_none(tokens)
@@ -20,14 +20,15 @@ def _convert_prompt_ids_to_tokens(tokenizer, prompt_ids):
     return tokens, max(read_offset - 5, 0), read_offset
 
 
-def _detokenize_incrementally(tokenizer, token_ids, prev_tokens, prefix_offset, read_offset):
+def _detokenize_incrementally(tokenizer, token_ids, prev_tokens, prefix_offset, read_offset,
+                              skip_special_tokens=True):
     first = prev_tokens is None
     if first:
         prev_tokens, prefix_offset, read_offset = _convert_prompt_ids_to_tokens(
-            tokenizer, token_ids[:-1]
+            tokenizer, token_ids[:-1], skip_special_tokens
         )
     new_tokens = tokenizer.convert_ids_to_tokens(
-        [token_ids[-1]], skip_special_tokens=True
+        [token_ids[-1]], skip_special_tokens=skip_special_tokens
     )
     if isinstance(new_tokens, str):
         new_tokens = [new_tokens]
@@ -45,8 +46,9 @@ def _detokenize_incrementally(tokenizer, token_ids, prev_tokens, prefix_offset, 
 class IncrementalDetokenizer:
     """Decode only a bounded token suffix while preserving UTF-8 boundaries."""
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, skip_special_tokens=True):
         self.tokenizer = tokenizer
+        self.skip_special_tokens = skip_special_tokens
         self.token_ids = []
         self.tokens = None
         self.prefix_offset = 0
@@ -60,7 +62,8 @@ class IncrementalDetokenizer:
     def push(self, token_id: int) -> str:
         self.token_ids.append(token_id)
         if not self._supports_incremental:
-            decoded = self.tokenizer.decode(self.token_ids)
+            decoded = self.tokenizer.decode(
+                self.token_ids, skip_special_tokens=self.skip_special_tokens)
             delta = decoded[len(self.text):]
             self.text = decoded
             return delta
@@ -71,6 +74,7 @@ class IncrementalDetokenizer:
                 self.tokens,
                 self.prefix_offset,
                 self.read_offset,
+                self.skip_special_tokens,
             )
         )
         if self.tokens is None:

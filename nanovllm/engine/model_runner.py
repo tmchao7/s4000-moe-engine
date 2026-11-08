@@ -11,7 +11,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
-from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.sampler import Sampler, SampleMeta
 from nanovllm.profiling import DeviceProfiler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -394,7 +394,7 @@ class ModelRunner:
         """
         assert self.enforce_eager, "attention probe requires eager decode"
         input_ids, positions = self.prepare_decode(seqs)
-        temperatures, all_greedy = self.prepare_sample(seqs) if self.rank == 0 else (None, True)
+        temperatures, all_greedy, meta = self.prepare_sample(seqs) if self.rank == 0 else (None, True, None)
         context = get_context()
         slot_mapping = context.slot_mapping
         original_slots = self._snapshot_kv_slots(slot_mapping)
@@ -447,7 +447,8 @@ class ModelRunner:
                 diagnostics = self._logit_probe_summary(
                     baseline_logits, candidate_logits, baseline_layers, candidate_layers
                 )
-                token_ids = self.sampler(baseline_logits, temperatures, all_greedy).tolist()
+                sampled, _ = self.sampler(baseline_logits, temperatures, all_greedy, meta)
+                token_ids = sampled.tolist()
 
             self._restore_kv_slots(slot_mapping, baseline_slots)
             succeeded = True
@@ -812,13 +813,82 @@ class ModelRunner:
         )
         return input_ids, positions
 
+    def _build_sample_meta(self, seqs: list[Sequence]):
+        """P22-A: host-side knob collection; device tensors are built only
+        when a knob is active somewhere in the batch, and SampleMeta is None
+        entirely when everything is at its default — that None routes the
+        sampler through the verbatim pre-P22 path (bitwise no-op)."""
+        has_k = any(seq.top_k != -1 for seq in seqs)
+        has_p = any(seq.top_p < 1.0 for seq in seqs)
+        has_minp = any(seq.min_p > 0.0 for seq in seqs)
+        logprobs_k = max(seq.logprobs for seq in seqs)
+        penalty = None
+        if any(seq.has_penalty for seq in seqs):
+            rows, ids, counts, pre, fre, rep = [], [], [], [], [], []
+            for i, seq in enumerate(seqs):
+                rep_on = seq.repetition_penalty != 1.0
+                pf_on = seq.presence_penalty != 0.0 or seq.frequency_penalty != 0.0
+                if not (rep_on or pf_on):
+                    continue
+                # Union pair set: repetition sees prompt+generated (vLLM/HF);
+                # presence/frequency coefficients only ride pairs whose token
+                # was actually generated (OpenAI).
+                combined = dict(seq.ensure_rep_counts()) if rep_on else {}
+                if pf_on:
+                    for tid, c in seq.gen_counts.items():
+                        combined[tid] = combined.get(tid, 0) + c
+                for tid, c in combined.items():
+                    is_gen = tid in seq.gen_counts
+                    rows.append(i)
+                    ids.append(tid)
+                    counts.append(c)
+                    pre.append(seq.presence_penalty if is_gen else 0.0)
+                    fre.append(seq.frequency_penalty if is_gen else 0.0)
+                    rep.append(seq.repetition_penalty)
+            if rows:
+                penalty = tuple(
+                    torch.tensor(x, dtype=dtype, pin_memory=True).to(self.device, non_blocking=True)
+                    for x, dtype in ((rows, torch.int64), (ids, torch.int64),
+                                     (counts, torch.int32), (pre, torch.float32),
+                                     (fre, torch.float32), (rep, torch.float32)))
+        top_ps = top_ks = min_ps = None
+        if has_p:
+            top_ps = torch.tensor([seq.top_p for seq in seqs], dtype=torch.float32, pin_memory=True).to(self.device, non_blocking=True)
+        if has_k:
+            top_ks = torch.tensor([seq.top_k for seq in seqs], dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        if has_minp:
+            min_ps = torch.tensor([seq.min_p for seq in seqs], dtype=torch.float32, pin_memory=True).to(self.device, non_blocking=True)
+        if penalty is None and not has_k and not has_p and not has_minp and logprobs_k == 0:
+            return None
+        return SampleMeta(penalty=penalty, top_ps=top_ps, top_ks=top_ks,
+                          min_ps=min_ps, has_k=has_k, has_p=has_p,
+                          has_minp=has_minp, logprobs_k=logprobs_k)
+
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures_list = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures_list, dtype=torch.float32, pin_memory=True).to(self.device, non_blocking=True)
         # Host-side greedy decision: replaces the sampler's two bool() device
         # reads (2 host syncs per step).
         all_greedy = all(value < 1e-3 for value in temperatures_list) if _SYNC_FIX[0] else None
-        return temperatures, all_greedy
+        return temperatures, all_greedy, self._build_sample_meta(seqs)
+
+    def _sample_to_host(self, logits, temperatures, all_greedy, meta, seqs):
+        """Sampler + the step's single D2H sync; logprob rows are kept only
+        for sequences that asked for them."""
+        sampled, lp_t = self.sampler(logits, temperatures, all_greedy, meta)
+        token_ids = sampled.tolist()
+        if lp_t is None:
+            return token_ids, None
+        topv, topi, chosen = (tensor.tolist() for tensor in lp_t)
+        logprobs = []
+        for row, seq in enumerate(seqs):
+            if not seq.logprobs:
+                logprobs.append(None)
+                continue
+            k = seq.logprobs
+            logprobs.append({"top": list(zip(topi[row][:k], topv[row][:k])),
+                             "chosen": chosen[row]})
+        return token_ids, logprobs
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, mode: str):
@@ -857,36 +927,47 @@ class ModelRunner:
 
         Each part runs through its own prepare_* / run_model (the global
         context only holds one batch at a time), then tokens are re-assembled
-        in the scheduler's seqs order for postprocess.
+        in the scheduler's seqs order for postprocess.  Sampling knobs are
+        rebuilt per subgroup — rows keep their seqs order inside each part.
         """
         prefill_idx = [i for i, seq in enumerate(seqs) if seq.is_prefill]
         decode_idx = [i for i, seq in enumerate(seqs) if not seq.is_prefill]
         token_ids: list[int | None] = [None] * len(seqs)
+        logprobs: list = [None] * len(seqs)
         if prefill_idx:
-            input_ids, positions = self.prepare_prefill([seqs[i] for i in prefill_idx])
+            sub = [seqs[i] for i in prefill_idx]
+            input_ids, positions = self.prepare_prefill(sub)
             logits = self.run_model(input_ids, positions, "prefill")
             if self.rank == 0:
-                sampled = self.sampler(
-                    logits, temperatures[prefill_idx], all_greedy
-                ).tolist()
+                sampled, lp = self._sample_to_host(
+                    logits, temperatures[prefill_idx], all_greedy,
+                    self._build_sample_meta(sub), sub)
                 for row, index in enumerate(prefill_idx):
                     token_ids[index] = sampled[row]
+                    if lp is not None:
+                        logprobs[index] = lp[row]
         if decode_idx:
-            input_ids, positions = self.prepare_decode([seqs[i] for i in decode_idx])
+            sub = [seqs[i] for i in decode_idx]
+            input_ids, positions = self.prepare_decode(sub)
             logits = self.run_model(input_ids, positions, "decode")
             if self.rank == 0:
-                sampled = self.sampler(
-                    logits, temperatures[decode_idx], all_greedy
-                ).tolist()
+                sampled, lp = self._sample_to_host(
+                    logits, temperatures[decode_idx], all_greedy,
+                    self._build_sample_meta(sub), sub)
                 for row, index in enumerate(decode_idx):
                     token_ids[index] = sampled[row]
+                    if lp is not None:
+                        logprobs[index] = lp[row]
         reset_context()
-        return token_ids
+        return token_ids, logprobs
 
     @torch.inference_mode()
-    def run(self, seqs: list[Sequence], mode: str) -> list[int]:
+    def run(self, seqs: list[Sequence], mode: str) -> tuple[list[int], list | None]:
         with self.profiler.range("runner.prepare", mode=mode):
-            temperatures, all_greedy = self.prepare_sample(seqs) if self.rank == 0 else (None, True)
+            if self.rank == 0:
+                temperatures, all_greedy, meta = self.prepare_sample(seqs)
+            else:
+                temperatures, all_greedy, meta = None, True, None
             unified = False
             if mode == "mixed" and self._mixed_unified:
                 try:
@@ -903,9 +984,12 @@ class ModelRunner:
         with self.profiler.range("runner.forward", mode=mode):
             logits = self.run_model(input_ids, positions, mode)
         with self.profiler.range("runner.sample", mode=mode):
-            token_ids = self.sampler(logits, temperatures, all_greedy).tolist() if self.rank == 0 else None
+            if self.rank == 0:
+                token_ids, logprobs = self._sample_to_host(logits, temperatures, all_greedy, meta, seqs)
+            else:
+                token_ids, logprobs = None, None
         reset_context()
-        return token_ids
+        return token_ids, logprobs
 
     def _segment_layers(self):
         return self.model.model.layers

@@ -292,9 +292,10 @@ class Scheduler:
             "scheduler_kv_admission_skips_total": self.kv_admission_skips_total,
         }
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], mode: str):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int], mode: str,
+                    logprobs: list | None = None):
         token_events = []
-        for seq, token_id in zip(seqs, token_ids):
+        for row, (seq, token_id) in enumerate(zip(seqs, token_ids)):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
@@ -304,11 +305,14 @@ class Scheduler:
             now = perf_counter()
             seq.record_token(now)
             hit_eos = not seq.ignore_eos and token_id == self.eos
+            # P22-A: per-request stop token ids fire regardless of ignore_eos
+            # (vLLM semantics — only the model eos is gated by ignore_eos).
+            hit_stop_id = token_id in seq.stop_token_ids
             hit_length = seq.num_completion_tokens == seq.max_tokens
-            if hit_eos or hit_length:
+            if hit_eos or hit_stop_id or hit_length:
                 seq.status = SequenceStatus.FINISHED
                 seq.finish_time = now
-                seq.finish_reason = "stop" if hit_eos else "length"
+                seq.finish_reason = "stop" if (hit_eos or hit_stop_id) else "length"
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
             token_events.append((
@@ -316,5 +320,6 @@ class Scheduler:
                 token_id,
                 seq.is_finished,
                 seq.metrics() if seq.is_finished else None,
+                logprobs[row] if logprobs is not None else None,
             ))
         return token_events

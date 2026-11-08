@@ -17,6 +17,8 @@ class TokenEvent:
     cancelled: bool = False
     metrics: dict | None = None
     error: str | None = None
+    # P22-A: {"top": [(token_id, logprob), ...], "chosen": float} or None
+    logprobs: dict | None = None
 
 
 @dataclass(slots=True)
@@ -192,11 +194,12 @@ class AsyncLLMEngine:
                 self.prometheus.active.set(0)
                 continue
 
-            for seq_id, token_id, finished, metrics in self.engine.last_token_events:
+            for seq_id, token_id, finished, metrics, logprobs in self.engine.last_token_events:
                 events = self.handles.get(seq_id)
                 if events is None:
                     continue
-                events.put(TokenEvent(token_id=token_id, finished=finished, metrics=metrics))
+                events.put(TokenEvent(token_id=token_id, finished=finished,
+                                      metrics=metrics, logprobs=logprobs))
                 self._bump(generated_tokens_total=1)
                 self.prometheus.generated_tokens.inc()
                 if finished:

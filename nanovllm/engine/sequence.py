@@ -1,3 +1,4 @@
+from collections import Counter
 from copy import copy
 from enum import Enum, auto
 from itertools import count
@@ -31,6 +32,23 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.priority = sampling_params.priority
+        # P22-A sampling face.  The knob attributes are read on the driver
+        # (rank 0) only — prepare_sample/postprocess never run on TP workers,
+        # so __getstate__ stays untouched.
+        self.top_p = sampling_params.top_p
+        self.top_k = sampling_params.top_k
+        self.min_p = sampling_params.min_p
+        self.presence_penalty = sampling_params.presence_penalty
+        self.frequency_penalty = sampling_params.frequency_penalty
+        self.repetition_penalty = sampling_params.repetition_penalty
+        self.logprobs = sampling_params.logprobs or 0
+        self.stop_token_ids = sampling_params.stop_token_ids or ()
+        # Penalties need token statistics: gen_counts (generated only) drives
+        # presence/frequency (OpenAI semantics); rep_counts (prompt+generated)
+        # drives repetition_penalty (vLLM/HF semantics), built lazily because
+        # PD handoffs set num_prompt_tokens after construction.
+        self.gen_counts = {}
+        self.rep_counts = None
         self.arrival_time = perf_counter()
         self.first_scheduled_time = None
         self.first_token_time = None
@@ -66,6 +84,20 @@ class Sequence:
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property
+    def has_penalty(self):
+        return (self.presence_penalty != 0.0 or self.frequency_penalty != 0.0
+                or self.repetition_penalty != 1.0)
+
+    def ensure_rep_counts(self):
+        """Prompt+generated token counts for repetition_penalty (vLLM/HF
+        semantics: the penalty sees prompt tokens too).  Lazy so PD handoffs
+        that fix num_prompt_tokens post-construction stay correct; updated
+        incrementally in append_token afterwards."""
+        if self.rep_counts is None:
+            self.rep_counts = dict(Counter(self.prompt_token_ids))
+        return self.rep_counts
+
+    @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
@@ -77,6 +109,9 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+        self.gen_counts[token_id] = self.gen_counts.get(token_id, 0) + 1
+        if self.rep_counts is not None:
+            self.rep_counts[token_id] = self.rep_counts.get(token_id, 0) + 1
 
     def record_token(self, timestamp: float):
         if self.first_token_time is None:
