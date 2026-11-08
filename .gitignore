@@ -210,3 +210,6 @@ AGENTS.md
 
 # 验收交接提示词(本地,不入库)
 docs/PROMPT-*.md
+
+# 验收报告(本地,不入库;由验收 Agent 产出)
+docs/ACCEPTANCE-*.md
