@@ -17,6 +17,13 @@ import struct
 
 import torch
 
+from nanovllm.utils.compat import accelerator
+
+
+def _sync():
+    """Device synchronize via the compat mirror (torch.musa / torch.cuda)."""
+    accelerator().synchronize()
+
 
 class KVBlockBuffer:
     """Pinned CPU staging for N whole KV blocks.
@@ -90,13 +97,13 @@ class LocalKVChannel:
     def send(self, block_table: list[int]) -> KVBlockBuffer:
         buf = KVBlockBuffer.from_pool(self.kv_cache, len(block_table))
         extract_kv(self.kv_cache, block_table, buf)
-        torch.musa.synchronize()
+        _sync()
         self.bytes_moved += buf.nbytes
         return buf
 
     def recv(self, block_table: list[int], buf: KVBlockBuffer) -> None:
         import_kv(self.kv_cache, block_table, buf)
-        torch.musa.synchronize()
+        _sync()
         self.bytes_moved += buf.nbytes
 
 
@@ -131,7 +138,7 @@ class TcpKVChannel:
         n = len(block_table)
         assert n <= self.buf.n_blocks
         extract_kv(self.kv_cache, block_table, self.buf)
-        torch.musa.synchronize()
+        _sync()
         k_bytes = _tensor_to_bytes(self.buf.k[:n])
         v_bytes = _tensor_to_bytes(self.buf.v[:n])
         # the peer reads non-blocking (assembler) but sendall needs blocking:
@@ -157,7 +164,7 @@ class TcpKVChannel:
         self.buf.k[:n] = _bytes_to_tensor(k_data, shape, self.buf.k.dtype)
         self.buf.v[:n] = _bytes_to_tensor(v_data, shape, self.buf.v.dtype)
         import_kv(self.kv_cache, block_table, self.buf)
-        torch.musa.synchronize()
+        _sync()
         self.bytes_moved += k_len + v_len
 
     def _recv_exact(self, n: int) -> bytes:

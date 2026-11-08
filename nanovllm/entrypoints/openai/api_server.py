@@ -125,8 +125,11 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise HTTPException(400, "messages must be a non-empty list")
-        max_tokens = int(body.get("max_tokens", 64))
-        temperature = float(body.get("temperature", 1.0))
+        try:
+            max_tokens = int(body.get("max_tokens", 64))
+            temperature = float(body.get("temperature", 1.0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "max_tokens/temperature must be numbers")
         # P22-A: top_p/top_k/min_p/penalties/stop_token_ids/logprobs ride
         # through; SamplingParams validation failures map to 400 below.
         sampling_kwargs = _parse_sampling_kwargs(body, HTTPException, logprobs_int=False)
@@ -348,8 +351,13 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
             raise HTTPException(400, "prompt must be a string or a list of token ids")
         if not prompt_ids:
             raise HTTPException(400, "prompt produced an empty token list")
-        max_tokens = int(body.get("max_tokens", 64))
-        temperature = float(body.get("temperature", 1.0))
+        max_tokens = body.get("max_tokens", 64)
+        temperature = body.get("temperature", 1.0)
+        try:
+            max_tokens = int(max_tokens)
+            temperature = float(temperature)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "max_tokens/temperature must be numbers")
         try:
             priority = int(body.get("priority", 0))
         except (TypeError, ValueError):
@@ -552,6 +560,13 @@ def main():
         help="production default keeps decode eager; --no-enforce-eager enables "
              "the segment-graph decode path (requires NANOVLLM_SEGMENT_GRAPH=1, I29)",
     )
+    parser.add_argument(
+        "--scheduler-overlap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="P23 one-batch-in-flight overlap pipeline (opt-in; bitwise-gated "
+             "vs serial, see benchmarks/P23-overlap.md)",
+    )
     args = parser.parse_args()
 
     if os.environ.get("NANOVLLM_TRACE_INIT") == "1":
@@ -578,6 +593,7 @@ def main():
         max_queue_size=args.max_queue_size,
         max_model_len=args.max_model_len,
         enforce_eager=args.enforce_eager,
+        scheduler_overlap=args.scheduler_overlap,
         **({"max_num_seqs": args.max_num_seqs} if args.max_num_seqs is not None else {}),
     )
     model_name = args.served_model_name or args.model.rstrip("/").rsplit("/", 1)[-1]
