@@ -207,3 +207,6 @@ AGENTS.md
 # AI agent 工具目录(本地)
 .claude/
 .aider*
+
+# 验收交接提示词(本地,不入库)
+docs/PROMPT-*.md
