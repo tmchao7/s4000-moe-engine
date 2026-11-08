@@ -86,7 +86,7 @@ candidate_deterministic: False (门 =True)
 ## 6. 复现
 
 ```bash
-ssh -f -n -p 28036 root@connect.sha1.seetacloud.com \
+ssh -f -n -p <redacted-port> root@<redacted-host> \
  'cd /root/moe-server-s4000 && setsid nohup env PYTHONPATH=/root/moe-server-s4000 \
   python3 scripts/p5_attention_ab.py --workloads 16x512,32x512,16x2048,32x2048 \
     --output-len 32 --repeats 3 --attention-backends sdpa,triton_paged \

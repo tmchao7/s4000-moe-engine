@@ -41,7 +41,7 @@
 
 ```bash
 cd /root/moe-server-s4000 && export PYTHONPATH=/root/moe-server-s4000
-MODEL=/root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8
+MODEL=/data/models/Qwen3-30B-A3B-Instruct-2507-FP8
 python3 -m nanovllm.entrypoints.openai.api_server --model "$MODEL" \
   --served-model-name qwen3-30b-a3b --host 127.0.0.1 --port 8000 \
   --scheduler-policy stall_free --decode-moe-backend bmm_dense > /root/p6_server.log 2>&1 &

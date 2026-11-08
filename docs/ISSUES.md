@@ -226,7 +226,7 @@
 | I10 | 回归脚本 rc 语义已修：graph 段改 `--with-graph` opt-in，六配置全等门单独决定 rc | commit `91e3fd3` |
 | I11 | graph A/B verify 加硬 watchdog（`--verify-watchdog-s`，超时打印卡点并 `os._exit(97)`） | commit `91e3fd3` |
 | I13 | `benchmark_online.py` fraction 断言放宽为 `>0`（乘数语义，可 >1） | commit `91e3fd3` |
-| I15 | 本地 ssh 别名 `s4000b` 端口 18484→28036 且改用已装的 `id_ed25519` | commit `91e3fd3` |
+| I15 | 本地 ssh 别名 `s4000b` 端口变更并固定密钥(连接细节只在本地维护) | commit `91e3fd3` |
 
 ---
 

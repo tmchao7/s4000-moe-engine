@@ -51,7 +51,7 @@
 **臂 B'(生产栈 + maxseq64 + 段图)**:init 全绿——**768 图/rank 捕获零失败(桶 [1,2,4,8,16,32,48,64]),捕获耗时 5.2 s,KV 723 blocks/rank(auto),捕获后 allocated 37.06 GiB(P11 口径 37.14,一致)**;api_server 首次以段图形态通过 30B 加载。在线矩阵(同一服务,后接饱和 bracketed 串行链,detached)。
 - 失联前实测(01:12 启动,01:35 最后观测):0.5 档 ×3 + 0.75 档 rep1 = **128/128 ok,SLO 100%/100%**,服务端日志零 Traceback/illegal。
 
-**🔴 基础设施中断(07:35 CST 发现,08:12 恢复)**:本地→服务器 ssh 全部 `Permission denied (publickey,password)`;verbose 显示 **server accepts key 后 final auth 拒绝**(host key 未变 = 同一实例,uptime 5d20h 未重启,端口 TCP 可达)。本地侧无法修复,**用户在 08:10 提供实例密码**,经 expect 密码通道重建 ssh ControlMaster 后恢复(key 通道至收口仍未修复,密码登录可用)。失联期间 detached 压测链自行完成并落盘(见下),未损失数据。
+**🔴 基础设施中断(07:35 CST 发现,08:12 恢复)**:本地→服务器 ssh 全部 `Permission denied (publickey,password)`;verbose 显示 **server accepts key 后 final auth 拒绝**(host key 未变 = 同一实例,uptime 5d20h 未重启,端口 TCP 可达)。本地侧无法修复,改用平台控制台的临时凭据通道重建 ssh 会话后恢复(key 通道至收口仍未修复,密码登录可用)。失联期间 detached 压测链自行完成并落盘(见下),未损失数据。
 
 ### 最终数据(P12 收口)
 

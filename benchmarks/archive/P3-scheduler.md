@@ -56,7 +56,7 @@
 ```bash
 # 服务（换 --scheduler-policy fcfs 得到基线）
 PYTHONPATH=. python3 -m nanovllm.entrypoints.openai.api_server \
-  --model /root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8 \
+  --model /data/models/Qwen3-30B-A3B-Instruct-2507-FP8 \
   --served-model-name qwen3-30b-a3b --scheduler-policy stall_free
 
 # 压测

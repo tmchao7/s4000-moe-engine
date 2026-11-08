@@ -5,13 +5,13 @@
 
 ## 0. 三十秒状态
 
-- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;**HEAD 领先 origin 25 个本地 commit(P19–P25,待用户审后 push)**。
+- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;**origin 已同步(P19–P25 已上远端;增量以 `git log --oneline origin/main..HEAD` 为准)**。
 - **P25-B 整理轮(11-08,本轮)**:目录树再收敛——**归档 13 个已判轮次的一次性脚本**(probe_p23b/c、p16d_30b_e1、p20_30b_flip、p22/p24_30b_final、p16_mixed_gate/online、p18_pd_poisson、p21_pd_openai/priority、p8_l3_serve、profile_experts → `scripts/archive/`,git mv 保留历史)+ **5 份已判报告**(P15/P16×2/P17/P19 → `benchmarks/archive/`,PLAN/ISSUES 9 处引用修链,README archive 范围改 P0–P21)+ 删上游遗留 `bench.py`。**引擎死代码 -357 行**:capacity-shrink 整路径(P8 判不采用,唯一调用者 p8_moe_30b 已归档,P17 遗留的保留理由消失)、expert-stats 家族(P3.1/P8-moe 调查已闭,profile_experts 归档)、`probe_attention_backends` 四方法(唯一调用者 p6_attention_logits 已归档);config 删 `collect_expert_stats` 字段。**保留的运行时开关均按 P17 先例核对过判决依据**(_SYNC_FIX/_MIXED_SPLIT/_MIXED_UNIFIED/LRU_EVICT/SEG_*/PAGED_CONFIG 等)。回归四套+p23+p25 全绿(0.6B 窗口);tests/p5_decide.py 经核实为冻结门边界测试(活)不归档。
-- **P25 修复轮(11-08,本轮)**:**P25 评审轮**(`docs/P25-proposal-and-career-review.md`:深度代码审查 + 2026-11 竞品比对 + 求职定位评估)发现两个 P23 缺陷并**当日修复**:① **I37 投机预检查逐序列不累计**——`Σneed > free` 且逐个 `need ≤ free` 时 `may_append_at` 跑穿 free list IndexError;修复 = `BlockManager.total_launch_shortfall` 累计门(超 free 整批 defer;fcfs/stall_free 两处同改)。② **I38 运行时关 overlap 丢弃已排投机批**——投机 schedule 的块分配 stranded → `len(table)==ceil(len/bs)` 不变式破坏 → KV 写偏一块静默坏输出;修复 = disable 改**排空式收尾**(在飞批照常 collect、parked 批照常 launch、仅停尾部投机调度,≤2 步排空),`NANOVLLM_OVERLAP_NO_SPEC` 同族改门控。**产品化**:api_server 补 `--scheduler-overlap` CLI(此前主线特性从服务端入口够不着)+ 畸形 max_tokens/temperature 改 400 + kv_channel 去 torch.musa 硬编码 + config 断言 `max_num_seqs ≤ max_num_batched_tokens`(F3)。**验证全绿(0.6B tiny,一次窗口)**:repro rc=0(F1 门);`tests/p25_overlap_fix.py` 三门(t1 中途 disable 排空 bitwise / t2 翻转窗 ABA bitwise 跨 768 边界 / t3 KV 压力 12/12 defers=3);p23 五门回归数字与原判决一致(t3 0.347%/t4 pre=3/t5 b1 0.9813);四套标准回归 + pytest 28 全过;生产默认零变更。
+- **P25 修复轮(11-08,本轮)**:**P25 评审轮**(`docs/P25-review.md`:深度代码审查 + 2026-11 竞品比对)发现两个 P23 缺陷并**当日修复**:① **I37 投机预检查逐序列不累计**——`Σneed > free` 且逐个 `need ≤ free` 时 `may_append_at` 跑穿 free list IndexError;修复 = `BlockManager.total_launch_shortfall` 累计门(超 free 整批 defer;fcfs/stall_free 两处同改)。② **I38 运行时关 overlap 丢弃已排投机批**——投机 schedule 的块分配 stranded → `len(table)==ceil(len/bs)` 不变式破坏 → KV 写偏一块静默坏输出;修复 = disable 改**排空式收尾**(在飞批照常 collect、parked 批照常 launch、仅停尾部投机调度,≤2 步排空),`NANOVLLM_OVERLAP_NO_SPEC` 同族改门控。**产品化**:api_server 补 `--scheduler-overlap` CLI(此前主线特性从服务端入口够不着)+ 畸形 max_tokens/temperature 改 400 + kv_channel 去 torch.musa 硬编码 + config 断言 `max_num_seqs ≤ max_num_batched_tokens`(F3)。**验证全绿(0.6B tiny,一次窗口)**:repro rc=0(F1 门);`tests/p25_overlap_fix.py` 三门(t1 中途 disable 排空 bitwise / t2 翻转窗 ABA bitwise 跨 768 边界 / t3 KV 压力 12/12 defers=3);p23 五门回归数字与原判决一致(t3 0.347%/t4 pre=3/t5 b1 0.9813);四套标准回归 + pytest 28 全过;生产默认零变更。
 - **P23(11-08)**:**overlap scheduler 落地**(opt-in `scheduler_overlap=True`,运行时 `set_scheduler_overlap`):SGLang 单飞流水线 collect→postprocess→launch(先剪行)→投机调度;**稳态输出与串行逐位全等**(greedy+采样同种子,0.6B/30B 双档 bitwise),错峰翻转 0.347%≤0.5%,抢占场景 12/12 完成,b1/b16 步时 0.997×。**I36 根因自查自修**:投机 decode 行 launch 前被追加 1 token,`len%256==1` 块边界判断差一块 → block_table 缺块 → slot 越界写 + kernel 越界读 → MUSA 提交路径卡死(曾误判厂商类,E1/E5 判别实验定位为本方 bug);修复=按 launch 时刻长度做块覆盖检查(`can_append_at/may_append_at`)。报告 benchmarks/P23-overlap.md。
 - **P24(11-08,本轮)**:**结构化输出落地**(xgrammar 0.2.7,per-request opt-in):`guided_json`/`guided_regex`/`response_format json_schema`;位掩码 torch 算子上 MUSA,与官方 CPU apply **支撑集逐位一致**;四 schema 16/16 合法+grammar 终止;约束开销 1.028×≤1.10;API 冒烟 8/8。报告 benchmarks/P24-guided.md。
 - **P22(11-08)**:采样面补齐(top_p/top_k/min_p/三 penalty/stop_token_ids/logprobs//v1/completions)+ 三个真 bug 专责回归(b1 混合分路 None 崩溃/b2 detokenizer/b3 采样器 fp32 别名)。
-- **服务器**:seetacloud `s4000`;收官时双卡 0 MiB、无进程、shm 干净;本轮回归 10 套全绿(四套+p16×3+p17+p22×2+p23)。
+- **服务器**:租用双卡 GPU 实例(ssh 别名 `s4000`,连接信息本地维护);收官时双卡 0 MiB、无进程、shm 干净;本轮回归 10 套全绿(四套+p16×3+p17+p22×2+p23)。
 - **生产栈(一个默认没动)**:`triton_paged` + `grouped_mm`/`bmm_dense` + eager + `stall_free` + TP2/EP2 + chunk-256。新特性全部 opt-in。
 - **I29 红线(用户明令)**:不跑 graph replay 类实验。
 
@@ -37,7 +37,7 @@
 
 | 优先 | 项 | 说明 |
 |---|---|---|
-| 1 | ~~用户审本地 commit → push~~ **✅ 已完成(11-08)** | origin = ae4e055,P19–P25 全部上远端;求职视角的公开仓库入口已激活 |
+| 1 | ~~用户审本地 commit → push~~ **✅ 已完成(11-08)** | origin = ae4e055,P19–P25 全部上远端;公开仓库入口已激活 |
 | 2 | overlap 在线口径补测 | 离线门全过 + CLI 已补;在线 benchmark_online(错峰到达+长队列)下 schedule/prepare 收益更大,补 p95/吞吐对照(同引擎 A/B 运行时开关) |
 | 3 | xgrammar 补全 | `json_object`(builtin grammar)/`guided_choice`;约束行多时 bitmask 展开可下沉 triton-mtgpu 内核 |
 | 4 | 量化路径立项(P25 报告 R3) | 平台 fp8 no-op → int8 weight-only 加载 + 运行时反量化(或 W4A16);招聘视角最大功能缺口;先显微探针验 MUSA int8 bmm 数值 |

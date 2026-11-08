@@ -3,8 +3,8 @@
 - 日期:2026-10-29
 - 状态:**调研完成,待评审**。本文档是独立调研件,不属于 AGENTS.md 文档地图的 5 个活文档;若立项,再按仓库流程转为轮次任务书。
 - 关联仓库:
-  - 参考实现 `/Users/tmchao7/repos/02_personal/nanoPD`(下称 nanoPD,从零实现的 PD 分离引擎,CUDA/单机多卡)
-  - 本引擎 `/Users/tmchao7/repos/02_personal/moe-server-s4000`(下称 musa-nano-vllm,MUSA/双 S4000 TP2)
+  - 参考实现 `<local-repo>/nanoPD`(下称 nanoPD,从零实现的 PD 分离引擎,CUDA/单机多卡)
+  - 本引擎 `<local-repo>/moe-server-s4000`(下称 musa-nano-vllm,MUSA/双 S4000 TP2)
 - 证据分级:【官方文档】【代码确认】【论文】【媒体/论坛】【推算】。全部外链见 §11。
 
 ---

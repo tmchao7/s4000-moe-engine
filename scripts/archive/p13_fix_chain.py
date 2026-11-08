@@ -23,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path('/root/moe-server-s4000')
 DATA = Path('/root/p13_data')
-MODEL = '/root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8'
+MODEL = '/data/models/Qwen3-30B-A3B-Instruct-2507-FP8'
 PY = '/usr/bin/python3'
 CHILDREN = {}
 DEADLINE = 0
@@ -173,7 +173,7 @@ def main():
                 run('fix_tiny_smoke', [PY, 'tests/p13_segment_fix_smoke.py'], timeout=1500)
                 # Phase 2: 0.6B tokens/steps with dense+fallback vs eager reference.
                 batches = '6,8,9,12,15,16,17,20,24,32'
-                common = ['--model', '/root/autodl-tmp/models/Qwen3-0.6B', '--dense',
+                common = ['--model', '/data/models/Qwen3-0.6B', '--dense',
                           '--batches', batches, '--rounds', '3',
                           '--prompt-tokens', '128', '--decode-tokens', '80']
                 for i in (1, 2):

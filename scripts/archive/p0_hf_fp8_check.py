@@ -4,7 +4,7 @@ transformers should dequantize the FP8 (e4m3 + block scale) weights at load
 time. Produces greedy-decode reference outputs on fixed prompts, saved to
 /root/p0_hf_reference.json — the correctness target for our own engine (P2).
 
-    python3 /root/p0_hf_fp8_check.py --model /root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8
+    python3 /root/p0_hf_fp8_check.py --model /data/models/Qwen3-30B-A3B-Instruct-2507-FP8
 
 If loading fails (missing torchao etc.), the error is recorded instead —
 that is itself a documented P0 finding.
@@ -21,7 +21,7 @@ MODEL_PROMPTS = [
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="/root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8")
+    ap.add_argument("--model", default="/data/models/Qwen3-30B-A3B-Instruct-2507-FP8")
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--tp", type=int, default=1, choices=[1, 2])
     args = ap.parse_args()

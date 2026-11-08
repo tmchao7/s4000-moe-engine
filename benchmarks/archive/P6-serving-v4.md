@@ -77,7 +77,7 @@
 
 ```bash
 cd /root/moe-server-s4000 && export PYTHONPATH=/root/moe-server-s4000
-MODEL=/root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8
+MODEL=/data/models/Qwen3-30B-A3B-Instruct-2507-FP8
 # 本轮用显式 flag；转正后同一命令可省略 --attention-backend（默认已是 triton_paged）
 python3 -m nanovllm.entrypoints.openai.api_server --model "$MODEL" \
   --served-model-name qwen3-30b-a3b --host 127.0.0.1 --port 8000 \

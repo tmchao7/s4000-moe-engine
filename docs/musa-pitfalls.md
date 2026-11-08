@@ -19,7 +19,7 @@
 
 ## 2. GPU 软件栈可用性（实测）
 
-> 2026-11-07 换新 seetacloud 实例（ssh 别名 `s4000`，AutoDL 容器，Ubuntu 22.04，driver 5.2.0-server）后全套重测通过：torch 2.11.0.post1 + torch_musa 2.11.0.post1 + triton 3.2.0（mtgpu）+ transformers 5.13.0。四套单测全过 + 30B TP2 生产栈加载/生成冒烟通过。旧实例的"未测组件"结论以新栈为准重验。
+> 2026-11-07 换新租用 GPU 容器实例（ssh 别名 `s4000`，Ubuntu 22.04，driver 5.2.0-server）后全套重测通过：torch 2.11.0.post1 + torch_musa 2.11.0.post1 + triton 3.2.0（mtgpu）+ transformers 5.13.0。四套单测全过 + 30B TP2 生产栈加载/生成冒烟通过。旧实例的"未测组件"结论以新栈为准重验。
 >
 > **torch_musa 2.11 分配器行为差异**：`llm.exit()` 后 caching allocator 仍攥着 reserved 段（21 GB 级）不还给驱动，同进程连续构建第二个 LLM 时 `allocate_kv_cache` 的设备级 used 核算会误判 → 已在 `ModelRunner.exit()` 修复（drop model/kv_cache + `gc.collect()` + `empty_cache()`，见 model_runner.py）。p2/p6 六配置连跑依赖此修复。
 >
@@ -61,7 +61,7 @@
 ## 5. 运维杂项
 
 - **`pkill -f` 自匹配**：`ssh host 'pkill -f foo'` 时，远端 shell 的命令行本身含 `foo`，pkill 会把自己的会话杀掉 → ssh 报 `Connection closed`。解法：正则括号技巧 `pkill -f "fo[o]"`。
-- **AutoDL 中继 ssh/scp 不稳定**：scp 大概率闪断（`Connection closed by ... port 28036`）。小文件用 `ssh host 'cat > path' < local_file` 传（实测稳定）；长任务用 `setsid nohup ... &` 完全脱离会话，ssh 断了不影响。
+- **容器中继 ssh/scp 不稳定**：scp 大概率闪断（`Connection closed`）。小文件用 `ssh host 'cat > path' < local_file` 传（实测稳定）；长任务用 `setsid nohup ... &` 完全脱离会话，ssh 断了不影响。
 - **磁盘布局**：系统盘 30G（几乎全空，放 Qwen3-8B）+ 数据盘 50G（放 FP8 checkpoint），合计 80G；该实例数据盘不支持扩容。
 
 ## 6. 性能基线速查

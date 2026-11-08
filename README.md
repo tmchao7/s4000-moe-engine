@@ -137,7 +137,7 @@ pip install -e '.[serve]'
 # 生产栈必须显式带 --decode-moe-backend bmm_dense:该参数默认跟随 --moe-backend(grouped_mm),
 # 漏掉则 decode 跑在 grouped_mm 上,不是本项目的生产配置(见 docs/ISSUES.md I32)。
 PYTHONPATH=. python3 -m nanovllm.entrypoints.openai.api_server \
-  --model /root/autodl-tmp/models/Qwen3-30B-A3B-Instruct-2507-FP8 \
+  --model /data/models/Qwen3-30B-A3B-Instruct-2507-FP8 \
   --served-model-name qwen3-30b-a3b --scheduler-policy stall_free \
   --decode-moe-backend bmm_dense
 

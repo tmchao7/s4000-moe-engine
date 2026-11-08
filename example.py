@@ -4,7 +4,7 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.environ.get("NANOVLLM_MODEL", "/root/autodl-tmp/models/Qwen3-0.6B")
+    path = os.environ.get("NANOVLLM_MODEL", "/data/models/Qwen3-0.6B")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
