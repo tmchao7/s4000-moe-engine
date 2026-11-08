@@ -97,7 +97,7 @@
 
 | # | 项 | 内容与理由 | 门(草案) | 预估 |
 |---|---|---|---|---|
-| R0 | **push + 文档刷新** | 用户审 20 commit 后 push;刷新 engine-vs-vllm-sglang.md 能力矩阵(F5) | 无(纯整理) | 0.5h |
+| R0 | **push + 文档刷新** | **✅ 已完成(11-08)**:用户授权 push(origin = ae4e055,P19–P25 上远端);engine-vs-vllm-sglang.md 矩阵已刷新(F5) | 无(纯整理) | ✅ |
 | R1 | **F1/F2 修复 + 回归** | **✅ 已完成(P25 修复轮)**:投机预检查累计化(`BlockManager.total_launch_shortfall`)+ overlap disable 排空式收尾 + NO_SPEC 门控化;`tests/p25_review_repro.py` 转为修复验证(rc=0),新增 `tests/p25_overlap_fix.py`(t1 drain bitwise/t2 翻转 ABA bitwise/t3 压力完成);台账 ISSUES I36/I37/I38 | ①repro rc=0 ✓ ②p25 三门 ✓ ③四套回归+p23 全套 ✓(见测试链日志) | ✅ |
 | R2 | **overlap 服务端产品化** | **✅ CLI 已补**(`--scheduler-overlap`,api_server 透传);在线口径补测(HANDOFF Top-N #2:错峰+长队列 p95/吞吐对照)待下一轮 GPU 窗口 | 同 P23 门族;在线 A/B 补 p95 | CLI ✅ / 在线补测待排 |
 | R3 | **量化路径立项(最大功能缺口)** | 平台 fp8 no-op → 做可行的那条:**int8 weight-only 加载 + 运行时反量化**(W4A16/AWQ 亦可),或 SmoothQuant 式 W8A8(先显微探针验 MUSA int8 bmm 数值);同时产出《为什么 MUSA 上 fp8/投机不可行》深挖文档(零 GPU 成本,面试叙事) | 预注册:①加载与 bf16 参考 LCP 翻转 ≤0.5% ②吞吐损失 ≤15% ③显存 ≤60% ④四套单测 | 1–2 轮 |

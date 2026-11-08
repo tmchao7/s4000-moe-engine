@@ -37,7 +37,7 @@
 
 | 优先 | 项 | 说明 |
 |---|---|---|
-| 1 | **用户审本地 commit → push** | 23 个本地 commit(`git log --oneline origin/main..HEAD`),远端未动;**求职视角这是最高 ROI 的一步**(P25 报告 §4.1) |
+| 1 | ~~用户审本地 commit → push~~ **✅ 已完成(11-08)** | origin = ae4e055,P19–P25 全部上远端;求职视角的公开仓库入口已激活 |
 | 2 | overlap 在线口径补测 | 离线门全过 + CLI 已补;在线 benchmark_online(错峰到达+长队列)下 schedule/prepare 收益更大,补 p95/吞吐对照(同引擎 A/B 运行时开关) |
 | 3 | xgrammar 补全 | `json_object`(builtin grammar)/`guided_choice`;约束行多时 bitmask 展开可下沉 triton-mtgpu 内核 |
 | 4 | 量化路径立项(P25 报告 R3) | 平台 fp8 no-op → int8 weight-only 加载 + 运行时反量化(或 W4A16);招聘视角最大功能缺口;先显微探针验 MUSA int8 bmm 数值 |
