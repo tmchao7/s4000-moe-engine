@@ -5,8 +5,9 @@
 
 ## 0. 三十秒状态
 
-- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;**HEAD 领先 origin 18 个本地 commit(隔夜轮+P19–P24,待用户审后 push)**。
-- **P23(11-08,本轮)**:**overlap scheduler 落地**(opt-in `scheduler_overlap=True`,运行时 `set_scheduler_overlap`):SGLang 单飞流水线 collect→postprocess→launch(先剪行)→投机调度;**稳态输出与串行逐位全等**(greedy+采样同种子,0.6B/30B 双档 bitwise),错峰翻转 0.347%≤0.5%,抢占场景 12/12 完成,b1/b16 步时 0.997×。**I36 根因自查自修**:投机 decode 行 launch 前被追加 1 token,`len%256==1` 块边界判断差一块 → block_table 缺块 → slot 越界写 + kernel 越界读 → MUSA 提交路径卡死(曾误判厂商类,E1/E5 判别实验定位为本方 bug);修复=按 launch 时刻长度做块覆盖检查(`can_append_at/may_append_at`)。报告 benchmarks/P23-overlap.md。
+- **仓库**:`tmchao7/s4000-moe-engine`,仅 main;**HEAD 领先 origin 23 个本地 commit(P19–P25,待用户审后 push)**。
+- **P25 修复轮(11-08,本轮)**:**P25 评审轮**(`docs/P25-proposal-and-career-review.md`:深度代码审查 + 2026-11 竞品比对 + 求职定位评估)发现两个 P23 缺陷并**当日修复**:① **I37 投机预检查逐序列不累计**——`Σneed > free` 且逐个 `need ≤ free` 时 `may_append_at` 跑穿 free list IndexError;修复 = `BlockManager.total_launch_shortfall` 累计门(超 free 整批 defer;fcfs/stall_free 两处同改)。② **I38 运行时关 overlap 丢弃已排投机批**——投机 schedule 的块分配 stranded → `len(table)==ceil(len/bs)` 不变式破坏 → KV 写偏一块静默坏输出;修复 = disable 改**排空式收尾**(在飞批照常 collect、parked 批照常 launch、仅停尾部投机调度,≤2 步排空),`NANOVLLM_OVERLAP_NO_SPEC` 同族改门控。**产品化**:api_server 补 `--scheduler-overlap` CLI(此前主线特性从服务端入口够不着)+ 畸形 max_tokens/temperature 改 400 + kv_channel 去 torch.musa 硬编码 + config 断言 `max_num_seqs ≤ max_num_batched_tokens`(F3)。**验证全绿(0.6B tiny,一次窗口)**:repro rc=0(F1 门);`tests/p25_overlap_fix.py` 三门(t1 中途 disable 排空 bitwise / t2 翻转窗 ABA bitwise 跨 768 边界 / t3 KV 压力 12/12 defers=3);p23 五门回归数字与原判决一致(t3 0.347%/t4 pre=3/t5 b1 0.9813);四套标准回归 + pytest 28 全过;生产默认零变更。
+- **P23(11-08)**:**overlap scheduler 落地**(opt-in `scheduler_overlap=True`,运行时 `set_scheduler_overlap`):SGLang 单飞流水线 collect→postprocess→launch(先剪行)→投机调度;**稳态输出与串行逐位全等**(greedy+采样同种子,0.6B/30B 双档 bitwise),错峰翻转 0.347%≤0.5%,抢占场景 12/12 完成,b1/b16 步时 0.997×。**I36 根因自查自修**:投机 decode 行 launch 前被追加 1 token,`len%256==1` 块边界判断差一块 → block_table 缺块 → slot 越界写 + kernel 越界读 → MUSA 提交路径卡死(曾误判厂商类,E1/E5 判别实验定位为本方 bug);修复=按 launch 时刻长度做块覆盖检查(`can_append_at/may_append_at`)。报告 benchmarks/P23-overlap.md。
 - **P24(11-08,本轮)**:**结构化输出落地**(xgrammar 0.2.7,per-request opt-in):`guided_json`/`guided_regex`/`response_format json_schema`;位掩码 torch 算子上 MUSA,与官方 CPU apply **支撑集逐位一致**;四 schema 16/16 合法+grammar 终止;约束开销 1.028×≤1.10;API 冒烟 8/8。报告 benchmarks/P24-guided.md。
 - **P22(11-08)**:采样面补齐(top_p/top_k/min_p/三 penalty/stop_token_ids/logprobs//v1/completions)+ 三个真 bug 专责回归(b1 混合分路 None 崩溃/b2 detokenizer/b3 采样器 fp32 别名)。
 - **服务器**:seetacloud `s4000`;收官时双卡 0 MiB、无进程、shm 干净;本轮回归 10 套全绿(四套+p16×3+p17+p22×2+p23)。
@@ -25,27 +26,28 @@
 | P22-A 采样面 | PASS,per-request opt-in | 默认逐字 legacy(bitwise);top_p 激活 1.091 |
 | **P23-B overlap scheduler** | **PASS,opt-in(`scheduler_overlap=True`)** | t1/t2 bitwise(0.6B+30B)/t3 0.347%/t4 12/12/t5 b1 0.9972 b16 0.9978;**I36 修复** |
 | **P24-C xgrammar** | **PASS,per-request opt-in** | g1 位掩码==官方 CPU apply;g2 16/16 合法+终止;g5 1.028×;API 8/8 |
+| **P25 修复轮(I37/I38)+ 产品化** | **PASS,全绿** | repro rc=0;p25 三门(t1 drain bitwise/t2 翻转 ABA bitwise/t3 压力 12/12 defers=3);p23 五门回归数字与原判决一致;四套+pytest 28 绿;`--scheduler-overlap` CLI 补齐 |
 
 ## 2. 已判决不要再碰(累计)
 
-投机解码 NO-GO;I19 否定;整图/分段图否决(I29,实验类命令用户封存);I30/I8 闭合;fused RMSNorm/容量收缩/placement 不采用;split=0/chunk-2048 否决;host-sync/mixed-split/paged 采纳;E1 autotune 闭合;int8 KV 终判不可用(除非厂商 fp8 落地);I35/I36 已修。
+投机解码 NO-GO;I19 否定;整图/分段图否决(I29,实验类命令用户封存);I30/I8 闭合;fused RMSNorm/容量收缩/placement 不采用;split=0/chunk-2048 否决;host-sync/mixed-split/paged 采纳;E1 autotune 闭合;int8 KV 终判不可用(除非厂商 fp8 落地);I35/I36/I37/I38 已修。
 
 ## 3. 下轮 Top-N(按 ROI)
 
 | 优先 | 项 | 说明 |
 |---|---|---|
-| 1 | **用户审本地 commit → push** | 18 个本地 commit(`git log --oneline origin/main..HEAD`),远端未动 |
-| 2 | overlap 在线口径补测 | 离线门全过;在线 benchmark_online(错峰到达+长队列)下 schedule/prepare 收益更大,补 p95/吞吐对照(同引擎 A/B 运行时开关) |
+| 1 | **用户审本地 commit → push** | 23 个本地 commit(`git log --oneline origin/main..HEAD`),远端未动;**求职视角这是最高 ROI 的一步**(P25 报告 §4.1) |
+| 2 | overlap 在线口径补测 | 离线门全过 + CLI 已补;在线 benchmark_online(错峰到达+长队列)下 schedule/prepare 收益更大,补 p95/吞吐对照(同引擎 A/B 运行时开关) |
 | 3 | xgrammar 补全 | `json_object`(builtin grammar)/`guided_choice`;约束行多时 bitmask 展开可下沉 triton-mtgpu 内核 |
-| 4 | P16-A 默认翻转评估 | 8B/30B 逐位 0 翻转,唯一瑕疵 0.6B 0.56% 冻结门——待用户裁决 |
-| 5 | 用户亲自发厂商工单 | E-vendor-ticket.md(fp8 no-op 等 7 项) |
-| 6 | PD 流式输出/多实例 | P18-C 剩余 |
+| 4 | 量化路径立项(P25 报告 R3) | 平台 fp8 no-op → int8 weight-only 加载 + 运行时反量化(或 W4A16);招聘视角最大功能缺口;先显微探针验 MUSA int8 bmm 数值 |
+| 5 | P16-A 默认翻转评估 | 8B/30B 逐位 0 翻转,唯一瑕疵 0.6B 0.56% 冻结门——待用户裁决 |
+| 6 | radix-tree 前缀缓存(P25 R4)/PD 流式多实例(P18-C 剩余) | radix 对齐 SGLang 叙事,需过 bitwise 门;PD 剩余项 |
 
 **不要做**:graph replay(封存);int8 KV(终判);norm/rope 单点融合;EAGLE3。
 
 ## 4. SOP/坑(继承 + 本轮新增)
 
-1. **(P23)投机调度的块覆盖必须按 launch 时刻长度算**——陈旧批次在 launch 前会被在飞批次 postprocess 追加 1 token,`len%256==1` 型判断差一块 → slot 越界写+kernel 越界读 → MUSA 提交路径卡死(I36)。一般式:任何"调度时算好的块/形状"在 launch 时要按活状态复核。
+1. **(P23)投机调度的块覆盖必须按 launch 时刻长度算**——陈旧批次在 launch 前会被在飞批次 postprocess 追加 1 token,`len%256==1` 型判断差一块 → slot 越界写+kernel 越界读 → MUSA 提交路径卡死(I36)。一般式:任何"调度时算好的块/形状"在 launch 时要按活状态复核。**(P25 延伸)预检查必须是执行的总和而非逐项**——逐序列 can_append_at 全过、累计分配仍可跑穿 free list(I37);同理"排了但不执行"的批要 drain 或回滚其资源分配(I38)。
 2. **(P23)卡死≠厂商**:先做判别实验矩阵(去压力/去投机/串行对照)再下结论;E1"能跑完"不等于"没写坏"——**块分配时序变化的实验必须带 bitwise 门**。
 3. **(P23)MUSA 多引擎同进程 churn 出现过无 traceback 原生崩溃**——长测试拆分进程阶段(父进程聚合 JSON),崩溃可定位、判决互不污染。
 4. **(P23)python 卡在 C 调用时**:`faulthandler.dump_traceback_later(90, repeat=True)` 看门狗转栈 > py-spy(需 sudo)> SIGINT(可能被吞)。

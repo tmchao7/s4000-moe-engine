@@ -5,7 +5,7 @@
 
 ## 0. 当前栈与已判决(不要重测)
 
-**生产栈**:`attention=triton_paged`(默认)、`moe_backend=grouped_mm`(prefill)、`decode_moe_backend=bmm_dense`、`enforce_eager=True`、`scheduler=stall_free`(在线)/`fcfs`(离线)、TP2/EP2、chunk-256。30B eager b1 decode 步时 142–159 ms(口径相关);**分段图已终局(P12 在线 FAIL + P13 修复验证:padding 税证实并消除,残余 AR 串行化 +1.0~4.7% 超 F2 门)→ 定格为单流可选开关,服务化分支关闭**;离线 b32 133 tok/s;**生产栈容量下界 1.070 req/s(1.6× 档双口径 100%,P13)**;短 prompt 四档 Poisson 全 100% SLO(TPOT p95 0.26–0.29);**1k 长上下文:冷缓存需 chunk-1024(0.5 档 90.6% SLO 过门),暖缓存任意 chunk 100%(P13)**。
+**生产栈**:`attention=triton_paged`(默认)、`moe_backend=grouped_mm`(prefill)、`decode_moe_backend=bmm_dense`、`enforce_eager=True`、`scheduler=stall_free`(在线)/`fcfs`(离线)、TP2/EP2、chunk-256。30B eager b1 decode 步时 142–159 ms(口径相关;**P25 口径注记**:文档中另有 181.57 ms 一数,出自 P22 ⑧ 的 30B 单载窗口,含采样面、非同一负载口径——引用时注明出处,勿跨口径对比);**分段图已终局(P12 在线 FAIL + P13 修复验证:padding 税证实并消除,残余 AR 串行化 +1.0~4.7% 超 F2 门)→ 定格为单流可选开关,服务化分支关闭**;离线 b32 133 tok/s;**生产栈容量下界 1.070 req/s(1.6× 档双口径 100%,P13)**;短 prompt 四档 Poisson 全 100% SLO(TPOT p95 0.26–0.29);**1k 长上下文:冷缓存需 chunk-1024(0.5 档 90.6% SLO 过门),暖缓存任意 chunk 100%(P13)**。
 
 **已判决(负结果也是结论)**:投机解码 NO-GO(α≈0 且 c=0.39);**I19 判决(P11):b1 固定等待主体 = 逐算子 host launch 开销,分段 replay 可回收 36.2 ms/步**(单算子融合被否定、replay 有效——两条自洽);整图 graph 否决(I29:TP2 引擎级间歇性 MCCL replay 楔死,barrier 无效),**分段图(图内零 MCCL)离线验证成立但在线否决(P12)+ 修复验证后仍转正失败(P13:padding 税已除,残余 AR 串行化 +1.0~4.7%)→ 服务化分支关闭,定格单流开关**;**I30 关闭(P13 ABA:现树快于 pre-P8 栈 23–51%,P9 回归主张被否定)**;**I8 长上下文闭合(P13:冷缓存塌=chunk 粒度,chunk-1024 解;准入=稳定性)**;**split=0 与 chunk-2048 默认化均否决(P10 实测)**;profiled placement 不采用;fused RMSNorm / bmm 容量收缩不采用;host-sync 移除与 mixed-split 已采纳默认开;30B 首 batch 为一次性 warmup 态(I31,token 门必丢首 batch)。
 

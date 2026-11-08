@@ -14,15 +14,15 @@
 | **S** | P7 投机解码 | S1–S6 |
 | **E** | 生态与厂商（autotune 手搓边界、runtime 限制） | E1–E6 |
 
-**统计（P15 后：I 31 项 = 已关闭 19 + 未结 12（新增 I34）；S 6 项；E 6 项。P15 给 I29 增补新栈证据（维持）；I28 变体已工程化修入 nanovllm/pd/kv_channel.py。I12 引擎侧兜底已落地，仍留 🟢 观察）**
+**统计(P25 后:I 35 项 = 已关闭 23 + 未结 12(I35 补录已修,I36 补录 P23 已修,I37/I38 评审发现修复即关);S 6 项;E 6 项)**
 
 | 系列 | 已关闭 | 未结 | 未结条目 |
 |---|---:|---:|---|
-| I 技术债 | 19 | 12 | I1、I2、I3、I12、I14、**I19**、I20、I27、I28、**I31**、**I32**、**I34** |
-| S 投机解码 | 1 | 5 | S2–S6（S5 随 S1 搁置） |
-| E 生态厂商 | 0 | 6 | E1、E2（可手搓）、E3–E6（厂商侧） |
+| I 技术债 | 23 | 12 | I1、I2、I3、I12、I14、**I19**、I20、I27、I28、**I31**、**I32**、**I34** |
+| S 投机解码 | 1 | 5 | S2–S6(S5 随 S1 搁置) |
+| E 生态厂商 | 0 | 6 | E1、E2(可手搓)、E3–E6(厂商侧) |
 
-已关闭 20 项（I 19 + S1）：I4、I5、I6、I7、I8、I9、I10、I11、I13、I15、I21、I22、I23、I24（部分修）、I25、I26、**I29、I30、I33**、S1。
+已关闭 24 项(I 23 + S1):I4、I5、I6、I7、I8、I9、I10、I11、I13、I15、I21、I22、I23、I24(部分修)、I25、I26、**I29、I30、I33**、**I35、I36、I37、I38**、S1。
 > 编号：I16–I18 已迁入 E 系列（E2/E5/E6），不再单独计数，故 I 系列实际 30 项（I1–I15、I19–I33）。
 > I8 已用有效跑闭合（1.0–1.15k token、384/384、rank1 存活）；三档 SLO 0% 是真实容量结论（瓶颈在 TTFT），P13 补齐机理与解法（见 I8 条目 P13 终局）。
 
@@ -105,6 +105,9 @@
 
 - **I20 KV 量化(🔴 P20 终判:三种 int8 方案机制全对但质量门连续 FAIL — 本模型 K/V 动态范围对 int8 不可用;除非厂商 fp8 落地,否则放弃)**:P17(隔夜轮)实现全链路 opt-in `kv_cache_dtype="int8"`:池 [2,L,blocks+1,256,kvh] int8 + scale [2,L,blocks+1,256,kvh] fp32;融合量化写 kernel(`nanovllm/kernels/kv_int8.py`,对 torch 参考逐位);paged decode kernel 融合 dequant(HAS_SCALE 分支)+ `_gather_kv`/sdpa 回退同。**容量 2.0× 精确(730→1460 块)、decode 步时 1.013×(≤5% 门过)**。**数值门 FAIL(照录)**:0.6B e2e 生成退化(重复/乱码),32/32 请求首 token 分叉。**根因(实测)**:Qwen3 K 激活 per-head amax 196~492 而典型元素 ~0.5-0.8 → per-token-head absmax 量化步长 1.5-3.9 淹没信号(P14 探针 0.67% 系无离群点合成数据,误导)。逐件排除 plumbing:store/gather 逐位、paged+scale vs torch 重算 4.8e-4 ≈ bf16 基线、引擎内 decode 注意力现场重算 diff 0.0019。**P20 终局(混合精度 outlier 通道)**:per-(layer,kv_head) 维度列表(≤4/head, K∪V ratio>10)+bf16 侧池+paged kernel split-sum(主 acc+acc_out 分离累加, 逐 head 覆盖 store)+gather/sdpa scatter——**机制逐位正确(unit 四张量 BITWISE; 引擎内重算 diff 0.0033; 顺带修复 P19 遗留 bug: paged 读误用 store scales 而非 dscales)**。**质量门仍 FAIL(flip 0.5, sim 0.035, degenerate 2/32, decode 1.126×) — 三种绝对网格方案(per-token-head/per-channel/per-channel+outlier 侧池)连续 FAIL, 结论=Qwen3 K/V 通道内动态范围 ~500× 对 int8 的 127 级网格不可用, 与实现无关**。**修复尝试(per-channel 校准静态 scale)**:已实现并逐位验证(store BITWISE、引擎内 manual-quant 全行恒等、bulk 量化级数中位 60/127);**质量门仍 FAIL — 根因再升级:通道内动态范围 ~500×(channel amax 398~492 vs 典型 ~1),int8 的 127 级绝对网格数学上无法兼顾;服务分布超校准 amax 时裁剪误差实测 worst 27.5**。**fp8 e4m3 on MUSA = 静默 no-op**(cast 不量化,492 零误差=假实现,比崩溃更危险;厂商工单素材)。**最终方案(下轮立项)**:混合精度 outlier 通道(高动态比通道保 bf16,其余 int8,~1.03× 存储;读侧双源)——布局与读路径全部就绪。默认 bf16 不变(预注册)。历史(P14):朴素 dequant pass 慢 bf16 拷贝 5.7× → 必须融 kernel(已实现)。证据 `benchmarks/data/p14/int8_kv_probe.json`、`/root/p17_data/gate.json`。
 - **I35 stall_free decode 循环 for-range 越界(🆕 P16 发现并修复)**:`_schedule_stall_free` 的 decode 循环按 `num_running` 固定迭代,但每次抢占额外从 running 弹出 victim → 抢占多发时 popleft 空 deque IndexError(上游潜伏,生产抢占罕见未触发);P16-C 压力负载触发,修为 `while self.running`。
+- **I36 投机调度块边界 off-by-one(🆕 P23 发现并修复)**:overlap 投机 decode 行 launch 前被在飞批次 postprocess 追加 1 token,按陈旧 `len%256==1` 判块边界差一块 → block_table 缺块 → slot 越界写 + kernel 越界读 → MUSA 提交路径卡死;修复 = 按 launch 时刻长度做块覆盖检查(`can_append_at/may_append_at`)。证据 `benchmarks/P23-overlap.md`。
+- **I37 投机预检查逐序列不累计 → free list 耗尽 IndexError(🆕 P25 评审发现并修复)**:`schedule(speculative=True)` 预检查逐个 `can_append_at`(fcfs+stall_free 两处),decode 循环却**累计** `may_append_at` 分配;当 `Σneed > free` 且每个 `need ≤ free` 时预检查全过(不 defer),第二个序列分配跑穿 free list → `_pop_free` 空 deque IndexError(串行路径靠抢占兜底不受影响;投机路径按设计永不抢占)。复现 `tests/p25_review_repro.py`(纯 CPU,本地与服务器 rc=0 验证修复);修复 = `BlockManager.total_launch_shortfall` 累计门,超 free 即整批 defer。引擎级压力回归 `tests/p25_overlap_fix.py` t3。
+- **I38 运行时关 overlap 丢弃已排投机批 → block_table 不变式破坏(🆕 P25 评审发现并修复)**:`set_scheduler_overlap(False)` 原实现直接丢 `_sched_next`,只 drain `_pending`;投机 schedule 对 inflight 跨界 decode 行已把 block_table 抬到 `ceil((L+1)/bs)`,批被丢弃后 token 永不追加 → 串行不变式 `len(table)==ceil(len/bs)` 破坏,`prepare_decode` 按 `block_table[-1]` 算写槽 → KV 写偏一块(复现中写到 slot 767 应为 511),该序列从跨界点起持续坏输出。同族:`NANOVLLM_OVERLAP_NO_SPEC=1` 原为"排了再丢"。修复 = disable 改**排空式收尾**(drain):在飞批照常 collect、 parked 批照常 launch(其 launch 时刻块覆盖恰在 collect 后成立)、仅停尾部投机调度,≤2 步排空后回串行;NO_SPEC 改为门控不排。回归 `tests/p25_overlap_fix.py` t1(中途 disable bitwise)/t2(翻转窗 ABA bitwise,跨 768 边界)。
 - **I21 per-rank KV 容量不一致(✅ 本轮修复)**:`allocate_kv_cache` 后 `dist.all_reduce(MIN)` 统一两 rank 的 `num_kvcache_blocks`;tiny TP2 六配置回归全等 rc=0,两 rank `[kvcache] blocks=` 一致(343080/343080、341994/341994;本轮加载内启发式恰好相同,真 divergence 钳制待 30B 长上下文确认)。
 - **I22 graph replay padding 写 KV slot 0(✅ 根因确认 + 修复 + TP1 验证;TP2 另有独立故障)**:scratch-slot 修复(`allocate_kv_cache` 多留 1 块 + replay 前 `slot_mapping/block_tables` 填 scratch);tiny/0.6B/8B 验证:GB 5/5 token 全等(paged)、GC 共享前缀全等、GD 捕获零失败;**30B TP2 首次 replay 楔死是独立故障**(见 I29),30B 图维持否决、默认 eager。详见 `benchmarks/archive/P8-graph.md`。
 - **I23 mixed step 走 prefill MoE 后端(✅ 本轮修复,效果待 L3 在线复测)**:`model_runner.run` 对 mixed 拆 prefill/decode 子批,decode 行走 `prepare_decode`+paged+bmm_dense(`NANOVLLM_MIXED_SPLIT`,默认开);调度器 mixed-batch 契约有单测(`tests/p8_scheduler_gaps.py`)。

@@ -24,10 +24,15 @@
 | OpenAI 兼容 API | ✅ chat/completions（SSE、usage、stop、cancel、429） | ✅ 完整 | ✅ 完整 | `entrypoints/openai/api_server.py` |
 | 增量 detokenization | ✅ UTF-8 边界 + stop 回退 | ✅ | ✅ | `incremental_detokenizer.py` |
 | 异步引擎 | ✅ 后台线程 + 命令队列 | ✅ 异步引擎 | ✅ | `async_engine.py` |
-| 采样 | ⚠️ 仅 greedy / temperature | ✅ top-k/p/min-p/penalty/beam/… | ✅ 同左 | `layers/sampler.py`（上游） |
-| 结构化输出 / tools / logprobs / n>1 | ❌ 明确不支持（400） | ✅ | ✅ | API 里显式拒绝 |
+| 采样 | ✅ top_p/top_k/min_p + presence/frequency/repetition penalty + stop_token_ids + logprobs(top-k)（P22;默认参数走逐字 legacy 路径,per-request opt-in) | ✅ top-k/p/min-p/penalty/beam/… | ✅ 同左 | `layers/sampler.py`、`engine/model_runner.py:_build_sample_meta` |
+| 结构化输出 | ✅ xgrammar:guided_json/guided_regex/response_format json_schema(P24;per-request opt-in,位掩码与官方 CPU apply 逐位一致,开销 1.028×) | ✅ | ✅ XGrammar | `engine/llm_engine.py:_attach_grammar`、`layers/sampler.py:_apply_grammar` |
+| overlap scheduler | ✅ 单飞流水线 collect→postprocess→launch→投机调度(opt-in `scheduler_overlap`;稳态与串行逐位全等;disable 排空式收尾 I38) | ✅ V1 原生 | ✅ 零开销调度 | `engine/llm_engine.py:_step_overlap` |
+| 优先级/SLO 分级调度 | ✅ per-request `priority`(高优 TTFT 42.7×;饥饿守卫;抢占 victim 按优先级) | 部分(公平调度,无 per-request 优先级) | 部分 | `engine/scheduler.py:_waiting_candidate/_preempt_victim` |
+| 前缀缓存淘汰 | ✅ 两级 victim: fresh 优先 + LRU 冷块 + touch-on-hit(P16-B,默认开) | ✅ | ✅ | `engine/block_manager.py:_pop_free` |
+| 结构化输出之外的 tools / n>1 | ❌ 明确不支持（400） | ✅ | ✅ | API 里显式拒绝 |
 | 投机解码 / LoRA / 多模态 | ❌ | ✅ | ✅ | 未做 |
-| 多实例 / 多节点 / 分离式 | ❌ 单实例单机 | ✅ | ✅ | 未做 |
+| 多实例 / 多节点 | ❌ 单实例单机 | ✅ | ✅ | 未做 |
+| PD 分离(prefill-decode) | ✅ 单机双卡 1P1D 全链路:bitwise 交接 + 在线 A/B ITL p95 0.753×/0.839× + 前缀复用 5.7× + OpenAI 端点(P15/P18) | ✅ 多机 | ✅ 一等公民 | `nanovllm/pd/`、`scripts/p15_pd_serve.py` |
 | Graph / compile | ⚠️ `torch.compile` 有 opt-in 开关但 MUSA 未验证 | ✅ | ✅ | `utils/compat.py` |
 | 评测工具链 | ✅ schema v2 + 开放环 + 冻结决策门 + 可审计 JSON | ✅ `benchmark_serving` | ✅ 自带 bench | `scripts/`、`benchmarks/` |
 | 设备侧 profiling | ✅ MUSA Event 分段 + 双 rank + 自动路线决策 | ✅ nsys/torch profiler | ✅ | `profiling.py`、`scripts/p5_profile.py` |
@@ -56,4 +61,5 @@
 ## 4. 结论
 
 - 它已经不是"nano-vllm 换设备"：调度、指标、服务化、确定性与评测方法都补齐到了**可解释、可复现、可对比**的程度。
-- 与 vLLM/SGLang 的真实差距集中在：graph capture（硬件阻塞）、采样/结构化输出等 API 面、radix 前缀缓存、多实例与分布式调度、以及自定义 kernel 的成熟度（我们的 paged/MoE kernel 还在"正确 + 局部更快"阶段）。
+- 与 vLLM/SGLang 的真实差距集中在：graph capture（硬件阻塞）、投机解码（判负）、量化推理运行时（平台 fp8 no-op，见 ISSUES I20 终判）、radix 前缀缓存、多实例与多节点、以及自定义 kernel 的成熟度（我们的 paged/MoE kernel 还在"正确 + 局部更快"阶段）。
+- P22–P24 已把服务面对齐（采样面/overlap 调度/结构化输出），P25 评审轮修复了 overlap 的两个状态机缺陷（ISSUES I37/I38）并为运行时开关补了服务端 CLI（`--scheduler-overlap`）。当前差距的量化比对与求职视角评估见 `docs/P25-proposal-and-career-review.md`。
