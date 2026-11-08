@@ -127,7 +127,7 @@
 
 ### I34 🟡 引擎 token 依赖状态历史：处女引擎与跑过流量的引擎在同 prompt 上近平局分叉（P15 发现，泛化 I31）
 
-0.6B TP1 paged eager，同引擎内先跑 6 个 PD 交接请求再跑 collocated 生成，与处女引擎的 collocated 结果比：**2/6 请求于中途近平局分叉（completion#10/#19）**，且每种状态历史下各自跨进程逐位确定（PD×2、BASE×2 全等）。含义：① **bitwise 对照臂必须同引擎同状态历史**——处女 baseline 不是合法参照（P15 M2 门已改为同引擎对照，`scripts/archive/p15_pd_1p1d.py`）；② I31 的"首 batch 跃迁"实为"状态历史相关"的特例，机制候选同 I31（allocator 布局/JIT/autotune 一次性切换）；③ 对所有 token 门的影响与 I31 ①相同，但作用域从"首 batch"扩大到"任何状态历史差异"。证据：`/root/p15_data/pd_m2_verdict_*.json`（run1/run2 + in-engine collocated），报告 `benchmarks/P15-pd-autotune.md` §E。
+0.6B TP1 paged eager，同引擎内先跑 6 个 PD 交接请求再跑 collocated 生成，与处女引擎的 collocated 结果比：**2/6 请求于中途近平局分叉（completion#10/#19）**，且每种状态历史下各自跨进程逐位确定（PD×2、BASE×2 全等）。含义：① **bitwise 对照臂必须同引擎同状态历史**——处女 baseline 不是合法参照（P15 M2 门已改为同引擎对照，`scripts/archive/p15_pd_1p1d.py`）；② I31 的"首 batch 跃迁"实为"状态历史相关"的特例，机制候选同 I31（allocator 布局/JIT/autotune 一次性切换）；③ 对所有 token 门的影响与 I31 ①相同，但作用域从"首 batch"扩大到"任何状态历史差异"。证据：`/root/p15_data/pd_m2_verdict_*.json`（run1/run2 + in-engine collocated），报告 `benchmarks/archive/P15-pd-autotune.md` §E。
 
 ### I32 🟡 api_server「默认启动」≠ 生产栈；30B 段图捕获的显存前提（P12 发现，两处）
 

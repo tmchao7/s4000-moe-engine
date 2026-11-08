@@ -98,7 +98,7 @@
 | P23 overlap scheduler | 完成 | vLLM V1/SGLang 单飞流水线(opt-in):**稳态输出与串行逐位全等**(greedy+采样,30B 同);错峰翻转 0.347%;抢占场景 12/12 完成;I36 投机调度块边界 off-by-one 自查自修(MUSA 提交卡死 → launch 时刻块覆盖检查);b1/b16 步时 0.997× |
 | P24 结构化输出(xgrammar) | 完成 | **guided_json/guided_regex/response_format json_schema**;位掩码与官方 CPU apply 逐位一致;四 schema 16/16 合法 + grammar 终止;约束开销 **1.028×**;API 端到端冒烟 |
 
-正确性门:tiny TP1/TP2 × loop/grouped/bmm 六配置逐 token 全等;跨后端比较采用"候选确定性 + 五层等价门"(数值契约见 [docs/numerics-policy.md](docs/numerics-policy.md))。历史轮次报告(P0–P14)在 [benchmarks/archive/](benchmarks/archive/),当前轮在 [benchmarks/](benchmarks/)。
+正确性门:tiny TP1/TP2 × loop/grouped/bmm 六配置逐 token 全等;跨后端比较采用"候选确定性 + 五层等价门"(数值契约见 [docs/numerics-policy.md](docs/numerics-policy.md))。历史轮次报告(P0–P21)在 [benchmarks/archive/](benchmarks/archive/),当前轮(P22 起)在 [benchmarks/](benchmarks/)。
 
 </details>
 

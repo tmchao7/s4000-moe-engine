@@ -45,7 +45,6 @@ class Config:
     # P23: one-batch-in-flight overlap pipeline (speculative scheduling hidden
     # under the GPU forward).  Opt-in; the serial step loop stays the default.
     scheduler_overlap: bool = False
-    collect_expert_stats: bool = False
     metrics_path: str | None = None
     enable_profiling: bool = False
 
