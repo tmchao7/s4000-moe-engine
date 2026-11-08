@@ -44,6 +44,8 @@
 <img width="500" src="assets/charts/longctx_ttft.png">
 </p>
 
+**口径与可信度边界**（照实写）：负载与压测客户端是自建的（客户端有 28 个单测、schema 版本化），判据是自己冻结的，证据来自单一环境（2×S4000 租用实例）。冻结门解决的是"自己骗自己"，替代不了第三方验证——标准负载（ShareGPT 类 trace）交叉对账是已知未做项。对比基线 = vllm-musa 0.29.1（2026-10-25 同栈同卡实测）；vLLM 迭代很快，引用加速比请连同基线版本与日期一起引。
+
 ## 复现
 
 | 项 | 配置 |
@@ -51,6 +53,7 @@
 | GPU | 2× MTT S4000（48GB / 卡，PCIe Gen5 x16） |
 | 软件栈 | torch 2.11 + torch_musa 2.11、MCCL 2.11、Triton（mtgpu backend）、Ubuntu 22.04 |
 | 模型 | Qwen/Qwen3-30B-A3B-Instruct-2507-FP8（30.5B 总参 / 3.3B 激活，128 专家 top-8）；tiny 模型由 `scripts/make_tiny_moe.py` 生成 |
+| 环境搭建 | [docs/SETUP.md](docs/SETUP.md)——软件栈、模型下载、复现链路（本仓库仅支持 MUSA 后端） |
 
 ```bash
 pip install -e .
