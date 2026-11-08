@@ -10,10 +10,11 @@ class SampleMeta:
     is the bitwise no-op guarantee for the legacy configuration."""
 
     __slots__ = ("penalty", "top_ps", "top_ks", "min_ps",
-                 "has_k", "has_p", "has_minp", "logprobs_k")
+                 "has_k", "has_p", "has_minp", "logprobs_k", "grammar")
 
     def __init__(self, penalty=None, top_ps=None, top_ks=None, min_ps=None,
-                 has_k=False, has_p=False, has_minp=False, logprobs_k=0):
+                 has_k=False, has_p=False, has_minp=False, logprobs_k=0,
+                 grammar=None):
         # (rows, ids, counts, presence, frequency, repetition) flat device
         # tensors over (row, token) pairs, or None.
         self.penalty = penalty
@@ -22,11 +23,16 @@ class SampleMeta:
         self.min_ps = min_ps            # float32 [rows] or None
         self.has_k, self.has_p, self.has_minp = has_k, has_p, has_minp
         self.logprobs_k = logprobs_k
+        # P24: (row_indices int64 [n], bitmask int32 [n, W]) or None — the
+        # grammar support for the constrained rows (LSB-first, bit t%32 of
+        # word t//32).
+        self.grammar = grammar
 
     @property
     def is_neutral(self):
         return (self.penalty is None and not self.has_k and not self.has_p
-                and not self.has_minp and self.logprobs_k == 0)
+                and not self.has_minp and self.logprobs_k == 0
+                and self.grammar is None)
 
 
 def _apply_penalties(logits, penalty):
@@ -42,10 +48,13 @@ def _apply_penalties(logits, penalty):
 
 
 def _apply_masks(logits, meta):
-    """top_k -> top_p -> min_p on the temperature-scaled fp32 logits (the
-    HF/vLLM warper order), per-row knobs through one shared sort.  Masked
-    positions get finfo.min instead of -inf so softmax stays finite on MUSA.
-    Masks never remove the argmax token, so greedy rows are unaffected."""
+    """grammar -> top_k -> top_p -> min_p on the temperature-scaled fp32
+    logits (the HF/vLLM warper order, grammar first), per-row knobs through
+    one shared sort.  Masked positions get finfo.min instead of -inf so
+    softmax stays finite on MUSA.  Masks never remove the argmax token, so
+    greedy rows are unaffected."""
+    if meta.grammar is not None:
+        logits = _apply_grammar(logits, meta.grammar)
     if not (meta.has_k or meta.has_p or meta.has_minp):
         return logits
     floor = torch.finfo(logits.dtype).min
@@ -72,6 +81,28 @@ def _apply_masks(logits, meta):
         probs = torch.softmax(logits, dim=-1)
         max_prob = probs.max(dim=-1, keepdim=True).values
         logits = logits.masked_fill(probs < meta.min_ps.unsqueeze(1) * max_prob, floor)
+    return logits
+
+
+def _apply_grammar(logits, grammar):
+    """P24: restrict the constrained rows to the grammar's token support.
+
+    Runs AFTER the temperature division (a finfo.min floor does not survive
+    a further division without overflowing to -inf) and BEFORE top_k/top_p.
+    Bit t of the support lives at bit t%32 of word t//32 (LSB-first); words
+    cover the tokenizer vocab, which can be narrower than the model's logits
+    width — the tail ids are not real tokens and stay masked."""
+    rows, bitmask = grammar
+    shifts = torch.arange(32, device=logits.device, dtype=torch.int32)
+    bits = (bitmask.unsqueeze(-1) >> shifts) & 1        # [n, W, 32] 0/1
+    allowed = bits.to(torch.bool).reshape(bits.size(0), -1)
+    vocab = logits.size(1)
+    if allowed.size(1) < vocab:
+        allowed = torch.nn.functional.pad(allowed, (0, vocab - allowed.size(1)), value=False)
+    else:
+        allowed = allowed[:, :vocab]
+    sub = logits[rows]
+    logits[rows] = torch.where(allowed, sub, torch.finfo(logits.dtype).min)
     return logits
 
 
@@ -108,6 +139,11 @@ class Sampler(nn.Module):
         if meta.penalty is not None:
             logits = _apply_penalties(logits, meta.penalty)
         if all_greedy:
+            # the grammar support changes the argmax (unlike top_k/top_p/min_p),
+            # so constrained greedy rows get their mask here; top_* stay off —
+            # they never remove the argmax token
+            if meta.grammar is not None:
+                logits = _apply_grammar(logits, meta.grammar)
             tokens = logits.argmax(dim=-1)
             # Greedy logprobs come from the penalty-adjusted raw logits: with
             # temperature 0 there is no division to undo.

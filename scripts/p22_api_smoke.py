@@ -111,6 +111,38 @@ def main():
         print("6 chat stop_token_ids:", "OK" if good else "FAIL")
         ok &= good
 
+        # P24: response_format json_schema -> parseable JSON + finish
+        r = post("/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "给张三一张名片。"}],
+            "max_tokens": 64, "temperature": 0.7,
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "card",
+                "schema": {"type": "object",
+                           "properties": {"name": {"type": "string"},
+                                          "age": {"type": "integer"}},
+                           "required": ["name", "age"],
+                           "additionalProperties": False}}}})
+        good = False
+        try:
+            obj = json.loads(r["choices"][0]["message"]["content"])
+            good = (isinstance(obj, dict) and "name" in obj and "age" in obj
+                    and r["choices"][0]["finish_reason"] in ("stop", "length"))
+        except Exception:
+            good = False
+        print("7 chat response_format json_schema:", "OK" if good else "FAIL",
+              r["choices"][0]["message"]["content"][:80])
+        ok &= good
+
+        try:
+            post("/v1/chat/completions", {
+                "messages": [{"role": "user", "content": "x"}],
+                "response_format": {"type": "json_object"}})
+            print("8 response_format validation: FAIL (no 400)")
+            ok = False
+        except urllib.error.HTTPError as exc:
+            print(f"8 response_format validation: {'OK' if exc.code == 400 else 'FAIL'} ({exc.code})")
+            ok &= exc.code == 400
+
         print("P22 API SMOKE", "PASS" if ok else "FAIL")
         return 0 if ok else 1
     finally:

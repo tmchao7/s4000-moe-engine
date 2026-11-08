@@ -24,6 +24,11 @@ class SamplingParams:
     # Top-k count of per-token logprobs to report (None/0 = off, cap 20).
     logprobs: int | None = None
     skip_special_tokens: bool = True
+    # P24 structured output (xgrammar): a JSON schema (dict or str) or a
+    # regex.  Data only — the engine compiles and attaches a per-sequence
+    # GrammarMatcher at add_request time.
+    guided_json: dict | str | None = None
+    guided_regex: str | None = None
 
     def __post_init__(self):
         assert self.temperature >= 0, "temperature must be non-negative (0 = greedy)"
@@ -42,6 +47,12 @@ class SamplingParams:
             raise ValueError("repetition_penalty must be in (0, 2]")
         if self.logprobs is not None and not 0 <= int(self.logprobs) <= 20:
             raise ValueError("logprobs must be an integer in [0, 20]")
+        if self.guided_json is not None and not isinstance(self.guided_json, (dict, str)):
+            raise ValueError("guided_json must be a JSON-schema dict or string")
+        if self.guided_json is not None and self.guided_regex is not None:
+            raise ValueError("guided_json and guided_regex are mutually exclusive")
+        if self.guided_regex is not None and not isinstance(self.guided_regex, str):
+            raise ValueError("guided_regex must be a string")
         if self.stop_token_ids is not None:
             if not isinstance(self.stop_token_ids, (list, tuple)) or not all(
                     isinstance(t, int) and not isinstance(t, bool)

@@ -43,6 +43,11 @@ class Sequence:
         self.repetition_penalty = sampling_params.repetition_penalty
         self.logprobs = sampling_params.logprobs or 0
         self.stop_token_ids = sampling_params.stop_token_ids or ()
+        # P24 structured output: data here, matcher attached by the engine
+        # (driver-side only — never crosses the TP pickle boundary).
+        self.guided_json = sampling_params.guided_json
+        self.guided_regex = sampling_params.guided_regex
+        self.grammar_matcher = None
         # Penalties need token statistics: gen_counts (generated only) drives
         # presence/frequency (OpenAI semantics); rep_counts (prompt+generated)
         # drives repetition_penalty (vLLM/HF semantics), built lazily because

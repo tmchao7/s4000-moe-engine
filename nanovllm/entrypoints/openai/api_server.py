@@ -45,6 +45,23 @@ def _parse_sampling_kwargs(body: dict, HTTPException, logprobs_int: bool) -> dic
             kwargs["logprobs"] = num("logprobs", int, 0)
     elif body.get("logprobs"):
         kwargs["logprobs"] = max(1, num("top_logprobs", int, 0))
+    # P24 structured output: response_format json_schema (OpenAI shape, with
+    # the vLLM-style direct-schema tolerance) or the vLLM guided_* aliases.
+    rf = body.get("response_format")
+    if rf is not None:
+        if not isinstance(rf, dict) or rf.get("type") != "json_schema":
+            raise HTTPException(400, "response_format.type must be 'json_schema'")
+        js = rf.get("json_schema")
+        schema = js.get("schema") if isinstance(js, dict) else None
+        if schema is None and isinstance(js, dict) and js:
+            schema = js                     # bare schema object tolerated
+        if not isinstance(schema, (dict, str)):
+            raise HTTPException(400, "response_format.json_schema.schema must be an object")
+        kwargs["guided_json"] = schema
+    if body.get("guided_json") is not None:
+        kwargs["guided_json"] = body["guided_json"]
+    if body.get("guided_regex") is not None:
+        kwargs["guided_regex"] = body["guided_regex"]
     return kwargs
 
 
