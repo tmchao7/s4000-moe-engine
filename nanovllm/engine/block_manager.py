@@ -189,6 +189,18 @@ class BlockManager:
     def can_append_at(self, seq: Sequence, launch_len: int) -> bool:
         return len(self.free_block_ids) >= self._blocks_needed(seq, launch_len)
 
+    def total_launch_shortfall(self, seqs: list[Sequence],
+                               launch_lens: list[int]) -> int:
+        """P25/F1: cumulative block shortfall over a whole speculative decode
+        batch.  A per-seq ``can_append_at`` check passes whenever each
+        individual shortfall fits the free list, but the decode loop then
+        allocates sequentially — ``sum(shortfall) > free`` runs ``_pop_free``
+        off the end of the list (IndexError) even though every per-seq check
+        passed.  Sequential allocation consumes exactly ``sum(shortfall)``
+        blocks, so the sum is the exact no-crash guarantee."""
+        return sum(self._blocks_needed(seq, ll)
+                   for seq, ll in zip(seqs, launch_lens))
+
     def may_append_at(self, seq: Sequence, launch_len: int):
         while self._blocks_needed(seq, launch_len) > 0:
             seq.block_table.append(self._allocate_block())

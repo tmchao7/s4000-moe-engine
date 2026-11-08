@@ -99,19 +99,30 @@ class Scheduler:
         scheduled_seqs = []
         num_batched_tokens = 0
         if speculative:
-            # P23: read-only pre-check — any decode seq whose launch-time
-            # block coverage would need a preemption defers the pass.
+            # P23: read-only pre-check before any mutation.  launch_len is the
+            # sequence length when the speculative batch launches: the batch
+            # currently on the GPU postprocesses first and appends one token
+            # to its own members (I36 fix — coverage must be checked at
+            # launch time, not at stale-schedule time).  P25/F1: the check is
+            # CUMULATIVE — per-seq checks pass while the sum of shortfalls
+            # exceeds the free list, and the decode loop's sequential
+            # may_append_at allocation would then run off it.  The decode loop
+            # pops in this same order under the same budget/count breaks, so
+            # `checked` is exactly the set it will allocate for.
             inflight_ids = {id(s) for s in (inflight or [])}
             launch_len = lambda seq: len(seq) + (1 if id(seq) in inflight_ids else 0)
-            budget = self.max_num_batched_tokens
-            count = 0
+            budget, count = self.max_num_batched_tokens, 0
+            checked = []
             for seq in self.running:
                 if budget == 0 or count >= self.max_num_seqs:
                     break
-                if not self.block_manager.can_append_at(seq, launch_len(seq)):
-                    return [], "defer"
+                checked.append(seq)
                 budget -= 1
                 count += 1
+            if checked and self.block_manager.total_launch_shortfall(
+                    checked, [launch_len(s) for s in checked]
+            ) > len(self.block_manager.free_block_ids):
+                return [], "defer"
 
         # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
@@ -229,17 +240,24 @@ class Scheduler:
             # sequence length when the speculative batch launches: the batch
             # currently on the GPU postprocesses first and appends one token
             # to its own members (I36 fix — coverage must be checked at
-            # launch time, not at stale-schedule time).
+            # launch time, not at stale-schedule time).  P25/F1: the check is
+            # CUMULATIVE (see _schedule_fcfs) — the decode loop below pops in
+            # this same order under the same budget/count breaks, so `checked`
+            # is exactly the set its may_append_at allocations must cover.
             inflight_ids = {id(s) for s in (inflight or [])}
             launch_len = lambda seq: len(seq) + (1 if id(seq) in inflight_ids else 0)
             budget, count = token_budget, 0
+            checked = []
             for seq in self.running:
                 if budget == 0 or count >= seq_budget:
                     break
-                if not self.block_manager.can_append_at(seq, launch_len(seq)):
-                    return [], "defer"
+                checked.append(seq)
                 budget -= 1
                 count += 1
+            if checked and self.block_manager.total_launch_shortfall(
+                    checked, [launch_len(s) for s in checked]
+            ) > len(self.block_manager.free_block_ids):
+                return [], "defer"
 
         # Keep every admitted decode moving before admitting prefill work.
         # while (not for-range): each preemption removes an extra running seq,
@@ -251,7 +269,7 @@ class Scheduler:
             seq = self.running.popleft()
             if speculative:
                 # pre-check (same scan order/budgets) already verified the
-                # launch-time block coverage for this seq without preemption
+                # batch's TOTAL launch-time block coverage without preemption
                 self.block_manager.may_append_at(seq, launch_len(seq))
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False

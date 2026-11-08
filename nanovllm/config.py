@@ -71,6 +71,14 @@ class Config:
         assert self.scheduler_policy in ("fcfs", "stall_free", "stall_free_lpm")
         assert self.prefill_chunk_size > 0
         assert self.scheduler_starvation_steps > 0
+        # P25/F3: decode rows are budgeted at 1 token each, and the fcfs
+        # decode loop (unlike stall_free) does not re-check the token budget —
+        # the speculative pre-check mirrors it by seq count only.  The seq cap
+        # binding first is what keeps every scheduled row pre-checked.
+        assert self.max_num_seqs <= self.max_num_batched_tokens, (
+            "max_num_seqs must not exceed max_num_batched_tokens (fcfs decode "
+            "and the speculative pre-check assume the seq cap binds first)"
+        )
         if self.expert_placement == "profiled":
             assert self.expert_map_path and os.path.isfile(self.expert_map_path)
         self.hf_config = AutoConfig.from_pretrained(self.model)

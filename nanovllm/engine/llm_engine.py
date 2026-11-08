@@ -229,14 +229,21 @@ class LLMEngine:
     def set_scheduler_overlap(self, enabled: bool):
         """P23 runtime switch.  Driver-local by design: the pipeline state
         machine lives on the engine thread; TP ranks only ever see
-        run_launch/collect commands.  Disabling drains naturally — a pending
-        launch is still collected on the next step."""
+        run_launch/collect commands.  Disabling DRAINS instead of dropping:
+        the next steps keep running the overlap loop until the parked
+        speculative batch is launched and the in-flight batch collected, and
+        only the trailing speculative scheduling stops.  Dropping the parked
+        batch would strand the blocks its may_append_at already allocated —
+        the serial invariant ``len(block_table) == ceil(len/bs)`` breaks and
+        prepare_decode writes KV one block off (P25/F2, silent corruption on
+        boundary-crossing rows)."""
         self._overlap = bool(enabled)
-        if not enabled:
-            self._sched_next = None
 
     def step(self):
-        if self._overlap:
+        # Drain routing (P25/F2): with overlap disabled the pipeline may still
+        # hold a parked speculative batch or an in-flight launch; _step_overlap
+        # retires both before the serial path resumes.
+        if self._overlap or self._pending is not None or self._sched_next is not None:
             return self._step_overlap()
         batch = self.scheduler.schedule()
         seqs, mode = batch
@@ -262,7 +269,14 @@ class LLMEngine:
         path) — then speculatively schedule the next batch while the GPU runs
         this one.  Speculative scheduling never preempts (stale victims); a
         defer falls back to the serial schedule on the next call, which by
-        then runs on exactly the state the serial path would see."""
+        then runs on exactly the state the serial path would see.
+
+        P25/F2 drain: with ``_overlap`` False the loop still collects the
+        in-flight batch and launches the parked speculative batch (its launch-
+        time block coverage holds exactly once the collect above appended the
+        in-flight rows' tokens); only the trailing speculative schedule is
+        gated off.  After at most two drain calls ``_pending`` and
+        ``_sched_next`` are both None and the serial step resumes."""
         outputs, num_tokens = [], 0
         collected = False
         if self._pending is not None:
@@ -273,15 +287,19 @@ class LLMEngine:
         batch = self._sched_next
         self._sched_next = None
         if batch is not None:
+            # The parked batch launches even while draining: dropping it here
+            # would strand its pre-allocated blocks (P25/F2).
             stale = len(batch.sequences)
             batch = self._prune_batch(batch)
             self.overlap_pruned_rows += stale - (len(batch.sequences) if batch else 0)
-        if batch is None:
+        elif self._overlap:
             batch = self.scheduler.schedule()
-        if batch.mode == "defer" or not batch.sequences:
+        if batch is None or batch.mode == "defer" or not batch.sequences:
             if not collected:
                 self.last_step_metrics = {
-                    "mode": "empty", "schedule_s": batch.schedule_s, "forward_s": 0.0,
+                    "mode": "empty",
+                    "schedule_s": batch.schedule_s if batch is not None else 0.0,
+                    "forward_s": 0.0,
                 }
             return outputs, num_tokens
         self._pending_launch_time = perf_counter()
@@ -294,16 +312,19 @@ class LLMEngine:
             self.last_step_metrics = {
                 "mode": batch.mode, "schedule_s": batch.schedule_s, "forward_s": 0.0,
             }
-        next_batch = self.scheduler.schedule(speculative=True,
-                                             inflight=batch.sequences)
-        if next_batch.mode == "defer":
-            self.overlap_defers += 1
-        # E5 diagnostic: NANOVLLM_OVERLAP_NO_SPEC=1 keeps the launch/collect
-        # rhythm but schedules every batch synchronously after collect.
-        if _OVERLAP_NO_SPEC[0]:
-            next_batch = None
-        self._sched_next = None if (next_batch is None or next_batch.mode == "defer"
-                                    or not next_batch.sequences) else next_batch
+        if self._overlap:
+            # Trailing speculative schedule — gated off while draining, and
+            # also by the E5 diagnostic NANOVLLM_OVERLAP_NO_SPEC=1 (which
+            # keeps the launch/collect rhythm but schedules every batch
+            # synchronously after collect; scheduling speculatively and
+            # dropping the result would strand its block allocations).
+            if not _OVERLAP_NO_SPEC[0]:
+                next_batch = self.scheduler.schedule(speculative=True,
+                                                     inflight=batch.sequences)
+                if next_batch.mode == "defer":
+                    self.overlap_defers += 1
+                self._sched_next = None if (next_batch.mode == "defer"
+                                            or not next_batch.sequences) else next_batch
         return outputs, num_tokens
 
     def _prune_batch(self, batch: ScheduledBatch):
