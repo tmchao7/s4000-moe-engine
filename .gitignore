@@ -200,7 +200,7 @@ cython_debug/
 /models/
 benchmarks/data/
 
-# 简历/面试材料只在本地,不入库不上传(user 要求)
+# 本地个人材料(不入库)
 docs/RESUME.md
 AGENTS.md
 

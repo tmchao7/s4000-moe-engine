@@ -22,15 +22,17 @@
 | # | 门 | 结果 | 判决 |
 |---|---|---|---|
 | 1 | g1 位掩码语义:torch 展开 vs xgrammar 官方 CPU `apply_token_bitmask_inplace` | 支撑集逐位相等(7 token)+ accept/reject 一致(新 matcher 逐例) | PASS |
-| 2 | g2 JSON schema:4 schema(含嵌套 array/enum/number)× 4 样本 | 16/16 `json.loads`+`jsonschema` 合法,全部 grammar 终止(finish=stop) | PASS |
+| 2 | g2 JSON schema:4 schema(含嵌套 array/enum/number)× 4 样本 | 16/16 `json.loads`+`jsonschema` 合法,全部 grammar 终止(finish=stop;**P27 起改用 greedy**,见测试构造注记) | PASS |
 | 3 | g3 regex `[A-Z]{3}-[0-9]{3}` × 2 | 100% fullmatch + 提前终止(<48 token) | PASS |
 | 4 | g4 不约束路径不变 | SampleMeta 无 grammar 即中性路径(p22 t4/t5 门覆盖)+ 回归全绿 | PASS |
-| 5 | g5 约束开销:8 seqs 约束 vs 不约束 decode 交错×3 | **1.028×** ≤ 1.10 | PASS |
+| 5 | g5 约束开销:8 seqs 约束 vs 不约束 decode 交错×3 | **1.028×**(原判决;P27 起改为 x5 交错、median+CV、**informational-only,不再设 rc 门**) | PASS(记录性) |
 | 6 | g6 参数校验 | 非法类型/互斥 → ValueError(→400) | PASS |
 | 7 | API 冒烟 7/8 号用例:response_format 经 HTTP 端到端 | 合法 JSON 返回 + 非法类型 400 | PASS |
 | 8 | 30B 单载 guided sanity | 见 §4 窗口 | PASS |
 
 **测试构造注记(照录)**:JSON 字符串值内部语法放行全部 token,temp 0.8 的 0.6B 会把不限长的字符串写穿 max_tokens——测试 schema 加 `maxLength/maxItems` 约束(有界性本身是 schema 的一部分,非弱化门);离线 `generate()` 的 `tokenizer.decode` 在 transformers 5.13 上不跳特殊 token(Qwen 词表怪癖),API 增量解码路径(skip=True 默认)不受影响。
+
+**P27 补充(采样终止性)**:JSON grammar 在 token 之间放行**无界空白**,temp>0 时模型可能合法地连续采样空白(如 `\n`/空格 token),直到 max_tokens 仍未生成收尾 `}`——此时输出是合法的 grammar 前缀但不是完整 JSON。P24 的 g2 因此在 P27 改为 **greedy**(确定性终止/合法);采样路径只用于 g5 性能记录。这不是 xgrammar/bitmask 缺陷(CPU 探针确认 stuck 状态的 support 同时包含 `}`/`true`/`false` 与空白),而是"grammar 保证合法 token,不保证模型在预算内选中收尾 token"。
 
 ## 3. 已知边界
 

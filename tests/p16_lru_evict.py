@@ -248,10 +248,13 @@ def part2_engine(out_dir):
 
 def main():
     import argparse
+    global MODEL
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-engine", action="store_true")
+    parser.add_argument("--model", default=MODEL)
     parser.add_argument("--out", default="/root/p16_data/lru_evict.json")
     args = parser.parse_args()
+    MODEL = args.model
     results = {}
     ok = True
     for name, fn in (("t1_only_ref0", t1_only_ref0_victims),

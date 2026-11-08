@@ -15,7 +15,7 @@
 | 组件 | 版本 | 来源 |
 |---|---|---|
 | Python | 3.10–3.12(实测 3.10;pyproject 声明上限 <3.13) | 系统 |
-| torch + torch_musa | 2.11 + 2.11.post1 | 摩尔线程官方 torch_musa 发行 wheel |
+| torch + torch_musa | 2.11.0.post1 + 2.11.0.post1（实测 torch_musa 2.11.0.post1+b431668） | 摩尔线程官方 torch_musa 发行 wheel |
 | MCCL | 2.11(随 torch_musa) | 同上 |
 | Triton | 3.2.0(mtgpu backend,随栈) | 同上 |
 | transformers | 5.13 | pip |
@@ -40,7 +40,8 @@ mthreads-gmi | grep MiB   # 空闲时应为 0MiB
 ## 4. 复现链路(顺序执行)
 
 ```bash
-pip install -e .
+# test/plot extras = pytest + xgrammar + matplotlib/SciencePlots(公开复现链所需)
+pip install -e ".[test,plot]"
 
 # ① tiny 模型正确性门(分钟级;p2 套件内建跑 TP1+TP2 全部六配置)
 PYTHONPATH=. python3 tests/p2_grouped_mm.py

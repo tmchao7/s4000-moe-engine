@@ -328,24 +328,42 @@ class LLMEngine:
         return outputs, num_tokens
 
     def _prune_batch(self, batch: ScheduledBatch):
-        """Drop rows for seqs that finished or were cancelled since the
-        speculative schedule, restore the frozen num_scheduled_tokens (the
-        collected step's postprocess zeroed them), and clamp prefill chunks
-        to the live remaining tokens.
+        """Drop stale rows before launching a parked speculative batch.
 
-        The clamp covers the one real staleness case: a chunk-continuing
-        prefill row can be scheduled in CONSECUTIVE batches, and the batch in
-        between advances num_cached at its postprocess — after which the
-        frozen chunk may exceed the true remaining (the stale schedule saw an
-        older num_cached).  min(frozen, live remaining) equals exactly what a
-        serial schedule would pick at launch time.  Decode rows are never
-        clamped: their 1 token is generated, not read from token_ids."""
+        All decisions use the batch FROZEN metadata (query_lens, prefill_flags)
+        plus the live num_cached_tokens that this step's collect just advanced:
+        the trailing speculative schedule runs before that collect and rewrites
+        live seq fields for the NEXT batch, so reading live is_prefill here
+        would misclassify rows.
+
+        Two stale cases:
+        1. A chunk-continuing prefill row whose earlier chunks completed in
+           the in-flight batch: clamp to the true remaining tokens.
+        2. A prefill row whose whole prompt completed in the in-flight batch
+           (num_cached >= num_prompt_tokens): DROP it.  Keeping it produced a
+           1-token prefill row with num_cached == prompt_len, whose
+           block_table[num_cached // block_size] read is out of range when
+           the prompt length is an exact multiple of block_size (P25/F2
+           follow-up crash).  The seq decodes from the next schedule.
+        Decode rows are never clamped: their 1 token is generated, not read
+        from token_ids."""
+        flags = batch.prefill_flags
+        if not flags:
+            flags = [seq.is_prefill for seq in batch.sequences]
         kept = []
-        for seq, q in zip(batch.sequences, batch.query_lens):
+        kept_flags = []
+        for idx, (seq, q) in enumerate(zip(batch.sequences, batch.query_lens)):
+            was_prefill = flags[idx] if idx < len(flags) else seq.is_prefill
             if seq.is_finished:
                 self.overlap_pruned_rows += 1
                 continue
-            if seq.is_prefill:
+            if was_prefill:
+                if seq.num_cached_tokens >= seq.num_prompt_tokens:
+                    # prompt already completed in the in-flight collect
+                    self.overlap_pruned_rows += 1
+                    seq.num_scheduled_tokens = 0
+                    seq.is_prefill = False
+                    continue
                 q = min(q, seq.num_tokens - seq.num_cached_tokens)
             if q <= 0:
                 # stale prefill row whose chunks all completed in between;
@@ -353,13 +371,16 @@ class LLMEngine:
                 # divergence, same class as the arrival-timing shift)
                 self.overlap_pruned_rows += 1
                 seq.num_scheduled_tokens = 0
+                seq.is_prefill = False
                 continue
             seq.num_scheduled_tokens = q
+            seq.is_prefill = was_prefill
             kept.append(seq)
+            kept_flags.append(was_prefill)
         if not kept:
             return None
-        has_dec = any(not seq.is_prefill for seq in kept)
-        has_pre = any(seq.is_prefill for seq in kept)
+        has_dec = any(not flag for flag in kept_flags)
+        has_pre = any(kept_flags)
         mode = "mixed" if (has_dec and has_pre) else ("decode" if has_dec else "prefill")
         return ScheduledBatch(
             sequences=kept,
@@ -369,6 +390,7 @@ class LLMEngine:
             num_scheduled_tokens=sum(seq.num_scheduled_tokens for seq in kept),
             mode=mode,
             schedule_s=batch.schedule_s,
+            prefill_flags=kept_flags,
         )
 
     def _finish_step(self, batch: ScheduledBatch, token_ids, logprobs):
@@ -376,15 +398,20 @@ class LLMEngine:
         counters, metrics, JSONL record, finished-output assembly."""
         seqs, mode = batch.sequences, batch.mode
         self.schedule_mode_counts[mode] += 1
-        prefill_tokens = sum(
-            seq.num_scheduled_tokens for seq in seqs if seq.is_prefill
-        )
-        decode_tokens = sum(
-            seq.num_scheduled_tokens for seq in seqs if not seq.is_prefill
-        )
+        flags = batch.prefill_flags
+        if not flags:
+            flags = [seq.is_prefill for seq in seqs]
+        query_lens = batch.query_lens
+        # Frozen row metadata, not live seq state: the overlap pipeline has
+        # already rewritten the live fields for the next batch by the time
+        # this batch is collected (C2 accounting fix).
+        prefill_tokens = sum(q for q, flag in zip(query_lens, flags) if flag)
+        decode_tokens = sum(q for q, flag in zip(query_lens, flags) if not flag)
         num_tokens = batch.num_scheduled_tokens if mode != "decode" else -len(seqs)
         forward_elapsed = perf_counter() - self._pending_launch_time
-        self.last_token_events = self.scheduler.postprocess(seqs, token_ids, mode, logprobs)
+        self.last_token_events = self.scheduler.postprocess(
+            seqs, token_ids, mode, logprobs, query_lens, flags
+        )
         self.step_count += 1
         self.prefill_tokens_total += prefill_tokens
         self.decode_tokens_total += decode_tokens

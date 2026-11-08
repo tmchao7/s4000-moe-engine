@@ -8,7 +8,7 @@
 | 项 | 值 |
 |---|---|
 | 硬件 | 2× MTT S4000(48 GB,PCIe Gen5 x16),TP2 |
-| 软件 | torch 2.11.0.post1 + torch_musa 2.11、MCCL 2.11、Triton(mtgpu)、Ubuntu 22.04(容器) |
+| 软件 | torch 2.11.0.post1 + torch_musa 2.11.0.post1、MCCL 2.11、Triton(mtgpu)、Ubuntu 22.04(容器) |
 | 驱动/运行时 | 实例 uptime 5d+,未被重启;驱动版本随工单附 `mthreads-gmi` 全文 |
 
 ## 1. 问题一:引擎级 MUSAGraph+MCCL replay 间歇性楔死(I29)
@@ -75,7 +75,7 @@ print(y)   # 期望 [0.5, 100, 448](clip),实测 [0.5, 100, 492] — cast 是 no
 
 **影响**:静默错误比崩溃更危险——任何依赖 fp8 量化收益的路径(如 KV cache fp8)会得到"看起来成功、实际未量化"的结果。**请求确认**:torch_musa 的 float8 cast 是否已实现?若未实现,建议 cast 时显式 raise 而非静默拷贝;若已实现,请提供正确性验证口径。
 
-**环境**:torch 2.11.0.post1 + torch_musa 2.11,MTT S4000。
+**环境**:torch 2.11.0.post1 + torch_musa 2.11.0.post1,MTT S4000。
 
 ## 5. 我方证据清单(随工单附)
 

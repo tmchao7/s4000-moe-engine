@@ -12,7 +12,8 @@
 | overlap scheduler(P23) | vLLM V1/SGLang 单飞流水线(opt-in):稳态输出与串行逐位全等(greedy+采样),30B bitwise 同;I36 投机调度块边界 off-by-one 自查自修(提交路径卡死 → launch 时刻块覆盖检查) |
 | 结构化输出(P24) | xgrammar:guided_json/guided_regex/response_format;位掩码与官方 CPU apply 逐位一致,四 schema 16/16 合法+grammar 终止,开销 1.028× |
 | PD 分离 | 单机双卡 1P1D 全链路:bitwise 交接 + 在线 A/B ITL p95 0.753×/0.839×;Poisson 双档 POSITIVE(0.79×/0.82×);P 侧前缀复用 5.7×;OpenAI 端点 |
-| 平台适配 | MUSA 全栈移植 + Triton-mtgpu 内核(paged/fused-moE)+ I28/I31/I34 等平台坑闭环 |
+| 平台适配 | MUSA 全栈移植 + Triton-mtgpu 内核(paged/fused-moE)+ I28/I31/I34 等平台坑**定界/绕过**(三项在 ISSUES 仍为未结,I28 见 §B;不写成"已闭环") |
+| 验收修复(P27) | 独立验收审计 → 修 I39(overlap stale prefill 行越界)/I40(冻结记账)、p24 终止性判定、pytest 干净 checkout、公开复现链 `--model`/extras;回归扩 16 套(新增 CPU 边界门),强门 16/16、pytest 28/28;生产默认未变 |
 
 ## B. 无法解决 — 厂商问题(我们修不了,需要摩尔线程)
 
@@ -49,7 +50,7 @@
 
 ## E. 停止线(收尾判定,2026-11-08)
 
-**项目冻结于 P26 收官轮**:功能不再新增,生产默认栈不再改动,既有轮次判决全部有效(台账见 PLAN §1 与 ISSUES,不写死轮数;轮号 P0–P26)——这是明确暂停,不是漂移。复活条件(满足其一才重开):
+**项目冻结于 P26 收官轮;P27 验收修复轮只做缺陷/判据/文档修复,不新增功能、不改生产默认**:既有轮次判决全部有效(台账见 PLAN §1 与 ISSUES,不写死轮数;决策轮 P0–P26,P27 为验收修复轮)——这是明确暂停,不是漂移。复活条件(满足其一才重开):
 - 厂商 fp8 量化落地(MUSA cast 不再 no-op)→ I20 重开容量 2× 奖池;
 - 新 MUSA 硬件/驱动修复 I29 引擎级 graph 楔死 → graph 线重开;
 - 仓库公开后收到外部复现反馈/issue → 按外部输入排期;

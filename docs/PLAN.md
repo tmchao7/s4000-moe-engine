@@ -6,7 +6,7 @@
 
 ## 0. 当前栈与已判决(不要重测)
 
-**生产栈**:`attention=triton_paged`(默认)、`moe_backend=grouped_mm`(prefill)、`decode_moe_backend=bmm_dense`、`enforce_eager=True`、`scheduler=stall_free`(在线)/`fcfs`(离线)、TP2/EP2、chunk-256。30B eager b1 decode 步时 142–159 ms(口径相关;**P25 口径注记**:文档中另有 181.57 ms 一数,出自 P22 ⑧ 的 30B 单载窗口,含采样面、非同一负载口径——引用时注明出处,勿跨口径对比);**分段图已终局(P12 在线 FAIL + P13 修复验证:padding 税证实并消除,残余 AR 串行化 +1.0~4.7% 超 F2 门)→ 定格为单流可选开关,服务化分支关闭**;离线 b32 133 tok/s;**生产栈容量下界 1.070 req/s(1.6× 档双口径 100%,P13)**;短 prompt 四档 Poisson 全 100% SLO(TPOT p95 0.26–0.29);**1k 长上下文:冷缓存需 chunk-1024(0.5 档 90.6% SLO 过门),暖缓存任意 chunk 100%(P13)**。
+**生产栈**:`attention=triton_paged`(默认)、`moe_backend=grouped_mm`(prefill)、`decode_moe_backend=bmm_dense`、`enforce_eager=True`、`scheduler=stall_free`(在线)/`fcfs`(离线)、TP2/EP2、chunk-256。30B eager b1 decode 步时 142 ms(口径相关;**P25 口径注记**:文档中另有 181.57 ms 一数,出自 P22 ⑧ 的 30B 单载窗口,含采样面、非同一负载口径——引用时注明出处,勿跨口径对比);**分段图已终局(P12 在线 FAIL + P13 修复验证:padding 税证实并消除,残余 AR 串行化 +1.0~4.7% 超 F2 门)→ 定格为单流可选开关,服务化分支关闭**;离线 b32 133 tok/s;**生产栈容量下界 1.070 req/s(1.6× 档双口径 100%,P13)**;短 prompt 四档 Poisson 全 100% SLO(TPOT p95 0.26–0.29);**1k 长上下文:冷缓存需 chunk-1024(0.5 档 90.6% SLO 过门),暖缓存任意 chunk 100%(P13)**。
 
 **已判决(负结果也是结论)**:投机解码 NO-GO(α≈0 且 c=0.39);**I19 判决(P11):b1 固定等待主体 = 逐算子 host launch 开销,分段 replay 可回收 36.2 ms/步**(单算子融合被否定、replay 有效——两条自洽);整图 graph 否决(I29:TP2 引擎级间歇性 MCCL replay 楔死,barrier 无效),**分段图(图内零 MCCL)离线验证成立但在线否决(P12)+ 修复验证后仍转正失败(P13:padding 税已除,残余 AR 串行化 +1.0~4.7%)→ 服务化分支关闭,定格单流开关**;**I30 关闭(P13 ABA:现树快于 pre-P8 栈 23–51%,P9 回归主张被否定)**;**I8 长上下文闭合(P13:冷缓存塌=chunk 粒度,chunk-1024 解;准入=稳定性)**;**split=0 与 chunk-2048 默认化均否决(P10 实测)**;profiled placement 不采用;fused RMSNorm / bmm 容量收缩不采用;host-sync 移除与 mixed-split 已采纳默认开;30B 首 batch 为一次性 warmup 态(I31,token 门必丢首 batch)。
 
@@ -19,6 +19,21 @@
 | C | 结构化输出 xgrammar | ① bitmask 语义 vs 官方 CPU apply ② schema 合法率 100% ③ regex 终止 ④ 不约束 bitwise 不变 ⑤ 开销 ≤10% ⑥ 校验/降级 ⑦ API 冒烟 | **判决 PASS(11-08)**:①支撑集逐位相等 ②四 schema 16/16 合法+grammar 终止 ③fullmatch ④中性路径 ⑤1.028× ⑥400/降级 ⑦8/8;`guided_json`/`guided_regex`/`response_format json_schema` per-request opt-in;报告 benchmarks/P24-guided.md |
 
 其余 backlog:n>1 并行采样、seed(MUSA RNG 语义厂商风险)、tools、swap 抢占/KV offload、PD 流式/多实例、json_object/guided_choice、bitmask triton-mtgpu 内核。
+
+## 0b. P27 验收修复轮(2026-11-08;冻结态缺陷修复,不新增功能)
+
+独立验收审计(P26+ 交接包)判 A 机械门 PASS、B/C/D/E FAIL,本轮逐项修复并复验:
+
+| 项 | 修复 | 验证 |
+|---|---|---|
+| **I39 overlap stale prefill 行越界(high)** | `_prune_batch` 用冻结 `prefill_flags`;`num_cached >= num_prompt_tokens` 的已完成 prefill 行丢弃,不再发 1-token prefill 行 | `tests/p25_overlap_prefill_boundary.py` C1(512/768/1024+chunk 256/512);旧代码失败、新代码通过 |
+| **I40 冻结记账(medium)** | `ScheduledBatch` 冻结 `prefill_flags`;`postprocess/_finish_step` 只用冻结 `query_lens/prefill_flags`(vLLM V1 同规则) | 同上 C2:200-token 中途到达后 num_cached 记 200(旧代码 1) |
+| **S4 测试语义** | p24 g2/g3 改 greedy(采样可合法空白循环到 max_tokens);p24 g5/p16pri 15% 锚点/TTFT 5×/p22sam e2e 全部 informational-only;`p23/p25 --stage` 失败返回 rc=1 | p24 单跑 PASS;强门 16/16 |
+| **D1 pytest 干净 checkout** | `test_benchmarking_v3.py` 指回 `scripts/archive/p13_*`;`remote_regression.sh` 镜像同步(先删目录再解包) | 干净服务器树 `pytest 28/28`(无 `scripts/p13_*.py` 残留) |
+| **公开复现链(E1–E3)** | p16lru/p16pri/p24 g1 支持 `--model`;runner 传 `--model/--out`;pyproject 增 `test`/`plot` extras;SETUP 改 `pip install -e ".[test,plot]"` | 服务器 16 套全跑通;SETUP 命令链可执行 |
+| **文档/脱敏(D2–D11,E4–E9)** | t5 数字、TEST-MATRIX 15%/17 行/抢占行、CLOSEOUT I28、README archive/台账指针、ISSUES E1/死路径、PLAN I30/159ms、torch 版本、AGENTS 链接、面试/简历文案、`.gitignore` 注释 | `check_docs` rc=0;逐条对照证据源 |
+
+回归入口扩为 **16 套**(新增纯 CPU `boundary` 门);服务器强门 **16/16 rc=0**,pytest **28/28**;本地 fuzz 60 组/3048 行 0 违规。生产默认栈未变,项目仍为冻结态。详见 `docs/ACCEPTANCE-FIX-REPORT.md`(本地)。
 
 ## 1. P16–P18 迭代内容(2026-11-07 立项;用户三方向合成:统一混合 batch + KV 调度做足 → KV int8 量化 → PD 小模型推进;30B 只做点睛)
 
@@ -94,13 +109,13 @@ I30 关闭 / I33 修复验证后段图定格单流开关 / I8+I26 闭合(chunk �
 | attention 等价 | `docs/numerics-policy.md` 五层门 L1–L5(实现 `scripts/p6_decide_attention_equivalence.py`) | L1 max_abs<2e-3;L2 翻转率 <0.5% 且翻转处 margin <0.5;L3 首 token 100%+退化 0+人工判读;L4 双端自确定;L5 在线 SLO | ✅ paged 已转正;`scripts/p5_decide.py::ATTENTION_GATES` 为历史保留,阈值不改 |
 | graph 转正(双轨) | `scripts/p5_decide.py::GRAPH_GATES` + P9-graph.md §4(P11 修正:30B token 门丢首 batch,I31) | token 全等(b1/b8/b32,稳态)+ CV ≤5% + 显存增量 ≤2 GiB;b1 ≥+15% 转正 | **离线五项全过(b1 −23.7%),但 P12 在线 A/B FAIL → 不转正**;整图维持否决(I29);门本身需补非桶边界 batch(P12 教训) |
 | MoE 后端采用 | 已过期(历史门) | b16/b32 吞吐比 ≥1.08、CV ≤5% | ✅ bmm_dense 已过 |
-| 在线 SLO(双口径) | v3 口径,逐请求从 records 复算 | standard: TTFT ≤2.0 s 且请求级 TPOT ≤0.5 s;strict: + ITL ≤1 s | 生产门;v4 回归门 TPOT p95 ≤0.343 当前被 I30 顶着 |
+| 在线 SLO(双口径) | v3 口径,逐请求从 records 复算 | standard: TTFT ≤2.0 s 且请求级 TPOT ≤0.5 s;strict: + ITL ≤1 s | 生产门;v4 回归门 TPOT p95 ≤0.343 现树 0.26–0.29 达标(I30 已关闭) |
 | 回归完整性 | `tests/p2_grouped_mm.py`、`tests/p6_bmm_dense_tiny.py`、`tests/p8_scheduler_gaps.py`、`tests/test_benchmarking_v3.py` | 六配置逐 token 全等 rc=0;调度单测 6/6;v3 单测 28/28 | 每轮开工先跑(服务器) |
 | 长上下文改进(历史) | P9-long-context.md | 1k 50% 档 TTFT p50 ≤2 s | ✅ chunk-2048 达成(1.036 s);后续回归基线 |
 
 ## 3. 红线与 SOP
 
-全部集中在 [AGENTS.md](../AGENTS.md)(仓库根,agent 入口),本文不重复。
+全部集中在仓库根 `AGENTS.md`(本地 agent 入口,公开仓库不含;公开读者按 [SETUP.md](./SETUP.md) 与 [HANDOFF.md](./HANDOFF.md) 操作),本文不重复。
 
 ## 4. 文档地图
 

@@ -24,6 +24,16 @@ serve = [
     "uvicorn>=0.30",
     "prometheus-client>=0.21",
 ]
+# Public reproduction chain extras: pytest suites + xgrammar structured-output
+# tests + matplotlib/SciencePlots for scripts/render_metrics.py.
+test = [
+    "pytest>=8",
+    "xgrammar>=0.2.7",
+]
+plot = [
+    "matplotlib>=3.8",
+    "SciencePlots>=2.0",
+]
 
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"

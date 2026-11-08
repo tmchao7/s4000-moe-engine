@@ -53,7 +53,7 @@
 | 不做 | 理由 |
 |---|---|
 | Radix tree 前缀缓存 | 当前 block-hash 已能命中整块前缀；在单实例、短对话负载下收益不足以抵消复杂度，留作后续。 |
-| 投机解码 / LoRA / 多模态 / 分离式部署 | 与"双卡 MoE 推理引擎"主线无关，面试项目里属于堆功能。 |
+| 投机解码 / LoRA / 多模态 / 分离式部署 | 与"双卡 MoE 推理引擎"主线无关，在单机双卡的定位下属于堆功能。 |
 | 多实例/多节点调度 | 硬件只有 2 卡单机；分布式调度无法验证。 |
 | 用 CUDA 生态的 CUDA Graph / cutlass kernel 直接套 | S4000 无对应能力（MUSA graph TP2 replay 间歇楔死 I29、无 FP8 算力），套了也跑不动。 |
 | 引入 MoonEP / UniEP / DeepGEMM 源码 | 前提是几十卡 all-to-all 或 SM90+FP8，与 2 卡 replicated-hidden + all-reduce 不匹配；只借鉴融合划分。 |
@@ -62,4 +62,4 @@
 
 - 它已经不是"nano-vllm 换设备"：调度、指标、服务化、确定性与评测方法都补齐到了**可解释、可复现、可对比**的程度。
 - 与 vLLM/SGLang 的真实差距集中在：graph capture（硬件阻塞）、投机解码（判负）、量化推理运行时（平台 fp8 no-op，见 ISSUES I20 终判）、radix 前缀缓存、多实例与多节点、以及自定义 kernel 的成熟度（我们的 paged/MoE kernel 还在"正确 + 局部更快"阶段）。
-- P22–P24 已把服务面对齐（采样面/overlap 调度/结构化输出），P25 评审轮修复了 overlap 的两个状态机缺陷（ISSUES I37/I38）并为运行时开关补了服务端 CLI（`--scheduler-overlap`）。当前差距的量化比对与求职视角评估为本地维护文档，不入库（见 `docs/P25-review.md` §4.1）。
+- P22–P24 已把服务面对齐（采样面/overlap 调度/结构化输出），P25 评审轮修复了 overlap 的两个状态机缺陷（ISSUES I37/I38）并为运行时开关补了服务端 CLI（`--scheduler-overlap`）。当前差距的量化比对与展示定位评估为本地维护文档，不入库。

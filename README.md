@@ -16,7 +16,7 @@
 
 跑在摩尔线程 MTT S4000（MUSA 全栈，无 FP8 算力）上的 Qwen3-30B-A3B 双卡 MoE 推理引擎。TP2/EP2、自研 Triton paged attention、stall-free 混批调度、OpenAI 兼容流式服务。引擎底座是 MIT 协议的 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)（约 1.4k 行）；MUSA 适配、MoE 模型、调度/服务化和全部平台能力是本项目写的，上游版权见 [LICENSE](LICENSE)。
 
-所有性能结论出自预注册冻结门的 A/B 实验：先写判据再跑，跑完不改阈值，负结果照录——P0 到 P26 共 27 轮，判决台账见 [docs/PLAN.md](docs/PLAN.md) §1；实验轮的报告与证据 JSON+sha256 在 [benchmarks/](benchmarks/) 及 [benchmarks/archive/](benchmarks/archive/)（P25 评审报告在 docs/P25-review.md），纯整理轮以台账判决为准。
+所有性能结论出自预注册冻结门的 A/B 实验：先写判据再跑，跑完不改阈值，负结果照录——P0 到 P26 共 27 轮，判决速览见 [docs/HANDOFF.md](docs/HANDOFF.md) §1（PLAN 保留冻结门与 P16–P18 判决）；实验轮的报告与证据 JSON+sha256 在 [benchmarks/](benchmarks/) 及 [benchmarks/archive/](benchmarks/archive/)（P25 评审报告在 docs/P25-review.md），纯整理轮以台账判决为准。
 
 ## 结果
 
@@ -51,7 +51,7 @@
 | 项 | 配置 |
 |---|---|
 | GPU | 2× MTT S4000（48GB / 卡，PCIe Gen5 x16） |
-| 软件栈 | torch 2.11 + torch_musa 2.11、MCCL 2.11、Triton（mtgpu backend）、Ubuntu 22.04 |
+| 软件栈 | torch 2.11.0.post1 + torch_musa 2.11.0.post1、MCCL 2.11、Triton（mtgpu backend）、Ubuntu 22.04 |
 | 模型 | Qwen/Qwen3-30B-A3B-Instruct-2507-FP8（30.5B 总参 / 3.3B 激活，128 专家 top-8）；tiny 模型由 `scripts/make_tiny_moe.py` 生成 |
 | 环境搭建 | [docs/SETUP.md](docs/SETUP.md)——软件栈、模型下载、复现链路（本仓库仅支持 MUSA 后端） |
 
@@ -150,8 +150,9 @@ python3 scripts/render_metrics.py    # 需要 matplotlib + SciencePlots
 | P24 结构化输出(xgrammar) | 完成 | **guided_json/guided_regex/response_format json_schema**;位掩码与官方 CPU apply 逐位一致;四 schema 16/16 合法 + grammar 终止;约束开销 **1.028×**;API 端到端冒烟 |
 | P25 评审与修复 | 完成 | 深度代码审查 + 2026-11 竞品比对;两个已复现的 overlap 状态机缺陷当日修复(I37/I38,排空式收尾 bitwise 全等);`--scheduler-overlap` CLI 补齐;整理轮归档 18 个文件、引擎 -357 行 |
 | P26 收官轮 | 完成 | 测试映射矩阵 + 一键回归(15 套,含冻结门守卫)+ 文档一致性 linter + 公开环境文档;口径与可信度边界入 README;悬置项终判 + 停止线;收官验证 15/15 |
+| P27 验收修复轮 | 完成 | 独立验收审计的 high/medium 全修:overlap stale prefill 行 + 冻结记账(I39/I40)、p24 greedy + informational g5、pytest 干净 checkout、公开复现链 `--model`/extras、16 套回归(新增 CPU 边界门);强门 **16/16** |
 
-正确性门:tiny TP1/TP2 × loop/grouped/bmm 六配置逐 token 全等;跨后端比较采用"候选确定性 + 五层等价门"(数值契约见 [docs/numerics-policy.md](docs/numerics-policy.md))。历史轮次报告(P0–P21)在 [benchmarks/archive/](benchmarks/archive/),当前轮(P22 起)在 [benchmarks/](benchmarks/)。
+正确性门:tiny TP1/TP2 × loop/grouped/bmm 六配置逐 token 全等;跨后端比较采用"候选确定性 + 五层等价门"(数值契约见 [docs/numerics-policy.md](docs/numerics-policy.md))。历史轮次报告(P0–P17/P19 有独立报告)在 [benchmarks/archive/](benchmarks/archive/);P18/P20/P21 为并入相邻报告/台账的测量轮,不单列报告。当前轮(P22 起)在 [benchmarks/](benchmarks/)。
 
 </details>
 

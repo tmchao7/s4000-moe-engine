@@ -158,8 +158,8 @@ def main():
     args = parser.parse_args()
 
     if args.stage != "all":
-        STAGES[args.stage](args)
-        return 0
+        verdict = STAGES[args.stage](args)
+        return 0 if verdict.get("stage_pass") else 1
 
     env = dict(os.environ, PYTHONPATH=REPO)
     verdict, ok = {}, True

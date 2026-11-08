@@ -323,7 +323,7 @@ def test_http_status_survives_stream_failure(failure):
 
 
 def test_aba_decisions():
-    judge = _load_module("p13_decide", "scripts/p13_decide.py")
+    judge = _load_module("p13_decide", "scripts/archive/p13_decide.py")
     def arm(value):
         return {"summary": [{"load_fraction": f, "repeat": r, "counts": {"attempted": 128, "ok": 128},
                               "tpot_p95_s": value} for f in (.9, 1.) for r in (1, 2, 3)]}
@@ -356,13 +356,13 @@ def test_summary_keeps_all_attempts_slo_and_server_timing():
 
 
 def test_aba_rejects_different_workloads():
-    judge = _load_module("p13_decide", "scripts/p13_decide.py")
+    judge = _load_module("p13_decide", "scripts/archive/p13_decide.py")
     assert judge.aba({"args": {"seed": 1}}, {"args": {"seed": 2}},
                      {"args": {"seed": 1}})["reason"] == "benchmark configuration mismatch"
 
 
 def test_padding_requires_repeats_valid_batches_and_tokens():
-    judge = _load_module("p13_decide", "scripts/p13_decide.py")
+    judge = _load_module("p13_decide", "scripts/archive/p13_decide.py")
     payloads = []
     for _ in range(5):
         for mode in ("eager", "segment"):
@@ -380,7 +380,7 @@ def test_padding_requires_repeats_valid_batches_and_tokens():
 
 @pytest.mark.parametrize("memories", [(100, 100), (0, 1000), (10000, 0)])
 def test_runner_rejects_nonzero_gpu_memory(monkeypatch, memories):
-    runner = _load_module("p13_run", "scripts/p13_run.py")
+    runner = _load_module("p13_run", "scripts/archive/p13_run.py")
     output = '\n'.join(f'{i} MTT S4000 |0000:00|0%    {memory}MiB(49152MiB)'
                        for i, memory in enumerate(memories))
     monkeypatch.setattr(runner.subprocess, 'check_output', lambda *a, **kw: output)

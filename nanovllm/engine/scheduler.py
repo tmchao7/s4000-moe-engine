@@ -1,5 +1,5 @@
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 
 from nanovllm.config import Config
@@ -21,6 +21,11 @@ class ScheduledBatch:
     num_scheduled_tokens: int
     mode: str
     schedule_s: float = 0.0     # P23: wall time of the scheduling pass
+    # Frozen per-row phase at schedule time.  The overlap pipeline mutates the
+    # live ``seq.is_prefill`` / ``num_scheduled_tokens`` while the batch is in
+    # flight (that mutation is for the *next* batch), so postprocess/prune must
+    # read the row type from this snapshot, not from live sequence state.
+    prefill_flags: list[bool] = field(default_factory=list)
 
     def __iter__(self):
         yield self.sequences
@@ -92,6 +97,7 @@ class Scheduler:
             num_scheduled_tokens=sum(seq.num_scheduled_tokens for seq in seqs),
             mode=mode,
             schedule_s=perf_counter() - schedule_start,
+            prefill_flags=[seq.is_prefill for seq in seqs],
         )
 
     def _schedule_fcfs(self, speculative: bool = False,
@@ -377,7 +383,26 @@ class Scheduler:
         }
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], mode: str,
-                    logprobs: list | None = None):
+                    logprobs: list | None = None,
+                    query_lens: list[int] | None = None,
+                    prefill_flags: list[bool] | None = None):
+        """Apply one launched batch output.
+
+        query_lens / prefill_flags are the FROZEN row metadata of the batch
+        being collected.  The overlap pipeline schedules the next batch before
+        this batch collect and rewrites the live seq fields while doing so;
+        reading live seq.num_scheduled_tokens / seq.is_prefill here would
+        therefore credit this batch with the NEXT batch row shape (P25/F1
+        follow-up: a 200-token prefill row advanced by +1, and a completed
+        prefill row could be re-launched as a 1-token prefill row).  vLLM V1
+        has the same rule: output processing consumes
+        scheduler_output.num_scheduled_tokens, never live request state.
+        The fallback keeps the serial/archive callers unchanged.
+        """
+        if query_lens is None:
+            query_lens = [seq.num_scheduled_tokens for seq in seqs]
+        if prefill_flags is None:
+            prefill_flags = [seq.is_prefill for seq in seqs]
         token_events = []
         for row, (seq, token_id) in enumerate(zip(seqs, token_ids)):
             if seq.is_finished:
@@ -386,12 +411,21 @@ class Scheduler:
                 # down (blocks deallocated, removed from queues) — skip it.
                 # Serial never schedules finished seqs, so this is a no-op there.
                 continue
+            q = query_lens[row]
+            was_prefill = prefill_flags[row]
+            seq.num_scheduled_tokens = q
+            seq.is_prefill = was_prefill
             self.block_manager.hash_blocks(seq)
-            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_cached_tokens += q
             seq.num_scheduled_tokens = 0
-            if seq.is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            if was_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
+            if was_prefill:
+                # Final prefill chunk: the next schedule is decode.  Serial
+                # sets this in the decode loop; doing it here keeps the live
+                # invariant true for overlap prune/defer decisions.
+                seq.is_prefill = False
             now = perf_counter()
             seq.record_token(now)
             hit_eos = not seq.ignore_eos and token_id == self.eos

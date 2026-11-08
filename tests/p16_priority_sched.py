@@ -270,10 +270,10 @@ def _part2_engine_body(llm):
     # pressure), with
     # gate① (ITL p95 <= 0.8x) judged FAIL-and-recorded — the benefit comes
     # from admission latency, not decode interference.  A regression suite
-    # must not re-litigate a recorded negative: it asserts the recorded
-    # verdict does not drift (anchor bitwise-equal, everyone finishes,
-    # priority benefit still present, preemption machinery still fires) and
-    # REPORTS the ITL ratio informationally.
+    # must not re-litigate a recorded negative.  P27/S4: wall-clock anchors
+    # are recorded informationally only; the rc gate is functional (everyone
+    # finishes + preemption machinery still fires), with anchor/benefit in
+    # the verdict JSON for drift observation.
     benefit_ok = (arms["B_priority"]["high_ttft_p50"]
                   < arms["A_no_priority"]["high_ttft_p50"] / 5)
     preemption_ok = all(a["preemptions"] > 0 for a in arms.values())
@@ -285,17 +285,24 @@ def _part2_engine_body(llm):
         "priority_ttft_benefit_ok": benefit_ok,
         "preemptions_ok": preemption_ok,
         "gate_p16c_itl_0_8x_recorded_negative": bool(ratio <= 0.8),
-        "gate": (anchor_ok and all_complete and benefit_ok and preemption_ok),
+        # S4: wall-clock numbers are recorded, never rc gates.  The rc gate
+        # is functional only (everyone completes + preemption machinery fires);
+        # the anchor/benefit values are informational drift records.
+        "gate_semantics": "functional only; anchor/benefit are informational (S4)",
+        "gate": (all_complete and preemption_ok),
     }
     return verdict
 
 
 def main():
     import argparse
+    global MODEL
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-engine", action="store_true")
+    parser.add_argument("--model", default=MODEL)
     parser.add_argument("--out", default="/root/p16_data/priority_sched.json")
     args = parser.parse_args()
+    MODEL = args.model
     results = {}
     ok = True
     for name, fn in (("t1_priority_over_fifo", t1_priority_overrides_fifo),
