@@ -42,7 +42,7 @@ mthreads-gmi | grep MiB   # 空闲时应为 0MiB
 ```bash
 pip install -e .
 
-# ① tiny 模型正确性门(分钟级,TP1;TP2 加 --tensor-parallel-size 2 相关参数见脚本)
+# ① tiny 模型正确性门(分钟级;p2 套件内建跑 TP1+TP2 全部六配置)
 PYTHONPATH=. python3 tests/p2_grouped_mm.py
 PYTHONPATH=. python3 tests/p6_bmm_dense_tiny.py
 python3 -m pytest tests/test_benchmarking_v3.py -q

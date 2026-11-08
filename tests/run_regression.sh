@@ -27,6 +27,7 @@ run() {
 
 # CPU-only first (fast fail), then GPU suites tiny→feature.
 run repro   env PYTHONPATH=. python3 tests/p25_review_repro.py
+run p5decide python3 tests/p5_decide.py
 run pytest  python3 -m pytest tests/test_benchmarking_v3.py -q
 run p8      env PYTHONPATH=. python3 tests/p8_scheduler_gaps.py
 run p2      env PYTHONPATH=. python3 tests/p2_grouped_mm.py

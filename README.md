@@ -16,7 +16,7 @@
 
 跑在摩尔线程 MTT S4000（MUSA 全栈，无 FP8 算力）上的 Qwen3-30B-A3B 双卡 MoE 推理引擎。TP2/EP2、自研 Triton paged attention、stall-free 混批调度、OpenAI 兼容流式服务。引擎底座是 MIT 协议的 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)（约 1.4k 行）；MUSA 适配、MoE 模型、调度/服务化和全部平台能力是本项目写的，上游版权见 [LICENSE](LICENSE)。
 
-所有性能结论出自预注册冻结门的 A/B 实验：先写判据再跑，跑完不改阈值，负结果照录——P0 到 P24 共 25 轮，每一轮都有报告、证据 JSON 和 sha256。
+所有性能结论出自预注册冻结门的 A/B 实验：先写判据再跑，跑完不改阈值，负结果照录——P0 到 P26 共 27 轮，每一轮都有报告、证据 JSON 和 sha256。
 
 ## 结果
 
@@ -129,7 +129,7 @@ python3 scripts/render_metrics.py    # 需要 matplotlib + SciencePlots
 详细设计见 [docs/architecture.md](docs/architecture.md)；当前迭代计划见 [docs/PLAN.md](docs/PLAN.md)；与 vLLM/SGLang 的能力对标见 [docs/engine-vs-vllm-sglang.md](docs/engine-vs-vllm-sglang.md)。
 
 <details>
-<summary><b>P0–P24 判决史（点击展开）</b></summary>
+<summary><b>P0–P26 判决史（点击展开）</b></summary>
 
 | 阶段 | 状态 | 关键数字 |
 |---|---|---|
@@ -148,6 +148,7 @@ python3 scripts/render_metrics.py    # 需要 matplotlib + SciencePlots
 | P23 overlap scheduler | 完成 | vLLM V1/SGLang 单飞流水线(opt-in):**稳态输出与串行逐位全等**(greedy+采样,30B 同);错峰翻转 0.347%;抢占场景 12/12 完成;I36 投机调度块边界 off-by-one 自查自修(MUSA 提交卡死 → launch 时刻块覆盖检查);b1/b16 步时 0.997× |
 | P24 结构化输出(xgrammar) | 完成 | **guided_json/guided_regex/response_format json_schema**;位掩码与官方 CPU apply 逐位一致;四 schema 16/16 合法 + grammar 终止;约束开销 **1.028×**;API 端到端冒烟 |
 | P25 评审与修复 | 完成 | 深度代码审查 + 2026-11 竞品比对;两个已复现的 overlap 状态机缺陷当日修复(I37/I38,排空式收尾 bitwise 全等);`--scheduler-overlap` CLI 补齐;整理轮归档 18 个文件、引擎 -357 行 |
+| P26 收官轮 | 完成 | 测试映射矩阵 + 一键回归(15 套,含冻结门守卫)+ 文档一致性 linter + 公开环境文档;口径与可信度边界入 README;悬置项终判 + 停止线;收官验证 15/15 |
 
 正确性门:tiny TP1/TP2 × loop/grouped/bmm 六配置逐 token 全等;跨后端比较采用"候选确定性 + 五层等价门"(数值契约见 [docs/numerics-policy.md](docs/numerics-policy.md))。历史轮次报告(P0–P21)在 [benchmarks/archive/](benchmarks/archive/),当前轮(P22 起)在 [benchmarks/](benchmarks/)。
 

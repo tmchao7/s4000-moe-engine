@@ -1,4 +1,4 @@
-# CLOSEOUT — 遗留问题与状态总账(2026-11-08,P21 后)
+# CLOSEOUT — 遗留问题与状态总账(2026-11-08,P26 收官轮后)
 
 > 本文只做一件事:把"还剩什么"一次说清。技术细节以 [ISSUES.md](./ISSUES.md) 为准,当前状态以 [HANDOFF.md](./HANDOFF.md) 为准,厂商沟通物料以 [E-vendor-ticket.md](./E-vendor-ticket.md) 为准。
 

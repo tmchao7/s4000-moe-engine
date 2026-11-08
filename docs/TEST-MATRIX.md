@@ -11,6 +11,7 @@
 | decode 后端(bmm_dense)六配置全等 | `tests/p6_bmm_dense_tiny.py` | ✅ |
 | 调度契约:空批不崩/HOL 跳过保序/混合步契约/空 FCFS | `tests/p8_scheduler_gaps.py` 6/6 | ✅ |
 | 压测客户端口径(双 SLO/Wilson CI/分桶) | `tests/test_benchmarking_v3.py`(28) | ✅ |
+| 冻结门阈值边界(门文件被误改/阈值漂移即 fail) | `tests/p5_decide.py`(纯 CPU;P26 补入回归) | ✅ |
 | **块分配时序变化的实验必须带 bitwise 门**(I36 教训) | `tests/p23_overlap.py` t1/t2(稳态 bitwise)+ `tests/p25_overlap_fix.py` t1/t2(**中途翻转 bitwise,跨 256 块边界**) | ✅(I37/I38 后补齐) |
 | 投机预检查必须是执行的总和(I37) | `tests/p25_review_repro.py`(纯 CPU 门)+ p25fix t3(KV 压力 defer) | ✅ |
 | 运行时开关的排空式收尾,禁止"排了再丢"(I38) | `tests/p25_overlap_fix.py` t1(单次中途 disable)+ t2(翻转窗 ABA) | ✅ |
