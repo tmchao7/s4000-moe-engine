@@ -6,7 +6,7 @@ engine's KV pool axes ([2, L, blocks, block_size, kv_heads, head_dim]) so
 export/import are pure strided copies with no repacking.
 
 M2 adds channels (local, TCP+pinned) on top; the control plane lives in
-scripts/p15_pd_1p1d.py.
+scripts/archive/p15_pd_1p1d.py.
 """
 from nanovllm.pd.kv_channel import (
     KVBlockBuffer,

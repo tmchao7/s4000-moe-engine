@@ -10,13 +10,13 @@
 ![Parallel](https://img.shields.io/badge/Parallel-TP2%20%2B%20EP2-0D9488)
 ![Offline](https://img.shields.io/badge/Offline-141.5%20tok%2Fs%20%28b64%29-1B9E77)
 ![Online](https://img.shields.io/badge/Online-%E2%89%A51.07%20req%2Fs%20%C2%B7%20100%25%20SLO-7C3AED)
-![Verdicts](https://img.shields.io/badge/Rounds-P0%E2%80%93P18%20all%20judged-111827)
+![Verdicts](https://img.shields.io/badge/Rounds-P0%E2%80%93P21%20all%20judged-111827)
 
 </div>
 
 面向国产 GPU（摩尔线程 MTT S4000 / MUSA 全栈）的 **Qwen3-30B-A3B 双卡 MoE 推理引擎**：TP2/EP2、自研 Triton paged attention、stall-free 混批调度、OpenAI 兼容流式服务，并以**预注册冻结门的 A/B 方法**完成 14 轮性能/正确性判决。
 
-> 引擎底座参考了 MIT 协议的轻量推理引擎 nano-vllm（~1.4k 行，[docs/upstream-readme.md](docs/upstream-readme.md)）；MUSA 适配、MoE 模型支持、调度/服务化与全部平台能力为本项目实现，上游版权声明见 [LICENSE](LICENSE)。
+> 引擎底座参考了 MIT 协议的轻量推理引擎 nano-vllm（~1.4k 行，[nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)）；MUSA 适配、MoE 模型支持、调度/服务化与全部平台能力为本项目实现，上游版权声明见 [LICENSE](LICENSE)。
 
 ---
 
@@ -79,7 +79,7 @@
 详细设计见 [docs/architecture.md](docs/architecture.md);当前迭代计划见 [docs/PLAN.md](docs/PLAN.md);问题台账见 [docs/ISSUES.md](docs/ISSUES.md) 与 [docs/CLOSEOUT.md](docs/CLOSEOUT.md)。
 
 <details>
-<summary><b>📈 当前进度（P0–P18 全部判决完毕 — 点击展开）</b></summary>
+<summary><b>📈 当前进度（P0–P21 全部判决完毕 — 点击展开）</b></summary>
 
 | 阶段 | 状态 | 关键数字 |
 |---|---|---|

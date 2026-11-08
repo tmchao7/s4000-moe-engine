@@ -243,8 +243,7 @@ def main():
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(verdict, f, indent=1)
-    print(json.dumps({k: v for k, v in verdict.items() if k != "flip" or True},
-                     indent=1, ensure_ascii=False)[:2000], flush=True)
+    print(json.dumps(verdict, indent=1, ensure_ascii=False), flush=True)
     print(f"[gate] {'ALL GATES PASS' if verdict['gate_all'] else 'GATE FAIL'}", flush=True)
     llm.exit()
     return 0 if verdict["gate_all"] else 1

@@ -9,7 +9,7 @@ directions as contiguous strided copies — no per-token gather — and matches
 how the decode side allocates pages before import.
 
 Bitwise contract: export→import is a pure copy; a round-trip must reproduce
-the source blocks exactly (verified by tests/p15_pd_m1_kv.py).
+the source blocks exactly (verified by tests/archive/p15_pd_m1_kv.py).
 """
 from __future__ import annotations
 

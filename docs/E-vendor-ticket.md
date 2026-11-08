@@ -1,6 +1,6 @@
 # 厂商工单包:MUSA Graph 引擎级 replay 楔死 + 图可执行上限求证(I29/E4/E6/I32-②)
 
-> 状态:待发送(2026-10-29 夜整理;2026-10-30 P14 补充官方文档线索、2048 交叉印证、MCCL_GRAPH_MIXING_SUPPORT 探针数据;**外发须用户亲自操作**)。发送渠道:摩尔线程开发者论坛 developer.mthreads.com / vllm-musa GitHub issues。
+> 状态:待发送(2026-10-29 整理;10-30 P14 补充;**2026-11-08 P20 补充 fp8 e4m3 cast 静默 no-op 证据,见 §4**;外发须用户亲自操作)。发送渠道:摩尔线程开发者论坛 developer.mthreads.com / vllm-musa GitHub issues。
 > 我们是自研推理引擎(基于 nano-vllm fork),非商业客户;但报告带最小复现与分级探针。官方文档称 S4000 上 MUSA Graph 默认开启,与我们观测的引擎级楔死矛盾——这正是要请厂商澄清的核心。
 
 ## 0. 环境版本
@@ -15,7 +15,7 @@
 
 **现象**:双卡 TP2 引擎在 graph replay 路径上间歇性 rendezvous 楔死。崩溃形态三种(对称双 rank 自旋 / 单 rank 死+另一 rank 旋 / watchdog 10 min 后杀且报错点漂移)。非确定复现:同一配置有时全绿。
 
-**分级探针结果**(`tests/p9_mccl_graph_probe.py`,每 case 独立进程+watchdog):
+**分级探针结果**(`tests/archive/p9_mccl_graph_probe.py`,每 case 独立进程+watchdog):
 
 | case | 结果 |
 |---|---|
@@ -43,7 +43,7 @@
 
 结论:打开混用支持能缓解但不能消除楔死,**说明"图内/图外 MCCL 混用"是成分之一、尚有另一个楔死源**。请厂商:① 确认单通信器(WORLD)的 captured/non-captured 混用是否也在该死锁机制覆盖范围内;② 指认剩余楔死源或提供图级诊断。详细数据:`benchmarks/archive/P14-mccl-mixing.md`。
 
-**P15 补充(2026-11-07,torch 2.11.0.post1 新栈实测)**:楔死在新栈仍存在且**形态改变**——纯张量梯子(96 AR/大载荷/bmm 混合/2400 节点)7/8 全绿,但引擎级 0.6B TP2 paged 整图 ×3 = 2 clean + **1 WEDGE(楔在 engine-init/capture 段而非首次 replay)**,且留下**驱动级无主残显存 22GB**(mthreads-gmi 显示占用但进程表为空,跨容器重启/完整关机-开机/克隆实例均持久)。证据:`tests/p15_i29_engine_probe.py`。请厂商:③ 解释 init/capture 阶段楔死的机制与残留显存为何不被驱动回收。
+**P15 补充(2026-11-07,torch 2.11.0.post1 新栈实测)**:楔死在新栈仍存在且**形态改变**——纯张量梯子(96 AR/大载荷/bmm 混合/2400 节点)7/8 全绿,但引擎级 0.6B TP2 paged 整图 ×3 = 2 clean + **1 WEDGE(楔在 engine-init/capture 段而非首次 replay)**,且留下**驱动级无主残显存 22GB**(mthreads-gmi 显示占用但进程表为空,跨容器重启/完整关机-开机/克隆实例均持久)。证据:`tests/archive/p15_i29_engine_probe.py`。请厂商:③ 解释 init/capture 阶段楔死的机制与残留显存为何不被驱动回收。
 
 ## 2. 问题二:MUSA 驱动每进程存活图可执行文件 ~2048 上限(torchada 已披露,求证细节)
 
@@ -63,8 +63,8 @@ torchada README:"The MUSA driver caps the number of live graph *executables* per
 
 ## 5. 我方证据清单(随工单附)
 
-- `tests/p9_mccl_graph_probe.py`(分级探针,独立进程+watchdog)
-- `tests/p8_graph_padfix.py --tp 2`(引擎级复现 harness,两进程口径)
+- `tests/archive/p9_mccl_graph_probe.py`(分级探针,独立进程+watchdog)
+- `tests/archive/p8_graph_padfix.py --tp 2`(引擎级复现 harness,两进程口径)
 - `benchmarks/archive/P9-graph.md`、`benchmarks/archive/P11-graph.md`、`benchmarks/archive/P12-serving.md`(全过程与冻结门)
 - 分段图替代实现作为 workaround 已验证:`NANOVLLM_SEGMENT_GRAPH=1`(图内零 MCCL,每层两段,all-reduce eager 在段间)——0.6B/8B/30B 离线门全过、768 图零失败、跨臂逐位 0 翻转;但在 TP2 上只能作为 workaround,批量 ≥8 时因桶 padding 与段间 eager AR 净负(详见 P12)。
 - 运行环境:`docs/musa-pitfalls.md` 记录的其他平台坑(跨块 strided view D2H 返回垃圾 I28、FP8 逐 expert 反量化 351 s 等)。
@@ -72,3 +72,20 @@ torchada README:"The MUSA driver caps the number of live graph *executables* per
 ## 6. 姿态与诉求
 
 我们不需要商业支持,只求:① 引擎级 replay 楔死的已知限制/修复计划;② 图可执行上限的官方口径与 torch_musa 直连轮换路线图;③ 图级 debug/dump 工具。若 ①短期无解,分段图(图内零 MCCL)是我们的既定路线,请帮忙审阅其 capture/replay 姿势是否符合 runtime 预期(代码 ~200 行,`model_runner.py::capture_segment_graphs`)。
+
+
+## 4. 问题四(P20 新增):torch float8_e4m3fn 在 MUSA 上 cast 静默不量化
+
+**现象**:`torch.float8_e4m3fn` dtype 存在且 `tensor.to(torch.float8_e4m3fn)` 不报错,但 **cast 后数值完全未量化**——含 492.0 的张量 cast 再转回 fp32 后仍为 492.0(e4m3 最大值 448,正确实现必然 clip 到 448 并带 ~3% 相对误差;实测误差恰为 0)。
+
+**最小复现**(MUSA 设备上三行):
+
+```python
+x = torch.tensor([0.5, 100.0, 492.0], device="musa")
+y = x.to(torch.float8_e4m3fn).to(torch.float32)
+print(y)   # 期望 [0.5, 100, 448](clip),实测 [0.5, 100, 492] — cast 是 no-op
+```
+
+**影响**:静默错误比崩溃更危险——任何依赖 fp8 量化收益的路径(如 KV cache fp8)会得到"看起来成功、实际未量化"的结果。**请求确认**:torch_musa 的 float8 cast 是否已实现?若未实现,建议 cast 时显式 raise 而非静默拷贝;若已实现,请提供正确性验证口径。
+
+**环境**:torch 2.11.0.post1 + torch_musa 2.11,MTT S4000。

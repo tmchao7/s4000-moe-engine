@@ -24,11 +24,11 @@ except ImportError:  # pragma: no cover - exercised only on non-accelerator host
 
 
 # Tuned on the 2026-11 S4000 image (torch 2.11 + triton 3.2.0, mtgpu) by
-# tests/p15_paged_autotune.py: per-batch winners, kernel-level geomean ~2.0x
+# tests/archive/p15_paged_autotune.py: per-batch winners, kernel-level geomean ~2.0x
 # over the historical (32, 4, 1) point that shipped untuned.  NOT the default:
 # the retile changes the online-softmax accumulation order and the 0.6B e2e
 # gate measured a 0.81% per-step top-1 flip rate on identical contexts
-# (tests/p15_paged_gate.py) — above the 0.5% frozen L2 bar — so the tuned
+# (tests/archive/p15_paged_gate.py) — above the 0.5% frozen L2 bar — so the tuned
 # table ships as an opt-in until a contract change is accepted for it
 # (same class as the I4 sdpa<->paged divergence).  Dispatch keys on the
 # launch-time batch, constant across a captured graph bucket.
