@@ -179,6 +179,20 @@ class BlockManager:
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
+    def _blocks_needed(self, seq: Sequence, launch_len: int) -> int:
+        """P23: block-table shortfall for a decode row whose input token sits
+        at index ``launch_len - 1`` (the stale schedule sees the sequence one
+        postprocess-append shorter than it will be at launch)."""
+        need = (launch_len - 1) // self.block_size + 1
+        return max(0, need - len(seq.block_table))
+
+    def can_append_at(self, seq: Sequence, launch_len: int) -> bool:
+        return len(self.free_block_ids) >= self._blocks_needed(seq, launch_len)
+
+    def may_append_at(self, seq: Sequence, launch_len: int):
+        while self._blocks_needed(seq, launch_len) > 0:
+            seq.block_table.append(self._allocate_block())
+
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size

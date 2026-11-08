@@ -20,6 +20,7 @@ class ScheduledBatch:
     context_lens: list[int]
     num_scheduled_tokens: int
     mode: str
+    schedule_s: float = 0.0     # P23: wall time of the scheduling pass
 
     def __iter__(self):
         yield self.sequences
@@ -62,22 +63,55 @@ class Scheduler:
                 return True
         return False
 
-    def schedule(self) -> ScheduledBatch:
+    def schedule(self, speculative: bool = False, inflight: list | None = None) -> ScheduledBatch:
+        """P23: ``speculative=True`` runs the pass one step ahead of the GPU
+        (overlap pipeline).  The pass must then never preempt — the victim
+        choice would see stale state and could evict a sequence that is about
+        to finish (double free at its postprocess).  A decode row that cannot
+        cover its launch-time block table without preemption therefore DEFERS
+        the whole decision to the next serial schedule (which runs after that
+        step's postprocess, i.e. with exactly the state the serial path would
+        see).  ``inflight`` lists the sequences of the launch currently on the
+        GPU: each of them grows by one token before the speculative batch
+        launches, so its block coverage must be checked at len+1 (I36 fix —
+        the naive ``len % block_size == 1`` check missed every block boundary
+        and produced out-of-range KV slots / block-table reads)."""
+        schedule_start = perf_counter()
         if self.policy == "fcfs":
-            seqs, mode = self._schedule_fcfs()
+            seqs, mode = self._schedule_fcfs(speculative, inflight)
         else:
-            seqs, mode = self._schedule_stall_free()
+            seqs, mode = self._schedule_stall_free(speculative, inflight)
+        if mode == "defer":
+            return ScheduledBatch(sequences=[], query_lens=[], context_lens=[],
+                                  num_scheduled_tokens=0, mode="defer",
+                                  schedule_s=perf_counter() - schedule_start)
         return ScheduledBatch(
             sequences=seqs,
             query_lens=[seq.num_scheduled_tokens for seq in seqs],
             context_lens=[seq.num_cached_tokens + seq.num_scheduled_tokens for seq in seqs],
             num_scheduled_tokens=sum(seq.num_scheduled_tokens for seq in seqs),
             mode=mode,
+            schedule_s=perf_counter() - schedule_start,
         )
 
-    def _schedule_fcfs(self) -> tuple[list[Sequence], str]:
+    def _schedule_fcfs(self, speculative: bool = False,
+                       inflight: list | None = None) -> tuple[list[Sequence], str]:
         scheduled_seqs = []
         num_batched_tokens = 0
+        if speculative:
+            # P23: read-only pre-check — any decode seq whose launch-time
+            # block coverage would need a preemption defers the pass.
+            inflight_ids = {id(s) for s in (inflight or [])}
+            launch_len = lambda seq: len(seq) + (1 if id(seq) in inflight_ids else 0)
+            budget = self.max_num_batched_tokens
+            count = 0
+            for seq in self.running:
+                if budget == 0 or count >= self.max_num_seqs:
+                    break
+                if not self.block_manager.can_append_at(seq, launch_len(seq)):
+                    return [], "defer"
+                budget -= 1
+                count += 1
 
         # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
@@ -112,6 +146,12 @@ class Scheduler:
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
+            if speculative:
+                self.block_manager.may_append_at(seq, launch_len(seq))
+                seq.num_scheduled_tokens = 1
+                seq.is_prefill = False
+                scheduled_seqs.append(seq)
+                continue
             while not self.block_manager.can_append(seq):
                 if self.running:
                     victim = self._preempt_victim(requester=seq)
@@ -178,11 +218,28 @@ class Scheduler:
         del self.running[victim_idx]
         return victim
 
-    def _schedule_stall_free(self) -> tuple[list[Sequence], str]:
+    def _schedule_stall_free(self, speculative: bool = False,
+                             inflight: list | None = None) -> tuple[list[Sequence], str]:
         decode_seqs = []
         prefill_seqs = []
         token_budget = self.max_num_batched_tokens
         seq_budget = self.max_num_seqs
+        if speculative:
+            # P23: read-only pre-check before any mutation.  launch_len is the
+            # sequence length when the speculative batch launches: the batch
+            # currently on the GPU postprocesses first and appends one token
+            # to its own members (I36 fix — coverage must be checked at
+            # launch time, not at stale-schedule time).
+            inflight_ids = {id(s) for s in (inflight or [])}
+            launch_len = lambda seq: len(seq) + (1 if id(seq) in inflight_ids else 0)
+            budget, count = token_budget, 0
+            for seq in self.running:
+                if budget == 0 or count >= seq_budget:
+                    break
+                if not self.block_manager.can_append_at(seq, launch_len(seq)):
+                    return [], "defer"
+                budget -= 1
+                count += 1
 
         # Keep every admitted decode moving before admitting prefill work.
         # while (not for-range): each preemption removes an extra running seq,
@@ -192,6 +249,15 @@ class Scheduler:
             if token_budget == 0 or len(decode_seqs) >= seq_budget:
                 break
             seq = self.running.popleft()
+            if speculative:
+                # pre-check (same scan order/budgets) already verified the
+                # launch-time block coverage for this seq without preemption
+                self.block_manager.may_append_at(seq, launch_len(seq))
+                seq.num_scheduled_tokens = 1
+                seq.is_prefill = False
+                decode_seqs.append(seq)
+                token_budget -= 1
+                continue
             while not self.block_manager.can_append(seq):
                 if self.running:
                     victim = self._preempt_victim(requester=seq)
@@ -296,6 +362,12 @@ class Scheduler:
                     logprobs: list | None = None):
         token_events = []
         for row, (seq, token_id) in enumerate(zip(seqs, token_ids)):
+            if seq.is_finished:
+                # P23 overlap: a cancel (or any finish) can land between the
+                # in-flight launch and its collect; the seq was already torn
+                # down (blocks deallocated, removed from queues) — skip it.
+                # Serial never schedules finished seqs, so this is a no-op there.
+                continue
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
@@ -308,11 +380,18 @@ class Scheduler:
             # P22-A: per-request stop token ids fire regardless of ignore_eos
             # (vLLM semantics — only the model eos is gated by ignore_eos).
             hit_stop_id = token_id in seq.stop_token_ids
+            # P24: advance the grammar state machine, then check completion —
+            # a finished JSON/regex grammar stops the sequence even though the
+            # model would keep going (eos is usually masked out of the support).
+            hit_grammar = False
+            if seq.grammar_matcher is not None:
+                seq.grammar_matcher.accept_token(token_id)
+                hit_grammar = seq.grammar_matcher.is_terminated()
             hit_length = seq.num_completion_tokens == seq.max_tokens
-            if hit_eos or hit_stop_id or hit_length:
+            if hit_eos or hit_stop_id or hit_grammar or hit_length:
                 seq.status = SequenceStatus.FINISHED
                 seq.finish_time = now
-                seq.finish_reason = "stop" if (hit_eos or hit_stop_id) else "length"
+                seq.finish_reason = "stop" if (hit_eos or hit_stop_id or hit_grammar) else "length"
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
             token_events.append((

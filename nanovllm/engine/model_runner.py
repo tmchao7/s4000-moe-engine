@@ -146,6 +146,12 @@ class ModelRunner:
         load_model(self.model, config.model)
         _trace_init(rank, "weights_loaded", stage_started)
         self.sampler = Sampler()
+        # P23 overlap pipeline state (driver/rank-0 only)
+        self._pending_sample = None
+        self._pending_direct = None
+        # P24: bitmask word count for guided generation (set by the engine's
+        # _attach_grammar; rank 0 only — prepare_sample is rank-0-only)
+        self._grammar_words = 0
         stage_started = time.perf_counter()
         self.warmup_model()
         _trace_init(rank, "warmup_done", stage_started)
@@ -858,11 +864,24 @@ class ModelRunner:
             top_ks = torch.tensor([seq.top_k for seq in seqs], dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         if has_minp:
             min_ps = torch.tensor([seq.min_p for seq in seqs], dtype=torch.float32, pin_memory=True).to(self.device, non_blocking=True)
-        if penalty is None and not has_k and not has_p and not has_minp and logprobs_k == 0:
+        grammar = None
+        g_rows = [i for i, seq in enumerate(seqs) if seq.grammar_matcher is not None]
+        if g_rows:
+            import xgrammar as xg
+            words = self._grammar_words
+            buf = torch.zeros(len(g_rows), words, dtype=xg.bitmask_dtype, pin_memory=True)
+            for k, i in enumerate(g_rows):
+                seqs[i].grammar_matcher.fill_next_token_bitmask(buf, k)
+            bitmask = buf.to(self.device, non_blocking=True)
+            rows_t = torch.tensor(g_rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
+            grammar = (rows_t, bitmask)
+        if (penalty is None and not has_k and not has_p and not has_minp
+                and logprobs_k == 0 and grammar is None):
             return None
         return SampleMeta(penalty=penalty, top_ps=top_ps, top_ks=top_ks,
                           min_ps=min_ps, has_k=has_k, has_p=has_p,
-                          has_minp=has_minp, logprobs_k=logprobs_k)
+                          has_minp=has_minp, logprobs_k=logprobs_k,
+                          grammar=grammar)
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures_list = [seq.temperature for seq in seqs]
@@ -877,8 +896,12 @@ class ModelRunner:
         for sequences that asked for them."""
         sampled, lp_t = self.sampler(logits, temperatures, all_greedy, meta)
         token_ids = sampled.tolist()
+        return token_ids, self._lp_to_host(lp_t, seqs)
+
+    @staticmethod
+    def _lp_to_host(lp_t, seqs):
         if lp_t is None:
-            return token_ids, None
+            return None
         topv, topi, chosen = (tensor.tolist() for tensor in lp_t)
         logprobs = []
         for row, seq in enumerate(seqs):
@@ -888,7 +911,53 @@ class ModelRunner:
             k = seq.logprobs
             logprobs.append({"top": list(zip(topi[row][:k], topv[row][:k])),
                              "chosen": chosen[row]})
-        return token_ids, logprobs
+        return logprobs
+
+    @torch.inference_mode()
+    def run_launch(self, seqs: list[Sequence], mode: str) -> None:
+        """P23 overlap stage 1: prepare + forward + sample LAUNCH — everything
+        the serial run() does, except the sampled tensors stay on device (the
+        single D2H moves to collect()).  The env-gated legacy mixed split runs
+        end-to-end here and parks its result for collect()."""
+        with self.profiler.range("runner.prepare", mode=mode):
+            if self.rank == 0:
+                temperatures, all_greedy, meta = self.prepare_sample(seqs)
+            else:
+                temperatures, all_greedy, meta = None, True, None
+            unified = False
+            if mode == "mixed" and self._mixed_unified:
+                try:
+                    input_ids, positions = self.prepare_mixed(seqs)
+                    unified = True
+                except ValueError:
+                    unified = False    # non-contiguous groups: legacy split
+            if mode == "mixed" and not unified:
+                if _MIXED_SPLIT[0]:
+                    token_ids, logprobs = self._run_mixed(seqs, temperatures, all_greedy)
+                    self._pending_direct = (token_ids, logprobs)
+                    return
+                input_ids, positions = self.prepare_prefill(seqs)
+            elif not unified:
+                input_ids, positions = self.prepare_decode(seqs) if mode == "decode" else self.prepare_prefill(seqs)
+        with self.profiler.range("runner.forward", mode=mode):
+            logits = self.run_model(input_ids, positions, mode)
+        with self.profiler.range("runner.sample", mode=mode):
+            if self.rank == 0:
+                self._pending_sample = (self.sampler(logits, temperatures, all_greedy, meta), seqs)
+            else:
+                self._pending_sample = None
+        reset_context()
+
+    def collect(self):
+        """P23 overlap stage 2: the step's single D2H sync (rank 0 only)."""
+        if self._pending_direct is not None:
+            result, self._pending_direct = self._pending_direct, None
+            return result
+        if self._pending_sample is None:
+            return None, None
+        (sampled, lp_t), seqs = self._pending_sample
+        self._pending_sample = None
+        return sampled.tolist(), self._lp_to_host(lp_t, seqs)
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, mode: str):
