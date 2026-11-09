@@ -82,3 +82,10 @@ def test_help_does_not_advertise_benchmarks(monkeypatch, capsys):
         parser.parse_args(["--help"])
     out = capsys.readouterr().out
     assert "benchmarks/" not in out
+
+def test_version_uses_product_prog_name(capsys):
+    parser = api_server.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--version"])
+    out = capsys.readouterr().out
+    assert out.startswith("s4000-server "), out

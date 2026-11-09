@@ -567,6 +567,7 @@ def _is_loopback(host: str) -> bool:
 
 def build_parser():
     parser = argparse.ArgumentParser(
+        prog="s4000-server",
         description="s4000-moe-engine OpenAI-compatible server")
     parser.add_argument(
         "--model",

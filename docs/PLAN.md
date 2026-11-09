@@ -34,6 +34,10 @@
 | **文档/脱敏(D2–D11,E4–E9)** | t5 数字、TEST-MATRIX 15%/18 行/抢占行、CLOSEOUT I28、README archive/台账指针、ISSUES E1/死路径、PLAN I30/159ms、torch 版本、AGENTS 链接、面试/简历文案、`.gitignore` 注释 | `check_docs` rc=0;逐条对照证据源 |
 
 回归入口扩为 **16 套**(新增纯 CPU `boundary` 门);服务器强门 **16/16 rc=0**,pytest **28/28**;本地 fuzz 60 组/3048 行 0 违规。生产默认栈未变,项目仍为冻结态。详见 `docs/ACCEPTANCE-FIX-REPORT.md`(本地)。
+### P30 机会评估(11-09)
+
+[P30-OPPORTUNITIES.md](P30-OPPORTUNITIES.md):先部署硬化,再 8k 长上下文产品化;量化/DP2/RR 不再重开。
+
 ### P29 候选(评估,未执行)
 
 独立评估 + 外部引擎调研 + 9 天候选任务见 [ROADMAP-NEXT.md](ROADMAP-NEXT.md);Day1/2/3/4/5/6 实测见 [benchmarks/P29-day1.md](../benchmarks/P29-day1.md)、[benchmarks/P29-day2.md](../benchmarks/P29-day2.md)、[benchmarks/P29-day3.md](../benchmarks/P29-day3.md)、[benchmarks/P29-day4.md](../benchmarks/P29-day4.md)、[benchmarks/P29-day5.md](../benchmarks/P29-day5.md)、[benchmarks/P29-day6.md](../benchmarks/P29-day6.md);收口/面试口径见 [P29-FINAL.md](P29-FINAL.md);长上下文见 [benchmarks/P29-day8-longctx.md](../benchmarks/P29-day8-longctx.md);多副本运维见 [benchmarks/P29-day9-dp2-ops.md](../benchmarks/P29-day9-dp2-ops.md)。当前生产默认不变。

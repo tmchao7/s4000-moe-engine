@@ -64,3 +64,4 @@ bash scripts/build_release.sh
 - [P25-review.md](P25-review.md)
 - [engine-vs-vllm-sglang.md](engine-vs-vllm-sglang.md)（历史对标，非产品承诺）
 - [ROADMAP-NEXT.md](ROADMAP-NEXT.md)（P29 评估 + 外部引擎调研 + 9 天候选任务）
+- [P30-OPPORTUNITIES.md](P30-OPPORTUNITIES.md)（P29 后的机会评估：部署硬化 / 8k 长上下文）
