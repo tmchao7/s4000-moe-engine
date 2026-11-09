@@ -36,7 +36,7 @@
 回归入口扩为 **16 套**(新增纯 CPU `boundary` 门);服务器强门 **16/16 rc=0**,pytest **28/28**;本地 fuzz 60 组/3048 行 0 违规。生产默认栈未变,项目仍为冻结态。详见 `docs/ACCEPTANCE-FIX-REPORT.md`(本地)。
 ### P29 候选(评估,未执行)
 
-独立评估 + 外部引擎调研 + 9 天候选任务见 [ROADMAP-NEXT.md](ROADMAP-NEXT.md);Day1/2/3 实测见 [benchmarks/P29-day1.md](../benchmarks/P29-day1.md)、[benchmarks/P29-day2.md](../benchmarks/P29-day2.md)、[benchmarks/P29-day3.md](../benchmarks/P29-day3.md)。当前生产默认不变。
+独立评估 + 外部引擎调研 + 9 天候选任务见 [ROADMAP-NEXT.md](ROADMAP-NEXT.md);Day1/2/3/4 实测见 [benchmarks/P29-day1.md](../benchmarks/P29-day1.md)、[benchmarks/P29-day2.md](../benchmarks/P29-day2.md)、[benchmarks/P29-day3.md](../benchmarks/P29-day3.md)、[benchmarks/P29-day4.md](../benchmarks/P29-day4.md)。当前生产默认不变。
 
 ### P28 产品化收尾(11-09)
 

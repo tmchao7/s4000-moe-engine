@@ -174,7 +174,15 @@
 - W8A16 GEMM（M=16–256）：自定义 Triton 比 bf16 **慢 4–16×**；加上 Day2 的 M=1 GEMV 0.76×，**自定义 W8 速度线证伪**，除非拿到 MATE。
 - round-robin 放置：prefill imbalance **8.5% → 0.3–0.5%**，decode **4–5.6% → 0.6–2.5%**；但 clean step 没有改善（b1 +7%，b8 +2.9%，b32 +0.5%，跨加载比较，未做 CV）。
 - 结论：量化只保留显存/DP 价值；下一步转 **RR 重复 A/B + 30B token 门**，不把 RR 直接设默认。
-### 3.8 算子/量化优先级
+
+### 3.8 Day4 实测（2026-11-09）
+
+详细报告：[benchmarks/P29-day4.md](../benchmarks/P29-day4.md)。
+
+- 30B 固定 4 prompt 贪心 8 token：**linear PASS，round_robin FAIL**（第 4 条从首 token 分叉）；RR 虽然 imbalance 低，但不能过 token 门。
+- 性能（1×128/8×128/32×128）：linear 174.82/190.52/241.38 ms，RR 174.49/189.53/237.79 ms，差异在跨加载噪声内，**没有可用速度收益**。
+- 决定：**RR NO-GO**，生产保持 linear；如继续 placement，先做逐专家权重审计 + 首 token logits margin，区分数值敏感性与装载 bug。
+### 3.9 算子/量化优先级
 
 1. **P29-Q1**：FP8 权重保留 + fused dequant（低质量风险，先拿显存/带宽收益）。
 2. **P29-Q2**：W8A16（MATE 或自定义 Triton；先一层/一个专家，再 e2e）。
