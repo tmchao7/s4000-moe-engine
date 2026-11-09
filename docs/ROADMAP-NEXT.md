@@ -212,7 +212,15 @@
 - 30B 生产栈跑通 8k/16k：8k prefill 13.96s / decode 210.8ms；16k prefill 30.91s / decode 284.8ms；无 OOM。
 - 1k/4k/8k 加载 651 blocks（KV 7.63GiB/rank）；16k 加载 525 blocks（6.15GiB/rank）。
 - 不修改默认 `max_model_len=4096`；8k 可作 opt-in 候选，16k 仅离线/研究；真实长文质量门未做。
-### 3.13 算子/量化优先级
+
+### 3.13 Day9 实测（2026-11-09）
+
+详细报告：[benchmarks/P29-day9-dp2-ops.md](../benchmarks/P29-day9-dp2-ops.md)。
+
+- 新增 `scripts/serve_dp2_s4000.sh`（start/status/stop）+ `scripts/smoke_dp2_s4000.sh`；两个独立 TP1/EP1 副本分别绑 GPU0/1。
+- 0.6B 实跑：ports 8100/8101 健康、`/v1/models` 正常、并发 chat PASS；停止后双卡 0 MiB。
+- 边界：脚本不含请求级负载均衡；**30B 不能用它做 DP2**（FP8 保留仍不可用）。
+### 3.14 算子/量化优先级
 
 1. **P29-Q1**：FP8 权重保留 + fused dequant（低质量风险，先拿显存/带宽收益）。
 2. **P29-Q2**：W8A16（MATE 或自定义 Triton；先一层/一个专家，再 e2e）。

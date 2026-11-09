@@ -76,3 +76,22 @@ mthreads-gmi | grep MiB
 - `tools`/`tool_choice`、多模态、embeddings 未实现；请求会 400。
 - `priority`、`guided_json`、`stop_token_ids` 是可选扩展，不是 OpenAI 标准。
 - 结构化输出在温度采样下可能合法地写满 `max_tokens`（JSON 空白），这是模型/预算行为，不是服务错误。
+
+## 10. 多副本（0.6B 验证）
+
+仓库提供 `scripts/serve_dp2_s4000.sh` + `scripts/smoke_dp2_s4000.sh`，用于两个独立单卡副本的启动/健康/停止：
+
+```bash
+S4000_DP2_MODEL=/path/to/Qwen3-0.6B \
+  S4000_DP2_PORTS="8100 8101" S4000_DP2_GPUS="0 1" \
+  S4000_DP2_MAX_MODEL_LEN=2048 \
+  scripts/serve_dp2_s4000.sh start
+S4000_DP2_PORTS="8100 8101" S4000_DP2_SERVED_NAME=<name> \
+  scripts/smoke_dp2_s4000.sh
+scripts/serve_dp2_s4000.sh stop
+```
+
+- 每个副本是独立 TP1/EP1 进程，通过 `MUSA_VISIBLE_DEVICES` 绑一张卡；
+- 脚本不含请求级负载均衡，需外部 Nginx/Envoy 或客户端轮询两个端口；
+- **30B 不要用这个脚本做 DP2**：单副本需要 FP8 权重保留，当前 loader 不实现（见 [P29-FINAL.md](P29-FINAL.md)）；
+- 0.6B 实跑：两个 `/health` 正常、`/v1/models` 正常、并发 chat PASS；停止后双卡 0 MiB。
