@@ -413,9 +413,10 @@ class Scheduler:
                 continue
             q = query_lens[row]
             was_prefill = prefill_flags[row]
-            seq.num_scheduled_tokens = q
             seq.is_prefill = was_prefill
-            self.block_manager.hash_blocks(seq)
+            # Pass the frozen q explicitly: the live num_scheduled_tokens may
+            # already describe the NEXT batch (review simplification).
+            self.block_manager.hash_blocks(seq, q)
             seq.num_cached_tokens += q
             seq.num_scheduled_tokens = 0
             if was_prefill and seq.num_cached_tokens < seq.num_tokens:

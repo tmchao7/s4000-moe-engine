@@ -10,7 +10,7 @@
 
 | 系列 | 范围 | 编号 |
 |---|---|---|
-| **I** | P6 遗留技术债（引擎/图/数值/验证） | I1–I18（沿用历史编号，I16–I18 已迁入 E 系列，见 §3） |
+| **I** | P6 遗留技术债（引擎/图/数值/验证） | I1–I40（沿用历史编号；I16–I18 已迁入 E 系列，见 §3） |
 | **S** | P7 投机解码 | S1–S6 |
 | **E** | 生态与厂商（autotune 手搓边界、runtime 限制） | E1–E6 |
 
@@ -108,7 +108,7 @@
 - **I36 投机调度块边界 off-by-one(🆕 P23 发现并修复)**:overlap 投机 decode 行 launch 前被在飞批次 postprocess 追加 1 token,按陈旧 `len%256==1` 判块边界差一块 → block_table 缺块 → slot 越界写 + kernel 越界读 → MUSA 提交路径卡死;修复 = 按 launch 时刻长度做块覆盖检查(`can_append_at/may_append_at`)。证据 `benchmarks/P23-overlap.md`。
 - **I37 投机预检查逐序列不累计 → free list 耗尽 IndexError(🆕 P25 评审发现并修复)**:`schedule(speculative=True)` 预检查逐个 `can_append_at`(fcfs+stall_free 两处),decode 循环却**累计** `may_append_at` 分配;当 `Σneed > free` 且每个 `need ≤ free` 时预检查全过(不 defer),第二个序列分配跑穿 free list → `_pop_free` 空 deque IndexError(串行路径靠抢占兜底不受影响;投机路径按设计永不抢占)。复现 `tests/p25_review_repro.py`(纯 CPU,本地与服务器 rc=0 验证修复);修复 = `BlockManager.total_launch_shortfall` 累计门,超 free 即整批 defer。引擎级压力回归 `tests/p25_overlap_fix.py` t3;**P27 补直接驱动 Scheduler 的 CPU 门**(fcfs/stall_free 两策略,`tests/p25_overlap_prefill_boundary.py` scenario C3),不再只测 BlockManager 原语。
 
-- **I39 overlap 投机批已完成 prefill 行被按 1-token 重发 → block_table 越界(🆕 P27 验收发现并修复)**:_prune_batch 对 parked prefill 行只做 min(frozen, live remaining);当在飞 collect 已把 prompt 做完(prompt 长度恰为 block_size 整数倍)时剩余被 clamp 成 1,行仍以 is_prefill=True、num_cached=prompt_len 发射;_prepare_rows 用 num_cached//block_size 取 block_table → IndexError(512/768/1024 token prompt 复现)。修复 = prune 用冻结 prefill_flags,num_cached >= num_prompt_tokens 的 stale prefill 行直接丢弃(该 seq 下一步转 decode);回归 tests/p25_overlap_prefill_boundary.py(纯 CPU,旧代码 C1 失败、新代码通过)。证据 docs/ACCEPTANCE-REPORT.md §3-C1。
+- **I39 overlap 投机批已完成 prefill 行被按 1-token 重发 → block_table 越界(🆕 P27 验收发现并修复)**:_prune_batch 对 parked prefill 行只做 min(frozen, live remaining);当在飞 collect 已把 prompt 做完(prompt 长度恰为 block_size 整数倍)时剩余被 clamp 成 1,行仍以 is_prefill=True、num_cached=prompt_len 发射;_prepare_rows 用 num_cached//block_size 取 block_table → IndexError(512/768/1024 token prompt 复现)。修复 = prune 用冻结 prefill_flags,以 **live is_prefill 是否被 postprocess 清掉**作为 prefill 完成信号(不能再用 `num_cached >= num_prompt_tokens`:被抢占的 seq 从 0 重 prefill 时 num_tokens > num_prompt_tokens,中途合法 chunk 会跨过 prompt 长度;该反例在 code review 中发现并补了 C4 回归);回归 tests/p25_overlap_prefill_boundary.py(纯 CPU,旧代码失败、新代码通过)。证据 docs/ACCEPTANCE-REPORT.md §3-C1。
 - **I40 投机调度改写 in-flight 行 → num_cached 少记(🆕 P27 验收发现并修复)**:尾部投机 schedule 在当前批 collect 前改写同一 seq 的 num_scheduled_tokens/is_prefill(为下一批);postprocess 按活值记账 → 200-token prefill 行只 +1,num_cached 失真(hashing/lpm/clamp 输入偏离)。修复 = ScheduledBatch 冻结 prefill_flags,postprocess/_finish_step 一律用冻结 query_lens/prefill_flags(与 vLLM V1 output processing consumes scheduler_output.num_scheduled_tokens 同规则);回归同上测试 C2。
 - **I38 运行时关 overlap 丢弃已排投机批 → block_table 不变式破坏(🆕 P25 评审发现并修复)**:`set_scheduler_overlap(False)` 原实现直接丢 `_sched_next`,只 drain `_pending`;投机 schedule 对 inflight 跨界 decode 行已把 block_table 抬到 `ceil((L+1)/bs)`,批被丢弃后 token 永不追加 → 串行不变式 `len(table)==ceil(len/bs)` 破坏,`prepare_decode` 按 `block_table[-1]` 算写槽 → KV 写偏一块(复现中写到 slot 767 应为 511),该序列从跨界点起持续坏输出。同族:`NANOVLLM_OVERLAP_NO_SPEC=1` 原为"排了再丢"。修复 = disable 改**排空式收尾**(drain):在飞批照常 collect、 parked 批照常 launch(其 launch 时刻块覆盖恰在 collect 后成立)、仅停尾部投机调度,≤2 步排空后回串行;NO_SPEC 改为门控不排。回归 `tests/p25_overlap_fix.py` t1(中途 disable bitwise)/t2(翻转窗 ABA bitwise,跨 768 边界)。
 - **I21 per-rank KV 容量不一致(✅ 本轮修复)**:`allocate_kv_cache` 后 `dist.all_reduce(MIN)` 统一两 rank 的 `num_kvcache_blocks`;tiny TP2 六配置回归全等 rc=0,两 rank `[kvcache] blocks=` 一致(343080/343080、341994/341994;本轮加载内启发式恰好相同,真 divergence 钳制待 30B 长上下文确认)。
@@ -184,14 +184,14 @@
 
 ## 3. 生态与厂商（E 系列）
 
-> 核心结论：**能手搓两处**（E1 我们的 paged kernel、E2 vLLM fused_moe 配置），**搓不动四类**（E3 grouped_mm、E4 MUSAGraph、E5 mp22、E6 watchdog）——后者是 driver/runtime 闭源层。
+> 核心结论：**E1 已闭合**（paged kernel autotune,P8/P16 判决);**E2 可手搓**（vLLM fused_moe 配置）；**搓不动四类**（E3 grouped_mm、E4 MUSAGraph、E5 mp22、E6 watchdog）——后者是 driver/runtime 闭源层。
 
 ### E1 ✅ 已闭合（P8/P16 判决）：手搓 paged decode kernel 的 autotune
 - **终判**：P8 内核级 2× 但翻转 0.81%>0.5% 冻结门；P16-D 30B e2e 复核 1.010–1.020×（负结果）。tuned 表维持 opt-in，E1 项闭合。
 - **历史方案（保留参考）**：`nanovllm/kernels/paged_attention.py` 现由 `_resolve_config(batch)` 选择 `(BLOCK_N, warps, stages)`，不再写死；历史入口见 git。
-- **方案**：扫 `BLOCK_N∈{16,32,64,128} × warps∈{2,4,8} × stages∈{1..4}`（≤64 组）× 桶 `(batch∈{1,4,16,32,64}, kv∈{≤1k,≤4k,>4k})`；计时复用 `scripts/archive/p6_moe_microbench.py` 的 `time_call` + 子进程隔离；产出 `configs/paged_decode_MTT_S4000.json` + sha256 绑定 kernel 源。预算：一发 30B 加载 30–60 min。
-- **硬约束**：`context_len` 必须保持 runtime 循环边界（不然破坏 kernel 复用）；**autotune 只改性能，不改变 SDPA↔paged 的 bf16 数值路径差异（I4）**——不要指望 autotune 解决 I4。
-- **触发条件**：**已满足**——I4 已于 10-27 转正（L1–L5 全过，paged 成为默认）。现在可做，但与 I19 的 norm/rope 融合相比 ROI 更低，排在 P8 计划之后。
+- **历史方案（已归档，勿重开）**：扫 `BLOCK_N∈{16,32,64,128} × warps∈{2,4,8} × stages∈{1..4}`（≤64 组）× 桶 `(batch∈{1,4,16,32,64}, kv∈{≤1k,≤4k,>4k})`；计时复用 `scripts/archive/p6_moe_microbench.py` 的 `time_call` + 子进程隔离；产出 `configs/paged_decode_MTT_S4000.json` + sha256 绑定 kernel 源。预算：一发 30B 加载 30–60 min。
+- **历史硬约束**：`context_len` 必须保持 runtime 循环边界（不然破坏 kernel 复用）；**autotune 只改性能，不改变 SDPA↔paged 的 bf16 数值路径差异（I4）**——不要指望 autotune 解决 I4。
+- **历史触发条件（已满足，但 P8/P16 已判决：不再重开）**：I4 已于 10-27 转正（L1–L5 全过，paged 成为默认）；与 I19 的 norm/rope 融合相比 ROI 更低。
 
 ### E2 🟢 手搓 vLLM fused_moe 的 S4000 配置（原 I16 重新归类）
 - **纠正**：此前记为"⚪ 厂商侧不可修"——**不准确**。缺的是 `configs/E=64,N=768,device_name=MTT_S4000.json` 这个**文件**，而生成它是我们的工作。
@@ -219,7 +219,7 @@
 
 ---
 
-## 4. 已关闭明细（早期 8 项，P6 时代遗留；均计入 §0 的「已关闭 24 项」，此处存档结论与证据）
+## 4. 已关闭明细（早期 8 项，P6 时代遗留；均计入 §0 的已关闭 I 项（25）/合计 27 项，此处存档结论与证据）
 
 | ID | 结论 | 证据 / commit |
 |---|---|---|

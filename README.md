@@ -56,7 +56,7 @@
 | 环境搭建 | [docs/SETUP.md](docs/SETUP.md)——软件栈、模型下载、复现链路（本仓库仅支持 MUSA 后端） |
 
 ```bash
-pip install -e .
+pip install -e ".[test,plot]"
 NANOVLLM_MODEL=/data/models/Qwen3-0.6B python example.py   # 单卡冒烟
 ```
 
@@ -147,10 +147,10 @@ python3 scripts/render_metrics.py    # 需要 matplotlib + SciencePlots
 | P19–P21 收敛与整理 | 完成 | **I20 终判**(int8 三方案机制全对/质量门连续 FAIL——本模型 K/V 通道内动态范围 ~500× 超 int8 网格);P16-A 30B 证据(0.977+0 翻转);PD 前缀复用 **5.7×** + priority×PD 全链路 + PD OpenAI 端点;整理轮(目录树去 AI 味/过期文档清理/CLOSEOUT 遗留问题总账) |
 | P22 采样面对齐(vLLM/SGLang 服务层) | 完成 | **top_p/top_k/min_p + presence/frequency/repetition penalty + 引擎级 stop_token_ids + logprobs(top-k) + /v1/completions(流式+非流式)**;默认参数走逐字 legacy 路径(改造前基线 bitwise 全等);top_p 激活 TPOT +9.1%;API 冒烟 6/6 |
 | P23 overlap scheduler | 完成 | vLLM V1/SGLang 单飞流水线(opt-in):**稳态输出与串行逐位全等**(greedy+采样,30B 同);错峰翻转 0.347%;抢占场景 12/12 完成;I36 投机调度块边界 off-by-one 自查自修(MUSA 提交卡死 → launch 时刻块覆盖检查);b1/b16 步时 0.997× |
-| P24 结构化输出(xgrammar) | 完成 | **guided_json/guided_regex/response_format json_schema**;位掩码与官方 CPU apply 逐位一致;四 schema 16/16 合法 + grammar 终止;约束开销 **1.028×**;API 端到端冒烟 |
+| P24 结构化输出(xgrammar) | 完成 | **guided_json/guided_regex/response_format json_schema**;位掩码与官方 CPU apply 逐位一致;四 schema 16/16 合法 + grammar 终止;约束开销 **1.028×**(P27 起 informational);API 端到端冒烟 |
 | P25 评审与修复 | 完成 | 深度代码审查 + 2026-11 竞品比对;两个已复现的 overlap 状态机缺陷当日修复(I37/I38,排空式收尾 bitwise 全等);`--scheduler-overlap` CLI 补齐;整理轮归档 18 个文件、引擎 -357 行 |
 | P26 收官轮 | 完成 | 测试映射矩阵 + 一键回归(15 套,含冻结门守卫)+ 文档一致性 linter + 公开环境文档;口径与可信度边界入 README;悬置项终判 + 停止线;收官验证 15/15 |
-| P27 验收修复轮 | 完成 | 独立验收审计的 high/medium 全修:overlap stale prefill 行 + 冻结记账(I39/I40)、p24 greedy + informational g5、pytest 干净 checkout、公开复现链 `--model`/extras、16 套回归(新增 CPU 边界门);强门 **16/16** |
+| P27 验收修复轮 | 完成 | 独立验收审计的 high/medium 全修:overlap stale prefill 行 + 冻结记账(I39/I40)、p24 greedy + informational g5、pytest 干净 checkout、公开复现链 `--model`/extras、16 套回归(新增 CPU 边界门);强门 **16/16**;code review 补 C4(re-prefill)/g5 verdict/p16pri 离散门/p22 e2e/rsync 同步 |
 
 正确性门:tiny TP1/TP2 × loop/grouped/bmm 六配置逐 token 全等;跨后端比较采用"候选确定性 + 五层等价门"(数值契约见 [docs/numerics-policy.md](docs/numerics-policy.md))。历史轮次报告(P0–P17/P19 有独立报告)在 [benchmarks/archive/](benchmarks/archive/);P18/P20/P21 为并入相邻报告/台账的测量轮,不单列报告。当前轮(P22 起)在 [benchmarks/](benchmarks/)。
 

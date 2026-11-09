@@ -15,13 +15,13 @@
 | **块分配时序变化的实验必须带 bitwise 门**(I36 教训) | `tests/p23_overlap.py` t1/t2(稳态 bitwise)+ `tests/p25_overlap_fix.py` t1/t2(**中途翻转 bitwise,跨 256 块边界**) | ✅(I37/I38 后补齐) |
 | 投机预检查必须是执行的总和(I37) | `tests/p25_review_repro.py`(纯 CPU 门)+ p25fix t3(KV 压力 defer,引擎级门含 defers>0) | ✅ |
 | 运行时开关的排空式收尾,禁止"排了再丢"(I38) | `tests/p25_overlap_fix.py` t1(单次中途 disable)+ t2(翻转窗 ABA) | ✅ |
-| overlap stale prefill 行 / 冻结记账 + I37 累计门(C1/C2/C3) | `tests/p25_overlap_prefill_boundary.py`(纯 CPU:块边界 prompt 512/768/1024 不得 launch 已完成的 1-token prefill 行;200-token 中途到达必须按冻结 q 记账;fcfs/stall_free 两策略在 per-seq 全过但累计超 free 时必须 defer) | ✅(P27 验收修复轮新增) |
+| overlap stale prefill 行 / 冻结记账 + I37 累计门 + 抢占 re-prefill(C1–C4) | `tests/p25_overlap_prefill_boundary.py`(纯 CPU:块边界 prompt 512/768/1024 不得 launch 已完成的 1-token prefill 行;200-token 中途到达按冻结 q 记账;fcfs/stall_free 累计门 defer;preempt 后 re-prefill 跨 prompt 长度不得被误丢) | ✅(P27 验收修复轮新增;C4 为 review 回归门) |
 | 抢占正确性(重算式,计数一致,全完成) | p23 t4 + p25fix t3 | ✅ |
 | 前缀缓存淘汰只动 ref==0 且活动序列 bitwise 不变 | `tests/p16_lru_evict.py` | ✅ |
 | 统一混合批结构门 | `tests/p16_mixed_unified.py` | ✅ |
 | 优先级调度(饥饿守卫/victim 选择) | `tests/p16_priority_sched.py`(P26 修正:已照录负结果 P16-C 门① 降为信息性记录;P27 验收修复:15% 单发 A/A2 锚点与 TTFT 5× 收益均降为 informational-only,rc 门只保留功能性判据——全完成 + 抢占发生;墙钟值仍随 verdict 记录,但不再决定 rc) | ✅ |
 | KV int8 kernel 单元正确性 | `tests/p17_kv_int8.py --mode unit` | ✅ |
-| 采样面(掩码/penalty/logprobs 与参考逐位) | `tests/p22_sampler_face.py` + `tests/p22_bugfix_regress.py`(b1/b2/b3 回归) | ✅ |
+| 采样面(掩码/penalty/logprobs 与参考逐位) | `tests/p22_sampler_face.py` + `tests/p22_bugfix_regress.py`(b1/b2/b3 回归);runner 带 `--e2e`(引擎级 stop/logprobs 功能门) | ✅ |
 | 结构化输出(位掩码/合法率/终止) | `tests/p24_guided.py` | ✅ |
 | A/B 噪声协议:墙钟对比不设硬 rc 门(AGENTS「A/B 噪声协议」同源) | p23 stage c t5(b1/b16 decode 步时 A/B,交错 x3、中位数,CV 随 verdict 记录);p24 g5(x5)、p22sam e2e、p16pri anchor/TTFT 同规则 | ⚠️ 信息性记录(P26/P27 修正:墙钟比不做 rc 门;p23 t5 x3 低于协议 ≥5,数字按 INVALID 级噪声读,判决基线=benchmarks/P23-overlap.md 的 b1 0.9972/b16 0.9978) |
 

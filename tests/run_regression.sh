@@ -37,19 +37,19 @@ run() {
 run repro   env PYTHONPATH=. python3 tests/p25_review_repro.py
 run p5decide python3 tests/p5_decide.py
 run pytest  python3 -m pytest tests/test_benchmarking_v3.py -q
+run boundary env PYTHONPATH=. python3 tests/p25_overlap_prefill_boundary.py   # CPU: stale prefill row / frozen q / I37
 run p8      env PYTHONPATH=. python3 tests/p8_scheduler_gaps.py
 run p2      env PYTHONPATH=. python3 tests/p2_grouped_mm.py
 run p6      env PYTHONPATH=. python3 tests/p6_bmm_dense_tiny.py
 run p23     env PYTHONPATH=. python3 tests/p23_overlap.py $MODEL_FLAG --out "$OUT_DIR/p23.json"
 run p25fix  env PYTHONPATH=. python3 tests/p25_overlap_fix.py $MODEL_FLAG --out "$OUT_DIR/p25_overlap_fix.json"
-run boundary env PYTHONPATH=. python3 tests/p25_overlap_prefill_boundary.py   # CPU: stale prefill row / frozen q
 
 # Feature regression nets (judged capabilities; keep green or justify).
 run p16lru  env PYTHONPATH=. python3 tests/p16_lru_evict.py $MODEL_FLAG --out "$OUT_DIR/p16_lru.json"
 run p16mix  env PYTHONPATH=. python3 tests/p16_mixed_unified.py $MODEL_FLAG --out "$OUT_DIR/p16_mixed.json"
 run p16pri  env PYTHONPATH=. python3 tests/p16_priority_sched.py $MODEL_FLAG --out "$OUT_DIR/p16_priority.json"
 run p17unit env PYTHONPATH=. python3 tests/p17_kv_int8.py --mode unit
-run p22sam  env PYTHONPATH=. python3 tests/p22_sampler_face.py $MODEL_FLAG
+run p22sam  env PYTHONPATH=. python3 tests/p22_sampler_face.py $MODEL_FLAG --e2e
 run p22fix  env PYTHONPATH=. python3 tests/p22_bugfix_regress.py $MODEL_FLAG
 run p24     env PYTHONPATH=. python3 tests/p24_guided.py $MODEL_FLAG --out "$OUT_DIR/p24.json"
 

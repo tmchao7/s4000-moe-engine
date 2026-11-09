@@ -29,6 +29,7 @@ serve = [
 test = [
     "pytest>=8",
     "xgrammar>=0.2.7",
+    "jsonschema>=4",
 ]
 plot = [
     "matplotlib>=3.8",

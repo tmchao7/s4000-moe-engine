@@ -208,9 +208,16 @@ class BlockManager:
         while self._blocks_needed(seq, launch_len) > 0:
             seq.block_table.append(self._allocate_block())
 
-    def hash_blocks(self, seq: Sequence):
+    def hash_blocks(self, seq: Sequence, num_new_tokens: int | None = None):
+        """Hash fully covered blocks after a step.
+
+        ``num_new_tokens`` is the batch's frozen query length (overlap
+        postprocess passes it explicitly); the default preserves the legacy
+        live-field callers in tests/archive.
+        """
+        q = seq.num_scheduled_tokens if num_new_tokens is None else num_new_tokens
         start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
+        end = (seq.num_cached_tokens + q) // self.block_size
         if start == end: return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):

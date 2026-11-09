@@ -289,9 +289,9 @@ class LLMEngine:
         if batch is not None:
             # The parked batch launches even while draining: dropping it here
             # would strand its pre-allocated blocks (P25/F2).
-            stale = len(batch.sequences)
+            # _prune_batch counts each dropped row; do not add a batch delta
+            # here or the metric double-counts (review finding).
             batch = self._prune_batch(batch)
-            self.overlap_pruned_rows += stale - (len(batch.sequences) if batch else 0)
         elif self._overlap:
             batch = self.scheduler.schedule()
         if batch is None or batch.mode == "defer" or not batch.sequences:
@@ -330,39 +330,51 @@ class LLMEngine:
     def _prune_batch(self, batch: ScheduledBatch):
         """Drop stale rows before launching a parked speculative batch.
 
-        All decisions use the batch FROZEN metadata (query_lens, prefill_flags)
-        plus the live num_cached_tokens that this step's collect just advanced:
-        the trailing speculative schedule runs before that collect and rewrites
-        live seq fields for the NEXT batch, so reading live is_prefill here
-        would misclassify rows.
+        Row shape decisions use the batch FROZEN metadata (query_lens,
+        prefill_flags); the live values that matter are num_cached_tokens
+        (advanced by this step's collect) and is_prefill (cleared by
+        postprocess only when the final prefill chunk completes).  The
+        trailing speculative schedule rewrites live seq fields for the NEXT
+        batch, so live is_prefill must not be used to infer row type.
 
         Two stale cases:
         1. A chunk-continuing prefill row whose earlier chunks completed in
            the in-flight batch: clamp to the true remaining tokens.
-        2. A prefill row whose whole prompt completed in the in-flight batch
-           (num_cached >= num_prompt_tokens): DROP it.  Keeping it produced a
-           1-token prefill row with num_cached == prompt_len, whose
-           block_table[num_cached // block_size] read is out of range when
-           the prompt length is an exact multiple of block_size (P25/F2
-           follow-up crash).  The seq decodes from the next schedule.
+        2. A prefill row whose final chunk completed in the in-flight batch
+           (postprocess cleared live is_prefill): DROP it.  Keeping it
+           produced a 1-token prefill row with num_cached == prompt_len,
+           whose block_table[num_cached // block_size] read is out of range
+           when the prompt length is an exact multiple of block_size
+           (P25/F2 follow-up crash).  The seq decodes from the next schedule.
+        A preempted seq is re-prefilled from 0 with num_tokens >
+        num_prompt_tokens, so it may legitimately cross num_prompt_tokens
+        mid-way; the live is_prefill flag is the completion signal, not the
+        prompt length.
         Decode rows are never clamped: their 1 token is generated, not read
         from token_ids."""
         flags = batch.prefill_flags
-        if not flags:
-            flags = [seq.is_prefill for seq in batch.sequences]
+        assert len(flags) == len(batch.sequences) == len(batch.query_lens), (
+            "frozen row metadata mismatch: "
+            f"flags={len(flags)} seqs={len(batch.sequences)} "
+            f"query_lens={len(batch.query_lens)}"
+        )
         kept = []
         kept_flags = []
         for idx, (seq, q) in enumerate(zip(batch.sequences, batch.query_lens)):
-            was_prefill = flags[idx] if idx < len(flags) else seq.is_prefill
+            was_prefill = flags[idx]
             if seq.is_finished:
                 self.overlap_pruned_rows += 1
                 continue
             if was_prefill:
-                if seq.num_cached_tokens >= seq.num_prompt_tokens:
-                    # prompt already completed in the in-flight collect
+                # postprocess clears the live is_prefill flag only when the
+                # final prefill chunk completes.  Do NOT use
+                # num_cached >= num_prompt_tokens here: a preempted seq is
+                # re-prefilled from 0 with num_tokens > num_prompt_tokens, so
+                # a legitimate mid-way chunk can cross the prompt length and
+                # would be wrongly dropped (C1 regression found in review).
+                if not seq.is_prefill:
                     self.overlap_pruned_rows += 1
                     seq.num_scheduled_tokens = 0
-                    seq.is_prefill = False
                     continue
                 q = min(q, seq.num_tokens - seq.num_cached_tokens)
             if q <= 0:
@@ -399,9 +411,11 @@ class LLMEngine:
         seqs, mode = batch.sequences, batch.mode
         self.schedule_mode_counts[mode] += 1
         flags = batch.prefill_flags
-        if not flags:
-            flags = [seq.is_prefill for seq in seqs]
         query_lens = batch.query_lens
+        assert len(flags) == len(query_lens) == len(seqs), (
+            "frozen row metadata mismatch: "
+            f"flags={len(flags)} query_lens={len(query_lens)} seqs={len(seqs)}"
+        )
         # Frozen row metadata, not live seq state: the overlap pipeline has
         # already rewritten the live fields for the next batch by the time
         # this batch is collected (C2 accounting fix).

@@ -16,7 +16,7 @@
 |---|---|---|---|
 | A | **采样面补齐**:top_p/top_k/min_p + presence/frequency/repetition penalty + stop_token_ids(引擎级) + logprobs(top-k) + skip_special_tokens + `/v1/completions`(流式+非流式) | ① t1/t1b/t3 掩码与 penalty 对独立 CPU 参考逐位 ② t2 支撑集封闭(200 抽 0 泄漏) ③ **t4 全默认与逐字 legacy 体 bitwise 相等(硬门)** ④ t5 0.6B 默认 greedy 与改造前基线 bitwise ⑤ t7 默认步时 ≤±1%;top_p 激活 ≤+10% ⑥ API 冒烟 6 项 ⑦ 回归(四套+特性套) ⑧ 30B 单载窗口(一致性+步时 CV+旋钮 sanity) | **判决 PASS(11-08)**:①–⑧ 全过(t5 基线逐位全等;t7 默认 +0.47%、top_p 激活 1.091 贴门照录;API 冒烟 6/6;回归 8/9 套绿,p16-priority 引擎门=P16-C 已照录负结果;⑧ 30B 单载:greedy 自一致逐位 True + 步时 181.57ms CV=0.0004 + 旋钮/stop/logprobs sanity 全 True);**全默认走逐字 legacy 路径,per-request opt-in,生产栈零默认变更**;报告 benchmarks/P22-sampling-face.md |
 | B | overlap scheduler(vLLM V1/SGLang 同款;schedule+prepare 与 GPU forward 重叠) | ① 稳态 bitwise(greedy+采样同种子) ② 错峰到达翻转 ≤0.5% ③ 抢占回退:全完成+块账一致 ④ 步时 ABA 双档 CV≤5% ⑤ 回归 ⑥ 30B 单载 | **判决 PASS(11-08)**:①②③⑤⑥ 全过(t1/t2 逐位、t3 0.347%、t4 pre=3 12/12、30B bitwise);④ b1 0.9972/b16 0.9978 小幅为正。**I36 根因修复**:投机行 launch 前被追加 1 token,`len%256==1` 块边界判断差一块 → slot 越界写+kernel 越界读 → MUSA 提交卡死(2/2);修复=按 launch 时刻长度做块覆盖检查;E1 教训=块分配时序实验必须带 bitwise 门。opt-in `scheduler_overlap=True`,默认串行逐字保留;报告 benchmarks/P23-overlap.md |
-| C | 结构化输出 xgrammar | ① bitmask 语义 vs 官方 CPU apply ② schema 合法率 100% ③ regex 终止 ④ 不约束 bitwise 不变 ⑤ 开销 ≤10% ⑥ 校验/降级 ⑦ API 冒烟 | **判决 PASS(11-08)**:①支撑集逐位相等 ②四 schema 16/16 合法+grammar 终止 ③fullmatch ④中性路径 ⑤1.028× ⑥400/降级 ⑦8/8;`guided_json`/`guided_regex`/`response_format json_schema` per-request opt-in;报告 benchmarks/P24-guided.md |
+| C | 结构化输出 xgrammar | ① bitmask 语义 vs 官方 CPU apply ② schema 合法率 100% ③ regex 终止 ④ 不约束 bitwise 不变 ⑤ 开销 ≤10%(P27 起 informational;`--perf-strict` opt-in) ⑥ 校验/降级 ⑦ API 冒烟 | **判决 PASS(11-08)**:①支撑集逐位相等 ②四 schema 16/16 合法+grammar 终止 ③fullmatch ④中性路径 ⑤1.028×(历史判决;P27 g5 x5 recorded,默认不进 rc) ⑥400/降级 ⑦8/8;`guided_json`/`guided_regex`/`response_format json_schema` per-request opt-in;报告 benchmarks/P24-guided.md |
 
 其余 backlog:n>1 并行采样、seed(MUSA RNG 语义厂商风险)、tools、swap 抢占/KV offload、PD 流式/多实例、json_object/guided_choice、bitmask triton-mtgpu 内核。
 
@@ -34,6 +34,7 @@
 | **文档/脱敏(D2–D11,E4–E9)** | t5 数字、TEST-MATRIX 15%/17 行/抢占行、CLOSEOUT I28、README archive/台账指针、ISSUES E1/死路径、PLAN I30/159ms、torch 版本、AGENTS 链接、面试/简历文案、`.gitignore` 注释 | `check_docs` rc=0;逐条对照证据源 |
 
 回归入口扩为 **16 套**(新增纯 CPU `boundary` 门);服务器强门 **16/16 rc=0**,pytest **28/28**;本地 fuzz 60 组/3048 行 0 违规。生产默认栈未变,项目仍为冻结态。详见 `docs/ACCEPTANCE-FIX-REPORT.md`(本地)。
+**P27 review 补(2026-11-09)**:独立 code review 在 `ef23c59` 上发现并修复 1 个 high 回归——初版 I39 用 prompt 长度判 prefill 完成,被抢占 seq 重 prefill 时会被误丢;改为 live `is_prefill` 完成信号 + scenario C4。同时补 p24 g5 的 PASS/DRIFT/INVALID 记录语义(`--perf-strict` opt-in)、p16pri 离散 first-token 门、p22sam `--e2e`、rsync 镜像同步、jsonschema/repo extras、ISSUES 计数。复验:本地 C1–C4/fuzz/pytest 28/check_docs;服务器 **16/16 rc=0**(p24 g5 记录 INVALID,默认不进 rc)。
 
 ## 1. P16–P18 迭代内容(2026-11-07 立项;用户三方向合成:统一混合 batch + KV 调度做足 → KV int8 量化 → PD 小模型推进;30B 只做点睛)
 

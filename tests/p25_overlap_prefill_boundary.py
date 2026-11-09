@@ -1,6 +1,6 @@
 """P25/F1 follow-up: overlap scheduler stale-row regressions (pure CPU).
 
-Covers two defects found by the P26+ acceptance audit:
+Covers four defects (C1–C4) found by acceptance audit + code review:
 
 C1  A parked prefill row whose prompt completed in the in-flight collect used
     to be clamped to a 1-token prefill row (num_cached == prompt_len).  When
@@ -17,6 +17,11 @@ C3  The I37 cumulative pre-check must be exercised through the real Scheduler
     (fcfs + stall_free): per-seq can_append_at passes while the summed
     shortfall exceeds the free list, and schedule(speculative=True) must
     return mode=defer.
+
+C4  A preempted sequence is re-prefilled from 0 with num_tokens >
+    num_prompt_tokens.  A legitimate mid-way re-prefill chunk can cross the
+    prompt length; it must NOT be dropped as "prefill complete" (regression
+    introduced by the first C1 fix and caught in review).
 
 Runs on the cheapest Python >= 3.10 (same re-exec trick as
 tests/p25_review_repro.py).  No torch / GPU / model needed.
@@ -125,6 +130,7 @@ sc_mod = load("nanovllm.engine.scheduler", "nanovllm/engine/scheduler.py")
 le_mod = load("nanovllm.engine.llm_engine", "nanovllm/engine/llm_engine.py")
 
 Sequence = sq.Sequence
+SequenceStatus = sq.SequenceStatus
 Scheduler = sc_mod.Scheduler
 SamplingParams = sp.SamplingParams
 LLMEngine = le_mod.LLMEngine
@@ -265,6 +271,37 @@ def scenario_c2():
     return ok
 
 
+def scenario_c4():
+    print("[C4] preempted seq re-prefill crossing prompt length must not be dropped")
+    engine = make_engine(blocks=64, chunk=256)
+    prompt, total = 200, 600
+    seq = Sequence(list(range(2000, 2000 + prompt)),
+                   SamplingParams(max_tokens=410, temperature=0))
+    # Simulate: 400 tokens generated, then preempted (block_table freed,
+    # num_cached reset, is_prefill=True) while num_tokens stays 600.
+    seq.token_ids.extend([1] * (total - prompt))
+    seq.num_tokens = total
+    seq.last_token = 1
+    seq.status = SequenceStatus.RUNNING
+    engine.scheduler.preempt(seq)
+    steps = run_to_finish(engine)
+    bad = []
+    for mode, rows in engine.model_runner.launches:
+        for row in rows:
+            sid, is_prefill, cached, ntok, scheduled, table_len = row
+            if not is_prefill and scheduled > 1:
+                bad.append(("non-prefill q>1", mode, row))
+            if is_prefill and cached // BS >= table_len:
+                bad.append(("oob", mode, row))
+    print("  steps=%d launches=%d bad=%d" %
+          (steps, len(engine.model_runner.launches), len(bad)))
+    for item in bad[:5]:
+        print("  BAD:", item)
+    ok = not bad and steps < 100 and seq.is_finished
+    print("  -> PASS" if ok else "  -> FAIL")
+    return ok
+
+
 def scenario_c3():
     print("[C3] cumulative scheduler gate must defer when per-seq checks pass")
     all_ok = True
@@ -296,14 +333,16 @@ def scenario_c3():
     print("  -> PASS" if all_ok else "  -> FAIL")
     return all_ok
 
+
 def main():
     c1 = scenario_c1()
     c2 = scenario_c2()
     c3 = scenario_c3()
+    c4 = scenario_c4()
     print()
-    print("VERDICT:", "PASS" if (c1 and c2 and c3) else "FAIL",
-          "(C1=%s, C2=%s, C3=%s)" % (c1, c2, c3))
-    return 0 if (c1 and c2 and c3) else 1
+    print("VERDICT:", "PASS" if (c1 and c2 and c3 and c4) else "FAIL",
+          "(C1=%s, C2=%s, C3=%s, C4=%s)" % (c1, c2, c3, c4))
+    return 0 if (c1 and c2 and c3 and c4) else 1
 
 
 if __name__ == "__main__":

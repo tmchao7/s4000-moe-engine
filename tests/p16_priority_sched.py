@@ -14,11 +14,11 @@ Part 2 (0.6B engine, TP1 paged eager, 12-block pool = KV-pressure regime):
     A  all priority 0 (legacy newest-victim)
     B  highs protected (victims = lows)
     A2 history anchor (I34)
-  Gate (P26 regression semantics): the ADOPTED verdict must not drift —
-  anchor arm A2 bitwise-equals A, all 12 finish, priority TTFT benefit
-  present (B high ttft_p50 < A/5), preemptions fire.  The P16-C ITL p95
-  <= 0.8x gate was judged FAIL-and-recorded (benefit = admission latency);
-  its ratio is reported informationally, never re-litigated.
+  Gate (P27 regression semantics): functional only, no wall-clock rc —
+  all 12 finish, preemptions fire, and the priority arm admits every high
+  request no later than the first low one (discrete first-scheduled step).
+  The A/A2 15% anchor and TTFT 5x benefit are recorded informationally; the
+  P16-C ITL p95 <= 0.8x gate was judged FAIL-and-recorded.
 
 Run:  PYTHONPATH=. python3 tests/p16_priority_sched.py     (rc=0 pass)
 """
@@ -201,6 +201,7 @@ def _part2_engine_body(llm):
         sid_map = {}
         finals = {}
         highs = []
+        first_token = {}
         # max_tokens 384: decode growth crosses a block boundary (540+384=924
         # -> 4 blocks) so the pool pressure produces REAL preemptions
         sp_high = SamplingParams(temperature=0, max_tokens=384, ignore_eos=True,
@@ -221,21 +222,31 @@ def _part2_engine_body(llm):
             steps += 1
             for seq_id, toks, metrics in outputs:
                 finals[sid_map[seq_id]] = metrics
+            # Discrete, wall-clock-free ordering evidence: the step at which
+            # each request produced its first token.
+            for seq in list(llm.scheduler.running) + list(llm.scheduler.waiting):
+                name = sid_map.get(seq.seq_id)
+                if name is not None and seq.first_token_time is not None \
+                        and name not in first_token:
+                    first_token[name] = steps
         missing = [sid_map[sid] for sid in sid_map if sid_map[sid] not in finals]
         if missing:
             sched = llm.scheduler
             print(f"  [prio] MISSING finals: {missing} "
                   f"(waiting={len(sched.waiting)} running={len(sched.running)})",
                   flush=True)
-        return finals, llm.scheduler.preemptions - preempts0, highs
+        return finals, llm.scheduler.preemptions - preempts0, highs, first_token
 
     results = {}
     arms = {}
     for name, tiers in (("A_no_priority", False), ("B_priority", True),
                         ("A2_anchor", False)):
-        finals, pre, highs = run_arm(tiers)
+        finals, pre, highs, first_token = run_arm(tiers)
         high_itls = [it for sid in highs for it in finals[sid]["itls_s"]]
+        lows = [n for n in finals if n.startswith("low")]
         arms[name] = {
+            "high_first_token_max": max(first_token[h] for h in highs),
+            "low_first_token_min": min(first_token[l] for l in lows),
             "high_itl_p95": pct(high_itls, 95),
             "high_itl_p50": pct(high_itls, 50),
             "high_ttft_p50": pct([finals[s]["ttft_s"] for s in highs], 50),
@@ -246,7 +257,9 @@ def _part2_engine_body(llm):
         print(f"  [{name}] high p95={arms[name]['high_itl_p95']:.4f} "
               f"p50={arms[name]['high_itl_p50']:.4f} "
               f"ttft_p50={arms[name]['high_ttft_p50']:.3f} pre={pre} "
-              f"finals={arms[name]['n_finals']}", flush=True)
+              f"finals={arms[name]['n_finals']} "
+              f"first_token high<={arms[name]['high_first_token_max']} "
+              f"low>={arms[name]['low_first_token_min']}", flush=True)
 
     # Anchor semantics: ITL/TTFT are wall-clock metrics — exact float
     # equality across arms is unsatisfiable by construction (timing noise).
@@ -277,6 +290,12 @@ def _part2_engine_body(llm):
     benefit_ok = (arms["B_priority"]["high_ttft_p50"]
                   < arms["A_no_priority"]["high_ttft_p50"] / 5)
     preemption_ok = all(a["preemptions"] > 0 for a in arms.values())
+    # Discrete functional priority gate (no wall-clock): in the priority arm
+    # every high request's first token must land no later than the first low
+    # one.  Legacy A showed high first-token step 775 vs low 3; priority B was
+    # high 3 vs low 3, so a broken priority plumbing/arm fails this.
+    priority_order_ok = (arms["B_priority"]["high_first_token_max"]
+                         <= arms["B_priority"]["low_first_token_min"])
     verdict = {
         "arms": results,
         "anchor_ok": anchor_ok,
@@ -288,8 +307,9 @@ def _part2_engine_body(llm):
         # S4: wall-clock numbers are recorded, never rc gates.  The rc gate
         # is functional only (everyone completes + preemption machinery fires);
         # the anchor/benefit values are informational drift records.
-        "gate_semantics": "functional only; anchor/benefit are informational (S4)",
-        "gate": (all_complete and preemption_ok),
+        "priority_order_ok": priority_order_ok,
+        "gate_semantics": "functional only (complete+preempt+priority order); anchor/benefit informational (S4)",
+        "gate": (all_complete and preemption_ok and priority_order_ok),
     }
     return verdict
 

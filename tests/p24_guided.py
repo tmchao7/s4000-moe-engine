@@ -3,14 +3,15 @@
   g1  bitmask semantics: my torch-op expansion (LSB-first, bit t%32 of word
       t//32) matches xgrammar's own CPU application + accept/reject behavior
   g2  JSON schema validity: 4 schemas x 4 prompts, 100% parse + validate
-      (greedy: at temperature>0 the model can legally loop on JSON whitespace
-      and hit max_tokens with an incomplete object; validity at a length cap
-      is not a grammar guarantee — sampled decoding is exercised by g5)
+      (greedy removes sampling randomness; the suite still asserts
+      finish=stop. A length cap here is a model/budget failure, not evidence
+      of bitmask corruption — sampled decoding is exercised by g5)
   g3  regex: `[A-Z]{3}-[0-9]{3}` x 2 -> 100% fullmatch, grammar terminates
       before max_tokens (finish_reason "stop"; greedy for determinism)
   g4  unconstrained bitwise: defaults path unchanged (p22 t5 anchor re-run)
-  g5  overhead: constrained vs unconstrained decode step (recorded
-      informationally: x5 interleaved, median + CV; S4: no wall-clock rc gate)
+  g5  overhead: constrained vs unconstrained decode step (x5 interleaved,
+      median + CV).  Default: recorded with PASS/DRIFT/INVALID verdict, no rc
+      gate (S4).  --perf-strict: rc=1 unless PASS (opt-in enforcement).
   g6  validation errors -> ValueError (api maps to 400)
 
 Run:  PYTHONPATH=. python3 tests/p24_guided.py
@@ -93,7 +94,8 @@ def g1_bitmask_semantics(model_path):
 # any max_tokens (boundedness is part of the schema, not a weaker gate).
 SCHEMAS = [
     {"type": "object", "properties": {"name": {"type": "string", "maxLength": 12},
-                                      "age": {"type": "integer"}},
+                                      "age": {"type": "integer", "minimum": 0,
+                                              "maximum": 120}},
      "required": ["name", "age"], "additionalProperties": False},
     {"type": "object", "properties": {"items": {"type": "array", "maxItems": 3,
                                                 "items": {"type": "string",
@@ -107,7 +109,8 @@ SCHEMAS = [
                                       "tags": {"type": "array", "maxItems": 3,
                                                "items": {"type": "string",
                                                          "maxLength": 8}},
-                                      "score": {"type": "number"}},
+                                      "score": {"type": "number", "minimum": 0,
+                                                "maximum": 100}},
      "required": ["name", "tags", "score"], "additionalProperties": False},
 ]
 
@@ -127,6 +130,10 @@ def g2_g3_engine(llm):
                 guided_json=schema)
         outs = llm.generate(prompts, [sp] * len(prompts), use_tqdm=False)
         for o in outs:
+            finish = o["metrics"]["finish_reason"]
+            assert finish == "stop", \
+                f"g2 schema{si}: finish={finish} (model did not terminate; " \
+                "length cap is a model/budget failure, not a bitmask gate)"
             # offline decode keeps special tokens on this tokenizer build;
             # the API incremental path (skip=True) is what serves users
             text = llm.tokenizer.decode(o["token_ids"],
@@ -134,8 +141,6 @@ def g2_g3_engine(llm):
             obj = json.loads(text)                    # raises if invalid
             if jsonschema is not None:
                 jsonschema.validate(obj, schema)
-            assert o["metrics"]["finish_reason"] == "stop", \
-                f"g2 schema{si}: finish={o['metrics']['finish_reason']}"
         print(f"g2 PASS schema{si} (4/4 valid + grammar-terminated)", flush=True)
 
     sp = SP(temperature=0, max_tokens=48, guided_regex=r"[A-Z]{3}-[0-9]{3}")
@@ -173,10 +178,24 @@ def g5_overhead(llm):
     ratio = statistics.median(on) / statistics.median(off)
     cv_off = statistics.pstdev(off) / statistics.median(off)
     cv_on = statistics.pstdev(on) / statistics.median(on)
+    cv_max = max(cv_off, cv_on)
+    # Recorded gate (P24 pre-registered <=1.10), with the AGENTS noise
+    # protocol applied: CV>5% means the measurement is INVALID, not PASS.
+    # Default rc stays 0 (S4: no wall-clock hard gate); --perf-strict opts in.
+    if cv_max > 0.05:
+        verdict = "INVALID"
+    elif ratio <= 1.10:
+        verdict = "PASS"
+    else:
+        verdict = "DRIFT"
     print(f"g5 constrained/unconstrained decode median ratio = {ratio:.4f} "
           f"(x5 interleaved; cv off={cv_off:.4f} on={cv_on:.4f}) "
-          f"[informational-only, not an rc gate]", flush=True)
-    return ratio, cv_off, cv_on
+          f"verdict={verdict} [recorded; --perf-strict opt-in]", flush=True)
+    return {"ratio": round(ratio, 4),
+            "cv": [round(cv_off, 4), round(cv_on, 4)],
+            "verdict": verdict,
+            "recorded_gate": ratio <= 1.10,
+            "rc_gate": False}
 
 
 def g6_validation():
@@ -195,6 +214,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="/root/autodl-tmp/models/Qwen3-0.6B")
     parser.add_argument("--out", default="/root/p24_data/guided.json")
+    parser.add_argument("--perf-strict", action="store_true",
+                        help="fail rc on g5 INVALID/DRIFT (default: record only)")
     args = parser.parse_args()
     g6_validation()
     g1_bitmask_semantics(args.model)
@@ -204,16 +225,18 @@ def main():
               scheduler_policy="stall_free")
     try:
         g2_g3_engine(llm)
-        ratio, cv_off, cv_on = g5_overhead(llm)
+        g5 = g5_overhead(llm)
     finally:
         llm.exit()
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
-        json.dump({"g5_ratio": round(ratio, 4), "g5_cv": [round(cv_off, 4), round(cv_on, 4)],
-                   "g5_semantics": "informational-only (not an rc gate)", "pass": True},
+        json.dump({"g5": g5,
+                   "g5_semantics": "recorded; rc gate off by default; --perf-strict opts in",
+                   "pass": g5["verdict"] == "PASS"},
                   f, indent=1)
-    print("[p24] PASS", flush=True)
-    return 0
+    strict_fail = args.perf_strict and g5["verdict"] != "PASS"
+    print("[p24]", "FAIL (--perf-strict g5)" if strict_fail else "PASS", flush=True)
+    return 1 if strict_fail else 0
 
 
 if __name__ == "__main__":

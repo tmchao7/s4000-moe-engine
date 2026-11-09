@@ -10,10 +10,10 @@
 | 调度/服务化 | stall_free + chunked prefill + 前缀缓存 + LRU 淘汰 + 优先级/SLO 分级(高优 TTFT 42.7×)+ host-sync 移除 + 统一混合批(混合步 −25%/−15%,opt-in) |
 | 采样/服务面(P22) | top_p/top_k/min_p + 三种 penalty + 引擎级 stop_token_ids + logprobs + /v1/completions(流式);默认参数逐字 legacy 路径(改造前基线 bitwise 全等),全 per-request opt-in |
 | overlap scheduler(P23) | vLLM V1/SGLang 单飞流水线(opt-in):稳态输出与串行逐位全等(greedy+采样),30B bitwise 同;I36 投机调度块边界 off-by-one 自查自修(提交路径卡死 → launch 时刻块覆盖检查) |
-| 结构化输出(P24) | xgrammar:guided_json/guided_regex/response_format;位掩码与官方 CPU apply 逐位一致,四 schema 16/16 合法+grammar 终止,开销 1.028× |
+| 结构化输出(P24) | xgrammar:guided_json/guided_regex/response_format;位掩码与官方 CPU apply 逐位一致,四 schema 16/16 合法+grammar 终止,开销 1.028×(P27 起 informational) |
 | PD 分离 | 单机双卡 1P1D 全链路:bitwise 交接 + 在线 A/B ITL p95 0.753×/0.839×;Poisson 双档 POSITIVE(0.79×/0.82×);P 侧前缀复用 5.7×;OpenAI 端点 |
 | 平台适配 | MUSA 全栈移植 + Triton-mtgpu 内核(paged/fused-moE)+ I28/I31/I34 等平台坑**定界/绕过**(三项在 ISSUES 仍为未结,I28 见 §B;不写成"已闭环") |
-| 验收修复(P27) | 独立验收审计 → 修 I39(overlap stale prefill 行越界)/I40(冻结记账)、p24 终止性判定、pytest 干净 checkout、公开复现链 `--model`/extras;回归扩 16 套(新增 CPU 边界门),强门 16/16、pytest 28/28;生产默认未变 |
+| 验收修复(P27) | 独立验收审计 → 修 I39(overlap stale prefill 行越界)/I40(冻结记账)、p24 终止性判定、pytest 干净 checkout、公开复现链 `--model`/extras;回归扩 16 套(新增 CPU 边界门),强门 16/16、pytest 28/28;code review 补 C4(re-prefill)/g5 verdict/p16pri 离散门/p22 e2e/rsync 同步;生产默认未变 |
 
 ## B. 无法解决 — 厂商问题(我们修不了,需要摩尔线程)
 
