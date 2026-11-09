@@ -41,6 +41,8 @@
 
 **Day2 进展**：8k 合成 needle-QA **9/9 PASS**（7615 tokens，3 code × 3 depth，整批 42.2s）；API 超长输入返回 400；8k 并发/SLO 探针已写但被交接中止，**没有 SLO 数字**（见 [day2 报告](../benchmarks/P30-day2-longctx-quality.md)）。下一任先重跑 SLO。
 
+**Day3 进展**：SLO 探针重跑完成——18×7600 并发 TTFT p50 63.5 s（超 2 s 交互门 32×），聚合 prefill ~2.1k tok/s（单流 ~3.9×）。**判决：8k = 离线/批处理能力，非交互能力**（与本节预估一致）；用法已写入 OPERATIONS §6，P30-A 验收四项全齐（见 [day3 报告](../benchmarks/P30-day3-longctx-slo.md)）。A 项到此收口，后续只剩 C（容量/可观测性）已有基础上的按需补测。
+
 ### A. 8k 长上下文产品化（2–3 天，第二优先）
 
 为什么值得：Day8 已证明 30B 在 8k 不 OOM，decode 210.8ms；这是**真实差异化能力**，而且不需要新 kernel。

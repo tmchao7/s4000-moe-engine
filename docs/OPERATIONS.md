@@ -56,6 +56,15 @@ sudo journalctl -u s4000-moe --since '10 min ago'
 - 生产默认 `max_num_seqs=512`、chunk 256、eager；不要开启 `--no-enforce-eager`（图路线在本平台被 I29 阻断）。
 - 容量/延迟数字是环境相关的；本仓库不再把历史 benchmark 当 SLA。
 
+### 8k 长上下文（opt-in，离线/批处理定位）
+
+设 `NANOVLLM_MAX_MODEL_LEN=8192` 开启（默认 4096）。8k 在本栈上**不是交互能力**，实测口径（30B、生产栈，[P30-A 报告](../benchmarks/P30-day3-longctx-slo.md)）：
+
+- 单流 7.6k prefill ~14 s；18 条 7.6k 并发 TTFT p50 ~64 s（聚合 prefill ~2.1k tok/s）；
+- 交互门是 TTFT ≤ 2 s，8k 超门 30 倍以上 ⇒ 只用于长文档摘要、批量知识抽取、离线评测类负载；
+- KV（util 0.85）可容纳 18 条 7.6k 并发，超容量请求按 429 拒绝；
+- 质量：合成 needle-QA 9/9（7.6k，needle 10/50/90% 深度）。
+
 ## 7. 停止/重启
 
 ```bash

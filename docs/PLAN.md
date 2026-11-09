@@ -46,6 +46,10 @@
 
 [day2 报告](../benchmarks/P30-day2-longctx-quality.md):合成 needle-QA 9/9;API 超长 400;8k 并发/SLO 探针被交接主动中止,无结果。
 
+### P30-A Day3:8k 并发/SLO 判决(11-09)
+
+[day3 报告](../benchmarks/P30-day3-longctx-slo.md):重跑 `scripts/p30_longctx_slo.py`(18×7600 随机 token,生产栈,opt-in 8k 配置)——TTFT p50/p95/max = 63.52/63.52/78.31 s,聚合 prefill ~2.1k tok/s(单流 ~3.9×),18 条全部完成无抢占。**判决:8k = 离线/批处理能力,非交互能力**(TTFT 超 2s 交互门 32×;单流 prefill ~14s 亦不可交互)。生产默认 `max_model_len=4096` 不变;8k 用法/时延口径写入 OPERATIONS §6。
+
 ### P30 夜间交接
 
 [NEXT-AGENT-PROMPT.md](NEXT-AGENT-PROMPT.md):给新 Agent 的可粘贴提示词。
