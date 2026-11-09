@@ -34,6 +34,10 @@
 | **文档/脱敏(D2–D11,E4–E9)** | t5 数字、TEST-MATRIX 15%/18 行/抢占行、CLOSEOUT I28、README archive/台账指针、ISSUES E1/死路径、PLAN I30/159ms、torch 版本、AGENTS 链接、面试/简历文案、`.gitignore` 注释 | `check_docs` rc=0;逐条对照证据源 |
 
 回归入口扩为 **16 套**(新增纯 CPU `boundary` 门);服务器强门 **16/16 rc=0**,pytest **28/28**;本地 fuzz 60 组/3048 行 0 违规。生产默认栈未变,项目仍为冻结态。详见 `docs/ACCEPTANCE-FIX-REPORT.md`(本地)。
+### P29 候选(评估,未执行)
+
+独立评估 + 外部引擎调研 + 9 天候选任务见 [ROADMAP-NEXT.md](ROADMAP-NEXT.md);当前生产默认不变。
+
 ### P28 产品化收尾(11-09)
 
 | 项 | 变更 | 验收 |

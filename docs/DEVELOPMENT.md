@@ -63,3 +63,4 @@ bash scripts/build_release.sh
 - [TEST-MATRIX.md](TEST-MATRIX.md)
 - [P25-review.md](P25-review.md)
 - [engine-vs-vllm-sglang.md](engine-vs-vllm-sglang.md)（历史对标，非产品承诺）
+- [ROADMAP-NEXT.md](ROADMAP-NEXT.md)（P29 评估 + 外部引擎调研 + 9 天候选任务）
