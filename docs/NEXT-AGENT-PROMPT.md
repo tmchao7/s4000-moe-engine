@@ -37,18 +37,19 @@ ssh s4000 'pgrep -fa "^/usr/bin/python3|^python3|^[s]pawn_main" || echo IDLE; mt
 - 生产栈：TP2/EP2、`triton_paged`、`grouped_mm` prefill、`bmm_dense` decode、eager、`stall_free`、chunk 256；30B b1 约 142ms（历史口径）。
 - P29 已判 NO-GO：30B DP2、FP8 保留、8/4-bit、RR 放置、PP/SP/CP、PD 产品化、图路线；不要重开，除非有**新证据**。
 - P30-B Day1：修复了 installer `--target` fallback 的 transformers/tokenizers 版本冲突；release 安装 + `serve_s4000.sh` + 30B health/chat/stream 已实跑通过；systemd 实启与 venv 分支受当前实例限制，**未验证**，不要伪造。
-- P30-A：8k 合成 needle-QA 已 **9/9 PASS**（7615 tokens，3 code × 3 depth，整批 42.2s）；API 超长输入返回 400；8k 并发/SLO 探针 `scripts/p30_longctx_slo.py` 已写好，**上一轮启动后被主动中止，尚无结果**，需要重跑。
-- 生产默认 `max_model_len` 仍 4096；8k 只是 opt-in 候选。
+- P30-A：8k 合成 needle-QA **9/9 PASS**；API 超长输入 400；**8k 并发/SLO 探针已完成**（[day3 报告](../benchmarks/P30-day3-longctx-slo.md)）：18×7600 并发 TTFT p50 63.5s / 聚合 prefill ~2.1k tok/s，**判决 8k = 离线/批处理能力，非交互能力**；用法已写入 OPERATIONS §6。P30-A 收口，不要重跑。
+- 测试网：G6 已闭合（p6 `--strict` 进 run_regression.sh）；`p25_overlap_fix.py` 支持 `--tp 2`（TP2 改动合入前人工跑一次）；`p25_overlap_prefill_boundary.py` 已含 C6/C7（cancel×overlap）。
+- 生产默认 `max_model_len` 仍 4096；8k 是 opt-in（`NANOVLLM_MAX_MODEL_LEN=8192`），定位离线/批处理。
 
 ### 2. 今晚的目标（通用、探索性）
 
-让项目在**不破坏生产默认**的前提下更接近“真正可交付/可面试讲清楚”的状态。优先级：
+让项目在**不破坏生产默认**的前提下更接近“真正可交付/可面试讲清楚”的状态。优先级（8k 评估已在上一班收口）：
 
-1. **8k 长上下文产品化评估（首选）**：跑 `scripts/p30_longctx_slo.py`（18 条 7600-token 随机 prompt，记录 TTFT/e2e/aggregate），结合已有 9/9 质量门，判断 8k 是交互能力还是离线/批处理能力；补 API 边界/文档/opt-in 说明。
+1. **代码审计/找 bug（当前首选）**：重点看 scheduler 状态机、block 边界、prefill/decode 混合、超时/取消/异常、API 400/429、KV 容量、release 脚本；发现真实 bug → 最小复现 → 修复 → 加回归测试（cancel×overlap 双窗口 C6/C7 已补，勿重复）。
 2. **部署/发布硬化**：在真实可用环境验证 systemd unit 或 venv 分支（当前实例没有，别硬造假）；检查 release 安装幂等、错误路径、`--version`、`serve_s4000.sh` 环境变量；补测试/文档。
-3. **代码审计/找 bug**：重点看 scheduler 状态机、block 边界、prefill/decode 混合、超时/取消/异常、API 400/429、KV 容量、release 脚本；发现真实 bug → 最小复现 → 修复 → 加回归测试。
-4. **容量/可观测性**：审计 `/metrics` 是否覆盖 KV 使用率、queue、TTFT/TPOT；补 8k 容量数字或文档。
-5. **弱门/假绿审计**：找“只打印不 assert”的测试、文档里未验证的“已通过”、release 允许路径；补强或如实降级。
+3. **容量/可观测性**：`/metrics` 已覆盖 KV 水位/queue/TTFT/TPOT（P19 实测）；剩余是按真实流量补容量数字，不急。
+4. **弱门/假绿审计**：找“只打印不 assert”的测试、文档里未验证的“已通过”；G6 已闭合，找下一处。
+5. **新特性探索**：先调研上游（vLLM/SGLang 的 release notes/PR），判断能否迁到 MUSA；只读探针/opt-in 原型起步，预注册验收门，再上 30B；一次一个 GPU 任务。
 
 **不要做**：重跑 P29 已否的量化/DP2/RR/PP/SP；为填时间做低 ROI kernel；改生产默认；在未知环境里 `pip install -U` 乱修依赖。
 
