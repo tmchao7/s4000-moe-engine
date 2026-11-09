@@ -299,6 +299,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             local_raw = self.global_to_local[topk_ids].reshape(-1)
             owned = local_raw >= 0
             local_ids = local_raw.clamp(min=0)
+        if self.profiler is not None:
+            # Same observation as the grouped path; bmm_dense is the decode
+            # production path, and without this the rank-pair imbalance was
+            # invisible in decode profiles (P29 Day1).
+            self.profiler.observe(
+                "moe.local_pairs", int(owned.sum()), layer=self.layer_id,
+                tokens=num_tokens,
+            )
         with self._profile("moe.route_pack"):
             flat_token = torch.arange(num_tokens, device=device).unsqueeze(1).expand_as(topk_ids).reshape(-1)
             flat_slot = torch.arange(slots, device=device)

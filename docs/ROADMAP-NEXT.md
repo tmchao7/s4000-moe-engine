@@ -148,7 +148,15 @@
 
 **量化最大的战略价值**：当前 bf16 完整模型约 59GB，单卡 48GB 放不下；FP8 权重保留/W8 后完整模型约 30GB，**可以塞进单卡 → DP=2 两个完整副本**（高吞吐），或 TP2 下把 KV 从 8.7GB 扩到更大上下文。这个收益可能大于 decode 单步加速；面试时要把「量化 → 拓扑变化」讲出来，而不只是「4-bit 更省显存」。
 
-### 3.5 算子/量化优先级
+
+### 3.5 Day1 实测结果（2026-11-09）
+
+详细报告：[benchmarks/P29-day1.md](../benchmarks/P29-day1.md)。
+
+- 量化：`mate/deep_gemm/deep_ep` 当前环境未安装；ATen `_int_mm`/`_weight_int8pack_mm` 在 2048² 下比 bf16 慢 **4–57×**；FP8 `_scaled_mm` 报 `MUSA_ARCH >= 310` 不支持；4-bit ATen 符号存在但未验证。
+- 拓扑（TP2/EP2、生产栈、128 context）：prefill EP all-reduce 2.6–7.8%、rank-pair imbalance **8.4–8.9%**；decode clean step 163/184/243 ms（b1/b8/b32），decode imbalance **4.2–5.6%**（补 `bmm_dense` 观测后）。
+- 结论：当前 2 卡上 **EP 负载不平衡比 all-reduce 更值得先做**；量化先做 FP8 保留 + fused dequant；不要用 ATen int8 路径做加速。
+### 3.6 算子/量化优先级
 
 1. **P29-Q1**：FP8 权重保留 + fused dequant（低质量风险，先拿显存/带宽收益）。
 2. **P29-Q2**：W8A16（MATE 或自定义 Triton；先一层/一个专家，再 e2e）。
