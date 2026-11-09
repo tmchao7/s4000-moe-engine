@@ -10,8 +10,12 @@ Gate (informational, decided BEFORE running):
   D2H < 2 GB/s   -> swap cost swamps the scheduling budget -> NO-GO 照录.
   in between     -> record numbers; re-judge only on real-traffic demand.
 
-Sizes: 6 MB (one TP2 30B KV block: 256 tok x 24 KB/token/rank) and 64 MB
-(bulk regime). >=5 timed reps, median + CV, warmup rep discarded.
+Sizes: 6 MB and 64 MB. NOTE (P30-R1 correction): one TP2 30B KV block is
+12 MiB (256 tok x 48 KiB/token/rank: 2 x 48L x 2 kvh x 128 x bf16), not
+6 MB as first written here — 6 MB remains a valid small-transfer point
+and the 64 MB point covers the bulk regime; the gate math below reads
+the same either way at the recorded bandwidth.
+>=5 timed reps, median + CV, warmup rep discarded.
 No engine code involved; one idle GPU; finishes in well under a minute.
 """
 import argparse
