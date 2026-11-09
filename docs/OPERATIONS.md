@@ -65,6 +65,15 @@ sudo journalctl -u s4000-moe --since '10 min ago'
 - KV（util 0.85）可容纳 18 条 7.6k 并发，超容量请求按 429 拒绝；
 - 质量：合成 needle-QA 9/9（7.6k，needle 10/50/90% 深度）。
 
+KV 并发容量（30B，块=12 MiB/rank，实测口径；块数随 `NANOVLLM_GPU_MEM_UTIL` 变化）：
+
+| gpu_memory_utilization | KV 块/rank | 8k 并发 | 4k 并发 | 来源 |
+|---|---:|---:|---:|---|
+| 0.9 | 651 | ~20 | ~40 | [P29-day8](../benchmarks/P29-day8-longctx.md) |
+| 0.85 | 526 | ~16 | ~32 | [P30-R1](../benchmarks/P30-kv-offload.md) |
+
+超并发不拒绝：准入等待（stall_free 准入跳过），单请求 `prompt+max_tokens` 超 KV 总容量才 429。开启 KV offload（见 §9）后，被逐出的前缀块可从主机内存复活（实测被挤出后重引用的 7.6k 文档 TTFT 22.4s→1.16s）。
+
 ## 7. 停止/重启
 
 ```bash
