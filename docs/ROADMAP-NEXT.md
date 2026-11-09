@@ -165,7 +165,16 @@
 - FP8 保留 + Triton dequant：**编译失败**（MUSA linker `__mt_tt_e4m3_to_f32` relocation）。
 - INT8 保留 + 自定义 GEMV（M=1）：0.1606ms vs bf16 0.1216ms = **0.76×（更慢）**；权重减半但 M=1 不走 INT8 tensor core。
 - 结论：**量化先拿显存/DP 价值，不把 decode 加速当默认预期**；下一步先探 MATE / W8 tensor-core，不过门就转 EPLB。
-### 3.7 算子/量化优先级
+
+### 3.7 Day3 实测（2026-11-09）
+
+详细报告：[benchmarks/P29-day3.md](../benchmarks/P29-day3.md)。
+
+- MATE：当前环境未安装，`/usr/local/musa` 无 MATE 库；不做生产环境安装。
+- W8A16 GEMM（M=16–256）：自定义 Triton 比 bf16 **慢 4–16×**；加上 Day2 的 M=1 GEMV 0.76×，**自定义 W8 速度线证伪**，除非拿到 MATE。
+- round-robin 放置：prefill imbalance **8.5% → 0.3–0.5%**，decode **4–5.6% → 0.6–2.5%**；但 clean step 没有改善（b1 +7%，b8 +2.9%，b32 +0.5%，跨加载比较，未做 CV）。
+- 结论：量化只保留显存/DP 价值；下一步转 **RR 重复 A/B + 30B token 门**，不把 RR 直接设默认。
+### 3.8 算子/量化优先级
 
 1. **P29-Q1**：FP8 权重保留 + fused dequant（低质量风险，先拿显存/带宽收益）。
 2. **P29-Q2**：W8A16（MATE 或自定义 Triton；先一层/一个专家，再 e2e）。

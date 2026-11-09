@@ -69,6 +69,8 @@ def main():
     parser.add_argument("--workloads", default="1x128,8x128,32x128")
     parser.add_argument("--decode-steps", type=int, default=4)
     parser.add_argument("--clean-steps", type=int, default=4)
+    parser.add_argument("--expert-placement", default="linear",
+                        choices=("linear", "round_robin"))
     parser.add_argument("--output", default="/root/p29_data/topology.json")
     parser.add_argument("--seed", type=int, default=20261109)
     args = parser.parse_args()
@@ -84,6 +86,7 @@ def main():
         moe_backend="grouped_mm",
         decode_moe_backend="bmm_dense",
         attention_backend="triton_paged",
+        expert_placement=args.expert_placement,
         scheduler_policy="stall_free",
         prefill_chunk_size=256,
         enable_profiling=True,
@@ -155,7 +158,7 @@ def main():
             "decode_moe_backend": "bmm_dense",
             "attention_backend": "triton_paged",
             "scheduler_policy": "stall_free", "prefill_chunk_size": 256,
-            "enforce_eager": True,
+            "enforce_eager": True, "expert_placement": args.expert_placement,
         },
         "workloads": [{"batch": b, "context": c} for b, c in workloads],
         "decode_steps": args.decode_steps,
