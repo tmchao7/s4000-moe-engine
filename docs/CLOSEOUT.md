@@ -13,7 +13,7 @@
 | 结构化输出(P24) | xgrammar:guided_json/guided_regex/response_format;位掩码与官方 CPU apply 逐位一致,四 schema 16/16 合法+grammar 终止,开销 1.028×(P27 起 informational) |
 | PD 分离 | 单机双卡 1P1D 全链路:bitwise 交接 + 在线 A/B ITL p95 0.753×/0.839×;Poisson 双档 POSITIVE(0.79×/0.82×);P 侧前缀复用 5.7×;OpenAI 端点 |
 | 平台适配 | MUSA 全栈移植 + Triton-mtgpu 内核(paged/fused-moE)+ I28/I31/I34 等平台坑**定界/绕过**(三项在 ISSUES 仍为未结,I28 见 §B;不写成"已闭环") |
-| 验收修复(P27) | 独立验收审计 → 修 I39(overlap stale prefill 行越界)/I40(冻结记账)、p24 终止性判定、pytest 干净 checkout、公开复现链 `--model`/extras;回归扩 16 套(新增 CPU 边界门),强门 16/16、pytest 28/28;code review 补 C4(re-prefill)/g5 verdict/p16pri 离散门/p22 e2e/rsync 同步;生产默认未变 |
+| 验收修复(P27) | 独立验收审计 → 修 I39(overlap stale prefill 行越界)/I40(冻结记账)、p24 终止性判定、pytest 干净 checkout、公开复现链 `--model`/extras;回归扩 16 套(新增 CPU 边界门),强门 16/16、pytest 28/28;code review 补 C4(re-prefill)/C5(兜底 sync schedule)/g5 verdict/p16pri 离散门/p22 e2e/rsync 同步;生产默认未变 |
 
 ## B. 无法解决 — 厂商问题(我们修不了,需要摩尔线程)
 

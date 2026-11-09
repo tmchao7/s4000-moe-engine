@@ -23,6 +23,11 @@ C4  A preempted sequence is re-prefilled from 0 with num_tokens >
     prompt length; it must NOT be dropped as "prefill complete" (regression
     introduced by the first C1 fix and caught in review).
 
+C5  A prefill completes in the in-flight collect while the seq is stranded in
+    waiting (speculative schedule deferred).  The fallback sync schedule must
+    not emit it as a q=1 prefill row: batch mode must match the frozen row
+    flags, and every row's block_table must cover its query range.
+
 Runs on the cheapest Python >= 3.10 (same re-exec trick as
 tests/p25_review_repro.py).  No torch / GPU / model needed.
 
@@ -271,6 +276,40 @@ def scenario_c2():
     return ok
 
 
+def launch_invariant(engine):
+    """Replicate the two _prepare_rows preconditions for every launch."""
+    bad = []
+    for mode, rows in engine.model_runner.launches:
+        flags = [row[1] for row in rows]
+        derived = ("mixed" if any(flags) and any(not f for f in flags)
+                   else ("prefill" if any(flags) else "decode"))
+        if mode != derived:
+            bad.append(("mode-mismatch", mode, derived, rows))
+        for row in rows:
+            sid, is_prefill, cached, ntok, scheduled, table_len = row
+            if scheduled > 0 and (cached + scheduled - 1) // BS >= table_len:
+                bad.append(("oob", mode, row))
+    return bad
+
+
+def scenario_c5():
+    print("[C5] fallback sync schedule must not emit a stranded prefill as q=1 prefill")
+    engine = make_engine(blocks=8, chunk=256)
+    for i, length in enumerate([512, 600, 768]):
+        engine.scheduler.add(Sequence(
+            list(range(10000 + i * 2000, 10000 + i * 2000 + length)),
+            SamplingParams(max_tokens=20, temperature=0)))
+    steps = run_to_finish(engine)
+    bad = launch_invariant(engine)
+    print("  steps=%d launches=%d bad=%d" %
+          (steps, len(engine.model_runner.launches), len(bad)))
+    for item in bad[:5]:
+        print("  BAD:", item)
+    ok = not bad and engine.is_finished() and steps < 200
+    print("  -> PASS" if ok else "  -> FAIL")
+    return ok
+
+
 def scenario_c4():
     print("[C4] preempted seq re-prefill crossing prompt length must not be dropped")
     engine = make_engine(blocks=64, chunk=256)
@@ -293,11 +332,14 @@ def scenario_c4():
                 bad.append(("non-prefill q>1", mode, row))
             if is_prefill and cached // BS >= table_len:
                 bad.append(("oob", mode, row))
-    print("  steps=%d launches=%d bad=%d" %
-          (steps, len(engine.model_runner.launches), len(bad)))
+    crossed = [row for mode, rows in engine.model_runner.launches
+               for row in rows
+               if row[1] and row[2] < prompt <= row[2] + row[4]]
+    print("  steps=%d launches=%d bad=%d crossed=%d" %
+          (steps, len(engine.model_runner.launches), len(bad), len(crossed)))
     for item in bad[:5]:
         print("  BAD:", item)
-    ok = not bad and steps < 100 and seq.is_finished
+    ok = (not bad and crossed and steps < 100 and seq.is_finished)
     print("  -> PASS" if ok else "  -> FAIL")
     return ok
 
@@ -339,10 +381,11 @@ def main():
     c2 = scenario_c2()
     c3 = scenario_c3()
     c4 = scenario_c4()
+    c5 = scenario_c5()
     print()
-    print("VERDICT:", "PASS" if (c1 and c2 and c3 and c4) else "FAIL",
-          "(C1=%s, C2=%s, C3=%s, C4=%s)" % (c1, c2, c3, c4))
-    return 0 if (c1 and c2 and c3 and c4) else 1
+    print("VERDICT:", "PASS" if (c1 and c2 and c3 and c4 and c5) else "FAIL",
+          "(C1=%s, C2=%s, C3=%s, C4=%s, C5=%s)" % (c1, c2, c3, c4, c5))
+    return 0 if (c1 and c2 and c3 and c4 and c5) else 1
 
 
 if __name__ == "__main__":

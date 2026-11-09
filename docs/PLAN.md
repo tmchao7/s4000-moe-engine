@@ -34,7 +34,7 @@
 | **文档/脱敏(D2–D11,E4–E9)** | t5 数字、TEST-MATRIX 15%/17 行/抢占行、CLOSEOUT I28、README archive/台账指针、ISSUES E1/死路径、PLAN I30/159ms、torch 版本、AGENTS 链接、面试/简历文案、`.gitignore` 注释 | `check_docs` rc=0;逐条对照证据源 |
 
 回归入口扩为 **16 套**(新增纯 CPU `boundary` 门);服务器强门 **16/16 rc=0**,pytest **28/28**;本地 fuzz 60 组/3048 行 0 违规。生产默认栈未变,项目仍为冻结态。详见 `docs/ACCEPTANCE-FIX-REPORT.md`(本地)。
-**P27 review 补(2026-11-09)**:独立 code review 在 `ef23c59` 上发现并修复 1 个 high 回归——初版 I39 用 prompt 长度判 prefill 完成,被抢占 seq 重 prefill 时会被误丢;改为 live `is_prefill` 完成信号 + scenario C4。同时补 p24 g5 的 PASS/DRIFT/INVALID 记录语义(`--perf-strict` opt-in)、p16pri 离散 first-token 门、p22sam `--e2e`、rsync 镜像同步、jsonschema/repo extras、ISSUES 计数。复验:本地 C1–C4/fuzz/pytest 28/check_docs;服务器 **16/16 rc=0**(p24 g5 记录 INVALID,默认不进 rc)。
+**P27 review 补(2026-11-09)**:独立 code review 在 `ef23c59` 上发现并修复 1 个 high 回归——初版 I39 用 prompt 长度判 prefill 完成,被抢占 seq 重 prefill 时会被误丢;改为 live `is_prefill` 完成信号 + scenario C4。同时补 p24 g5 的 PASS/DRIFT/INVALID 记录语义(`--perf-strict` opt-in)、p16pri 离散 first-token 门、p22sam `--e2e`、rsync 镜像同步、jsonschema/repo extras、ISSUES 计数;并修 review 二轮 high:overlap 兜底 sync schedule 把「在飞完成 prefill 但留在 waiting」的 seq 当 q=1 prefill 发射(补 C5)。复验:本地 C1–C5/fuzz/pytest 28/check_docs;服务器 **16/16 rc=0**(p24 g5 记录 INVALID,默认不进 rc)。
 
 ## 1. P16–P18 迭代内容(2026-11-07 立项;用户三方向合成:统一混合 batch + KV 调度做足 → KV int8 量化 → PD 小模型推进;30B 只做点睛)
 

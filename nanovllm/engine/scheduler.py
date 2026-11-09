@@ -382,6 +382,14 @@ class Scheduler:
             "scheduler_kv_admission_skips_total": self.kv_admission_skips_total,
         }
 
+    def _remove_from_queues(self, seq: Sequence):
+        # A prefill-completing seq can be in waiting when the speculative
+        # schedule deferred; finished handling must not assume running.
+        if seq in self.waiting:
+            self.waiting.remove(seq)
+        if seq in self.running:
+            self.running.remove(seq)
+
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], mode: str,
                     logprobs: list | None = None,
                     query_lens: list[int] | None = None,
@@ -446,7 +454,18 @@ class Scheduler:
                 seq.finish_time = now
                 seq.finish_reason = "stop" if (hit_eos or hit_stop_id or hit_grammar) else "length"
                 self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+                self._remove_from_queues(seq)
+            elif was_prefill and seq in self.waiting:
+                # A prefill chunk can be requeued before this collect finishes
+                # the prefill (the trailing speculative schedule may defer).
+                # Promote it now: otherwise the fallback sync schedule sees a
+                # waiting seq with is_prefill=False and emits a q=1 *prefill*
+                # row, which runs prepare_prefill at a block boundary and can
+                # index block_table out of range (review finding / C5).
+                self.waiting.remove(seq)
+                self.running.append(seq)
+                seq.status = SequenceStatus.RUNNING
+
             token_events.append((
                 seq.seq_id,
                 token_id,

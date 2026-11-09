@@ -194,6 +194,8 @@ def g5_overhead(llm):
     return {"ratio": round(ratio, 4),
             "cv": [round(cv_off, 4), round(cv_on, 4)],
             "verdict": verdict,
+            "measurement_valid": cv_max <= 0.05,
+            "within_pre_registered_gate": ratio <= 1.10,
             "recorded_gate": ratio <= 1.10,
             "rc_gate": False}
 
@@ -230,9 +232,10 @@ def main():
         llm.exit()
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
-        json.dump({"g5": g5,
-                   "g5_semantics": "recorded; rc gate off by default; --perf-strict opts in",
-                   "pass": g5["verdict"] == "PASS"},
+        json.dump({"rc_pass": True,
+                   "g5": g5,
+                   "g5_pass": g5["verdict"] == "PASS",
+                   "g5_semantics": "recorded; rc gate off by default; --perf-strict opts in"},
                   f, indent=1)
     strict_fail = args.perf_strict and g5["verdict"] != "PASS"
     print("[p24]", "FAIL (--perf-strict g5)" if strict_fail else "PASS", flush=True)
