@@ -68,3 +68,39 @@
 ### 3.1 TP2 对称性门（2026-11-10 凌晨补测，✅）
 
 `tests/p30_kv_offload_engine.py --tp 2`（0.6B TP2，rc=0）：junk_puts=9、revives=3、**x/r2 复活输出均与参考 bitwise 相等**、池账目闭环——双 rank 各自搬运 KV 半边、slot 流经同一命令序列保持一致的设计拿到实测证据。报告 §3 的"未单独实测 TP2 门"边界自此闭合。
+
+## 4. 30B 收益测量（预注册，先写门再跑；单载 A/B，一次 GPU 任务）
+
+**口径**（`scripts/p30_offload_30b.py`，生产栈 + `kv_offload_enabled=True`、host_blocks=1024=12 GiB pinned，max_model_len 8192，util 0.85）：
+- **pass1（冷）**：4 条 ~7.6k token 文档 prompt（tokenizer 编码的中性文本，词表安全），greedy 16 token → 记每条 TTFT（冷 prefill 基准）与输出；
+- **junk 波次**：每次 4 条 7.6k junk（中性文本）跑到完，直到 `host_puts ≥ 120`（自适应波次，≤6 轮；4×~29≈118 个文档块须全部进 host）；
+- **pass2（复活）**：同一 4 条文档重跑 → 前缀块从 host 换回，记 TTFT 与输出。
+
+**门**：
+1.（硬）pass2 输出与 pass1 **逐位相等**（复活正确性 @30B；若翻车先看 R 型消歧——junk 排干后第三次重跑应==pass1，若 pass3≠pass1 则历史效应主导、门设计对 30B 无效，如实降级）；
+2.（硬）`revives ≥ 100`（复活路径确实承载了文档前缀）；
+3.（记录性）**TTFT_revived / TTFT_cold 比值**（收益数字）+ puts/gets/drops 账目 + swap 字节数。
+
+**预期**：pass2 TTFT < pass1（跳过 ~29 块/条的 prefill 重算），差额 = 复活收益 − swap-in 开销；若比值 ≥ 1.0（swap-in 吃掉全部收益）→ 负结果照录，特性定位降级为"仅容量扩展、无 TTFT 收益"。
+
+### 4.1 结果（2026-11-10 实测，rc=0，单载窗口，✅ 全门过）
+
+KV 池实测 526 块/rank（block_bytes 12,582,912 = 12 MiB，与 §0 口径修正一致）。5 波 junk 后 puts=174、**drops=0**（host 池 1024 slots 无压力）。
+
+| 指标 | pass1 冷 | pass2 复活 |
+|---|---:|---:|
+| TTFT p50（=max，4 条同步完成） | **22.41 s** | **1.16 s** |
+| wall（4 条 7.6k + 16 token greedy） | 26.5 s | 4.8 s |
+
+| 门 | 结果 |
+|---|---|
+| pass2 输出 vs pass1 **bitwise**（30B 复活正确性） | ✅ |
+| revives ≥ 100 | ✅ **116**（≈ 4×29 文档前缀块） |
+| 池账目一致（in_use == host_map） | ✅ |
+| **TTFT_revived / TTFT_cold**（记录性） | **0.0519（4/4 条一致）⇒ 复活 TTFT 是冷 prefill 的 ~1/19.3** |
+
+- swap 字节：puts=174 × 12 MiB ≈ **2.0 GiB/rank**（×2 rank）；junk 波次 5×4 条（自适应门 puts≥120 提前满足）；
+- **判读**：swap-in 的阻塞拷贝开销（~1.2 s 内含 116 块 × 2 rank ≈ 2.7 GiB 搬运 + 部分块 prefill）远小于 22.4 s 的冷重算——**对"被挤出后再次引用"的长文档，offload 把 22 s 级重 prefill 压回 1 s 级**，命中知识库/RAG 重复引用形态；且 1.16 s 已在 2 s 交互门内（单发口径，勿当 SLA）；
+- **负结果如实记录**：drops=0 说明本轮未测到池满降级路径（1024 slots 足够大）；junk 的 TTFT（21-25 s）印证 8k 批量 prefill 的离线定位（与 [day3](./P30-day3-longctx-slo.md) 一致）。
+
+**30B 窗口运维注记**：第一次启动因"杀 driver 未杀 spawn worker"（pgrep 模式缺 `^[s]pawn_main` 锚定）留下 rank1 残显存，第二次启动 rank1 撞残留 OOM——AGENTS.md 红线"杀进程须锚定三模式"的实例教训，清理后第三次启动正常。
