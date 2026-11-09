@@ -69,6 +69,29 @@
 - **G 多副本**：0.6B 启动/健康/停止脚本已完成，但 30B 单卡放不下，不能当 30B 扩展方案；
 - **H 量化/DP2/RR**：P29 已用实测否掉；不要为了填时间重做。
 
+## 4.5 下一候选调研：KV offload（GPU→CPU 分层缓存，11-09 夜间）
+
+**来源**：SGLang HiCache（[LMSYS blog 2025-09-10](https://www.lmsys.org/blog/2025-09-10-sglang-hicache)，官方口径平均 TTFT −56%）；SGLang 2026 Q2/Q4 路线图把 hierarchical cache 列为最高优先（[issue #22949](https://github.com/sgl-project/sglang/issues/22949)、[#42473](https://github.com/sgl-project/sglang/issues/42473)）。vLLM 侧 2026 动向主要是 spec-decode×structured-output 边界修复（[issue #65430](https://github.com/vllm-project/vllm/issues/65430)，本仓 spec 已 NO-GO，不适用）；vllm-musa 官方插件在持续更新（[GitHub](https://github.com/MooreThreads/vllm-musa)，2025-12，torchada 路线）——基线版本落后值得 owner 关注，但不构成本仓可动手的事。SGLang 上游 MUSA 支持仍是 open feature request（[issue #16565](https://github.com/sgl-project/sglang/issues/16565)），无新厂商能力。
+
+**为什么值得探**：HiCache 是调度器/块管理器特性，**不需要新 kernel**（本仓缺口最小的一类新特性）；本仓已有 LRU 淘汰（P16-B）和 MUSA 实测过的 KV 批量搬运通道（PD 线 M2，index_select/index_copy_）；PLAN backlog 的「swap 抢占/KV offload」**从未被判决**（不在 P29 已否清单）；8k 判决为离线/批处理能力后，容量扩展是它的自然下一步。DWDP（EP 预取对端专家权重）需要 EP 重写 + 对 P2P 带宽的高要求，2×PCIe S4000 上先验不成立，不探。
+
+**预注册探针门（先写门再跑，只读，informational）**：`scripts/p30_pcie_probe.py` 测 MUSA pinned 内存 D2H/H2D 带宽（6 MB ≈ 一个 TP2 30B KV 块，64 MB 批量档，≥5 次取中位数+CV）——
+- D2H ≥ 5 GB/s ⇒ 一个 KV 块 ~1.2 ms，可藏在 142 ms decode 步旁 ⇒ **立项候选**（继续设计 opt-in 原型与质量门）；
+- D2H < 2 GB/s ⇒ 交换成本淹没调度预算 ⇒ **NO-GO 照录**，不重开；
+- 中间带 ⇒ 记录数字，留给真实流量需求驱动再判。
+
+**探针结果（11-09 实测，rc=0，CV≤3.5%，原始 JSON `benchmarks/data/P30/pcie_probe.json`）**：
+
+| 档位 | D2H | H2D |
+|---|---:|---:|
+| 6 MB pinned | **29.68 GB/s** | 29.80 GB/s |
+| 64 MB pinned | 52.13 GB/s | 52.34 GB/s |
+| 6 MB unpinned | 4.52 GB/s | 4.91 GB/s |
+
+**判决：D2H ≥ 5 GB/s ⇒ 立项候选**。6 MB 块换入+换出 ≈ 0.4 ms ≈ 142 ms decode 步的 0.3%，带宽不构成障碍。附带口径：① pinned 是硬前提（未锁页 6.5× 慢）；② 小块 ~30 GB/s vs 批量 ~52 GB/s——批量恢复（突发后多块回迁）应聚合成大批；③ 本探针只证**带宽可行**，特性本身（opt-in swap-out/in + LRU 接线 + bitwise 门 + I36 族 launch 时复核）仍需独立轮次预注册实施，本轮不做。进 backlog 首位，与 SGLang HiCache 设计（两级 victim + touch-on-hit 已有同构基础）对照实现。
+
+**红线**：不引图路线（I29）；不动生产默认；探针一次 GPU 任务、跑完清场。
+
 ## 5. 如果只做一件事
 
 做 **B 部署硬化**。原因：A 的 8k prefill 14s 是否可接受还没定，而 B 是所有后续工作的前提；B 工作量小、风险低、能直接提升“可交付”。

@@ -52,7 +52,11 @@
 
 ### P30 测试网补强(11-09)
 
-G6 闭合(p6 `--strict` 进一键回归)、G1 部分闭合(p25fix `--tp 2` 模式,0.6B TP2 三门全过)、C6/C7 新增(`p25_overlap_prefill_boundary.py` 引擎级 cancel×overlap 双窗口门)。变异验证:去掉 collect 跳过 → IndexError 硬崩;去掉 launch 剪行 → oob FAIL rc=1;两防御均承重。详见 TEST-MATRIX 与 HANDOFF。
+G6 闭合(p6 `--strict` 进一键回归)、G1 部分闭合(p25fix `--tp 2` 模式,0.6B TP2 三门全过)、C6/C7 新增(`p25_overlap_prefill_boundary.py` 引擎级 cancel×overlap 双窗口门)。变异验证:去掉 collect 跳过 → IndexError 硬崩;去掉 launch 剪行 → oob FAIL rc=1;两防御均承重。**轮末回归 16/16 rc=0(2026-11-09 23:54,0.6B)**。详见 TEST-MATRIX 与 HANDOFF。
+
+### P30 新特性调研:KV offload 探针(11-09)
+
+SGLang HiCache 同思路(GPU→CPU 分层缓存)预注册探针:pinned 6MB D2H 29.68 GB/s(H2D 29.80;64MB 档 ~52;unpinned 6.5× 慢)⇒ **立项候选**,实施需独立轮次(opt-in swap + bitwise 门)。DWDP 先验不成立不探。详见 P30-OPPORTUNITIES §4.5。
 
 ### P30 夜间交接
 
