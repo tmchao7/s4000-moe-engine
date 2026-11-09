@@ -36,7 +36,7 @@ cd /opt/s4000-moe
 sudo bash scripts/install_s4000.sh --prefix /opt/s4000-moe
 ```
 
-安装脚本会：检查 MUSA/torch_musa；优先创建 `--system-site-packages` venv（复用厂商 torch，**绝不 pip 安装 torch**）；若系统没有 `python3-venv`，回退到隔离的 `--target` 安装并生成 `bin/s4000-server`（同样不安装 torch/numpy，transformers 使用系统版本）；安装 serve 依赖；写 `/etc/s4000-moe/serve.env`；以 root 运行时安装并 reload systemd unit。
+安装脚本会：检查 MUSA/torch_musa；优先创建 `--system-site-packages` venv（复用厂商 torch，**绝不 pip 安装 torch**）；若系统没有 `python3-venv`，回退到隔离的 `--target` 安装并生成 `bin/s4000-server`（同样不安装 torch/numpy；transformers/tokenizers 精确 pin 到宿主机版本，避免 target 目录 shadow 系统依赖）；安装 serve 依赖；写 `/etc/s4000-moe/serve.env`；以 root 运行时安装并 reload systemd unit。
 
 ### 2.2 源码仓库（开发）
 
@@ -159,6 +159,7 @@ mthreads-gmi | grep MiB        # 应回到双卡 0MiB
 | 端口占用 | 改 `NANOVLLM_PORT`，或先停旧服务 |
 | 请求 429 | KV 容量不足；缩短 prompt/max_tokens 或降低并发 |
 | 停止后显存不释放 | `systemctl stop` 后等 `TimeoutStopSec`；仍占用则查 `pgrep -fa` 对应 PID，按 PID 清理 |
+| `--target` 安装后 import 报 tokenizers/transformers 版本冲突 | 安装脚本已 pin 到宿主机版本；删除旧 prefix 重装，不要手工 `pip install -U transformers` 到 target |
 
 平台坑（MUSA 快照、MCCL、pgrep 等）见 [musa-pitfalls.md](musa-pitfalls.md)。
 
@@ -167,3 +168,5 @@ mthreads-gmi | grep MiB        # 应回到双卡 0MiB
 - 本仓库只支持 MUSA 后端；NVIDIA/CUDA 不在支持范围。
 - 发布包不包含模型权重、厂商 wheel、benchmark 证据。
 - 只验证单机 2 卡；多机/PD 分离/Python 3.13 不在产品支持面。
+- 当前开发实例没有 systemd（`systemctl` offline），unit 只做了 `systemd-analyze verify`；真实 systemd 主机上需自行验证 `systemctl start/stop/restart`。
+- 当前开发实例没有 `python3-venv`，installer 的 venv 分支未实跑；`--target` fallback 已实跑。

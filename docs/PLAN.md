@@ -38,6 +38,10 @@
 
 [P30-OPPORTUNITIES.md](P30-OPPORTUNITIES.md):先部署硬化,再 8k 长上下文产品化;量化/DP2/RR 不再重开。
 
+### P30-B Day1:部署/发布硬化(11-09)
+
+[day1 报告](../benchmarks/P30-day1-deploy-hardening.md):修复 target fallback 的 transformers/tokenizers 版本冲突;release 安装 + serve 脚本 + 30B 健康/chat/stream 实跑通过;systemd/venv 受环境限制未验证。
+
 ### P29 候选(评估,未执行)
 
 独立评估 + 外部引擎调研 + 9 天候选任务见 [ROADMAP-NEXT.md](ROADMAP-NEXT.md);Day1/2/3/4/5/6 实测见 [benchmarks/P29-day1.md](../benchmarks/P29-day1.md)、[benchmarks/P29-day2.md](../benchmarks/P29-day2.md)、[benchmarks/P29-day3.md](../benchmarks/P29-day3.md)、[benchmarks/P29-day4.md](../benchmarks/P29-day4.md)、[benchmarks/P29-day5.md](../benchmarks/P29-day5.md)、[benchmarks/P29-day6.md](../benchmarks/P29-day6.md);收口/面试口径见 [P29-FINAL.md](P29-FINAL.md);长上下文见 [benchmarks/P29-day8-longctx.md](../benchmarks/P29-day8-longctx.md);多副本运维见 [benchmarks/P29-day9-dp2-ops.md](../benchmarks/P29-day9-dp2-ops.md)。当前生产默认不变。

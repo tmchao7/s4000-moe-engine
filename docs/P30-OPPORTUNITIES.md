@@ -37,6 +37,8 @@
 
 验收：30B systemd 起停、0.6B tarball 起服务、健康/chat/stop、双卡 0 MiB。
 
+**Day1 进展**：已修复 target 安装的 transformers/tokenizers 版本冲突；release tarball + `--target` 安装 + `serve_s4000.sh` + 30B health/chat/stream 已实跑通过；systemd 实启与 venv 分支受当前实例限制，未验证（见 [day1 报告](../benchmarks/P30-day1-deploy-hardening.md)）。
+
 ### A. 8k 长上下文产品化（2–3 天，第二优先）
 
 为什么值得：Day8 已证明 30B 在 8k 不 OOM，decode 210.8ms；这是**真实差异化能力**，而且不需要新 kernel。

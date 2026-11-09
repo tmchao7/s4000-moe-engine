@@ -56,12 +56,17 @@ else
   TARGET="$PREFIX/lib"
   mkdir -p "$TARGET" "$PREFIX/bin"
   # --target does not see system packages, so install the project and the
-  # small serve deps with --no-deps and leave torch/transformers/numpy to the
-  # vendor/system stack (installing numpy here shadows the wheel torch_musa
-  # was built against).
+  # small serve deps with --no-deps and leave torch/numpy to the vendor/system
+  # stack (installing numpy here shadows the wheel torch_musa was built
+  # against).  Transformers/tokenizers are version-coupled: installing the
+  # latest transformers with --no-deps pulled tokenizers>=0.23 while the host
+  # had 0.22.x and broke import.  Pin both to the host versions instead.
+  HOST_TRANSFORMERS=$("$PYTHON" -c 'import transformers; print(transformers.__version__)')
+  HOST_TOKENIZERS=$("$PYTHON" -c 'import tokenizers; print(tokenizers.__version__)')
   "$PYTHON" -m pip install --no-deps --upgrade --target "$TARGET" "$ROOT"
   for pkg in "fastapi>=0.115" "uvicorn>=0.30" "prometheus-client>=0.21" \
-             "transformers>=4.51.0" "tqdm" "xxhash"; do
+             "transformers==${HOST_TRANSFORMERS}" "tokenizers==${HOST_TOKENIZERS}" \
+             "tqdm" "xxhash"; do
     "$PYTHON" -m pip install --no-deps --upgrade --target "$TARGET" "$pkg"
   done
   cat > "$PREFIX/bin/s4000-server" <<EOF
