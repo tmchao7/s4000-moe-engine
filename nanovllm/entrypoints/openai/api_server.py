@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 
+from nanovllm import __version__
 from nanovllm.async_engine import AsyncLLMEngine
 from nanovllm.incremental_detokenizer import IncrementalDetokenizer
 from nanovllm.sampling_params import SamplingParams
@@ -78,14 +79,27 @@ def _top_lp(tokenizer, cache: dict, token_id: int, logprob: float) -> dict:
     return {"token": text, "logprob": logprob, "bytes": list(text.encode("utf-8"))}
 
 
-def create_app(engine: AsyncLLMEngine, model_name: str):
+def create_app(engine: AsyncLLMEngine, model_name: str, api_key: str | None = None,
+               version: str | None = None):
     try:
         from fastapi import FastAPI, HTTPException, Request
         from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
     except ImportError as exc:
-        raise RuntimeError("install nano-vllm[serve] to run the API server") from exc
+        raise RuntimeError("install the serve dependencies: pip install -r requirements-serve.txt") from exc
 
-    app = FastAPI(title="moe-server-s4000")
+    app = FastAPI(title="s4000-moe-engine")
+
+    if api_key:
+        @app.middleware("http")
+        async def require_api_key(request: Request, call_next):
+            if request.url.path.startswith("/v1/") and \
+                    request.headers.get("authorization") != f"Bearer {api_key}":
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": {"message": "invalid API key",
+                                       "type": "invalid_request_error"}},
+                )
+            return await call_next(request)
 
     @app.on_event("shutdown")
     async def shutdown():
@@ -93,7 +107,10 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "model": model_name}
+        payload = {"status": "ok", "model": model_name}
+        if version:
+            payload["version"] = version
+        return payload
 
     @app.get("/v1/models")
     async def models():
@@ -327,7 +344,6 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
                 "completion_tokens": len(token_ids),
                 "total_tokens": len(prompt_ids) + len(token_ids),
             },
-            "metrics": metrics,
         })
 
     @app.post("/v1/completions")
@@ -515,59 +531,130 @@ def create_app(engine: AsyncLLMEngine, model_name: str):
                 "completion_tokens": len(token_ids),
                 "total_tokens": len(prompt_ids) + len(token_ids),
             },
-            "metrics": metrics,
         })
 
     return app
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--served-model-name")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--moe-backend", choices=("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused"), default="grouped_mm")
+def _env(name, default=None):
+    value = os.environ.get(name)
+    return default if value is None or value == "" else value
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer, got {value!r}") from exc
+
+
+def _env_float(name, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a number, got {value!r}") from exc
+
+
+def _is_loopback(host: str) -> bool:
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="s4000-moe-engine OpenAI-compatible server")
+    parser.add_argument(
+        "--model",
+        default=_env("NANOVLLM_MODEL"),
+        help="model directory (or set NANOVLLM_MODEL)",
+    )
+    parser.add_argument("--served-model-name",
+                        default=_env("NANOVLLM_SERVED_MODEL_NAME"))
+    parser.add_argument("--host", default=_env("NANOVLLM_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=_env_int("NANOVLLM_PORT", 8000))
+    parser.add_argument(
+        "--moe-backend",
+        choices=("loop", "grouped_mm", "fused_grouped_mm", "vllm_fused"),
+        default=_env("NANOVLLM_MOE_BACKEND", "grouped_mm"),
+    )
     parser.add_argument(
         "--decode-moe-backend",
         choices=("loop", "grouped_mm", "fused_grouped_mm", "bmm_dense", "vllm_fused"),
-        default=None,
-        help="decode-only MoE backend (e.g. bmm_dense); default = same as --moe-backend",
+        default=_env("NANOVLLM_DECODE_MOE_BACKEND", "bmm_dense"),
+        help="decode-only MoE backend; product default bmm_dense",
     )
-    parser.add_argument("--attention-backend", choices=("sdpa", "triton_paged"), default="triton_paged")
-    parser.add_argument("--expert-placement", choices=("linear", "round_robin", "profiled"), default="linear")
-    parser.add_argument("--expert-map-path")
-    parser.add_argument("--scheduler-policy", choices=("fcfs", "stall_free", "stall_free_lpm"), default="stall_free")
-    parser.add_argument("--prefill-chunk-size", type=int, default=256)
-    parser.add_argument("--metrics-path")
-    parser.add_argument("--max-queue-size", type=int, default=1024)
-    parser.add_argument("--max-model-len",
-        type=int,
-        default=4096,
-        help="context limit; also bounds warmup and the KV block table width",
-    )
-    parser.add_argument(
-        "--max-num-seqs",
-        type=int,
-        default=None,
-        help="override Config.max_num_seqs (default 512); bounds the decode "
-             "batch and, with --no-enforce-eager, the graph bucket set",
-    )
-    parser.add_argument(
-        "--enforce-eager",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="production default keeps decode eager; --no-enforce-eager enables "
-             "the segment-graph decode path (requires NANOVLLM_SEGMENT_GRAPH=1, I29)",
-    )
-    parser.add_argument(
-        "--scheduler-overlap",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="P23 one-batch-in-flight overlap pipeline (opt-in; bitwise-gated "
-             "vs serial, see benchmarks/P23-overlap.md)",
-    )
-    args = parser.parse_args()
+    parser.add_argument("--attention-backend",
+                        choices=("sdpa", "triton_paged"),
+                        default=_env("NANOVLLM_ATTENTION_BACKEND", "triton_paged"))
+    parser.add_argument("--expert-placement",
+                        choices=("linear", "round_robin", "profiled"),
+                        default=_env("NANOVLLM_EXPERT_PLACEMENT", "linear"))
+    parser.add_argument("--expert-map-path",
+                        default=_env("NANOVLLM_EXPERT_MAP_PATH"))
+    parser.add_argument("--scheduler-policy",
+                        choices=("fcfs", "stall_free", "stall_free_lpm"),
+                        default=_env("NANOVLLM_SCHEDULER_POLICY", "stall_free"))
+    parser.add_argument("--prefill-chunk-size", type=int,
+                        default=_env_int("NANOVLLM_PREFILL_CHUNK_SIZE", 256))
+    parser.add_argument("--metrics-path", default=_env("NANOVLLM_METRICS_PATH"))
+    parser.add_argument("--max-queue-size", type=int,
+                        default=_env_int("NANOVLLM_MAX_QUEUE_SIZE", 1024))
+    parser.add_argument("--max-model-len", type=int,
+                        default=_env_int("NANOVLLM_MAX_MODEL_LEN", 4096),
+                        help="context limit; also bounds warmup and the KV table width")
+    parser.add_argument("--max-num-seqs", type=int,
+                        default=_env_int("NANOVLLM_MAX_NUM_SEQS", None),
+                        help="override Config.max_num_seqs (default 512)")
+    parser.add_argument("--tensor-parallel-size", type=int,
+                        default=_env_int("NANOVLLM_TP_SIZE", 2))
+    parser.add_argument("--expert-parallel-size", type=int,
+                        default=_env_int("NANOVLLM_EP_SIZE", 0),
+                        help="0 = same as tensor-parallel-size")
+    parser.add_argument("--gpu-memory-utilization", type=float,
+                        default=_env_float("NANOVLLM_GPU_MEM_UTIL", 0.9))
+    parser.add_argument("--api-key", default=_env("NANOVLLM_API_KEY"),
+                        help="optional Bearer token; required for non-loopback host")
+    parser.add_argument("--allow-insecure", action="store_true",
+                        default=_env("NANOVLLM_ALLOW_INSECURE", "0") == "1",
+                        help="allow non-loopback bind without an API key")
+    parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction,
+                        default=_env("NANOVLLM_ENFORCE_EAGER", "1") != "0")
+    parser.add_argument("--scheduler-overlap", action=argparse.BooleanOptionalAction,
+                        default=_env("NANOVLLM_SCHEDULER_OVERLAP", "0") == "1",
+                        help="advanced one-batch-in-flight pipeline (opt-in)")
+    parser.add_argument("--log-level", default=_env("NANOVLLM_LOG_LEVEL", "info"),
+                        choices=("critical", "error", "warning", "info", "debug", "trace"))
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    return parser
+
+
+def validate_args(parser, args):
+    if not args.model:
+        parser.error("--model or NANOVLLM_MODEL is required")
+    if not os.path.isdir(args.model):
+        parser.error(f"model directory not found: {args.model}")
+    if args.tensor_parallel_size < 1:
+        parser.error("--tensor-parallel-size must be >= 1")
+    if args.expert_parallel_size not in (0, args.tensor_parallel_size):
+        parser.error("--expert-parallel-size must be 0 or equal to tensor-parallel-size")
+    if args.max_queue_size <= 0:
+        parser.error("--max-queue-size must be positive")
+    if args.api_key is not None:
+        args.api_key = args.api_key.strip() or None
+    if not _is_loopback(args.host) and not args.api_key and not args.allow_insecure:
+        parser.error("refusing non-loopback bind without --api-key; set "
+                     "NANOVLLM_API_KEY or pass --allow-insecure for a trusted network")
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    validate_args(parser, args)
 
     if os.environ.get("NANOVLLM_TRACE_INIT") == "1":
         # Startup is silent between weight load and KV allocation; a hung rank
@@ -578,10 +665,17 @@ def main():
 
     if args.max_num_seqs is not None:
         print(f"[init] max_num_seqs={args.max_num_seqs}", flush=True)
+    print(
+        f"[serve] model={args.model} tp={args.tensor_parallel_size} "
+        f"ep={args.expert_parallel_size} host={args.host} port={args.port} "
+        f"decode={args.decode_moe_backend}",
+        flush=True,
+    )
     engine = AsyncLLMEngine(
         args.model,
-        tensor_parallel_size=2,
-        expert_parallel_size=2,
+        tensor_parallel_size=args.tensor_parallel_size,
+        expert_parallel_size=args.expert_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         moe_backend=args.moe_backend,
         decode_moe_backend=args.decode_moe_backend,
         attention_backend=args.attention_backend,
@@ -597,7 +691,10 @@ def main():
         **({"max_num_seqs": args.max_num_seqs} if args.max_num_seqs is not None else {}),
     )
     model_name = args.served_model_name or args.model.rstrip("/").rsplit("/", 1)[-1]
-    uvicorn.run(create_app(engine, model_name), host=args.host, port=args.port)
+    uvicorn.run(
+        create_app(engine, model_name, api_key=args.api_key, version=__version__),
+        host=args.host, port=args.port, log_level=args.log_level,
+    )
 
 
 if __name__ == "__main__":

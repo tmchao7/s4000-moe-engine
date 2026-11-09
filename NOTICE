@@ -1,0 +1,12 @@
+s4000-moe-engine
+
+This product is based on nano-vllm:
+https://github.com/GeeeekExplorer/nano-vllm
+
+nano-vllm is Copyright (c) 2025 Xingkai Yu and is distributed under the
+MIT License (see LICENSE). The MUSA port, Qwen3-MoE model support,
+paged-attention kernels, scheduler, serving layer, deployment tooling and
+the rest of this repository are modifications/ additions by the
+s4000-moe-engine contributors.
+
+The upstream MIT license text is retained verbatim in LICENSE.

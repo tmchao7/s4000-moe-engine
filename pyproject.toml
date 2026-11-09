@@ -3,19 +3,21 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
-version = "0.2.0"
+name = "s4000-moe-engine"
+version = "0.1.0"
 authors = [{ name = "Xingkai Yu" }]
+maintainers = [{ name = "s4000-moe-engine contributors" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
+description = "Qwen3-30B-A3B MoE inference server for MTT S4000 (MUSA, TP2/EP2, OpenAI-compatible)"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
     "triton>=3.0.0",
     "transformers>=4.51.0",
     "xxhash",
+    "tqdm",
 ]
 
 [project.optional-dependencies]
@@ -30,14 +32,19 @@ test = [
     "pytest>=8",
     "xgrammar>=0.2.7",
     "jsonschema>=4",
+    "httpx>=0.27",
 ]
 plot = [
     "matplotlib>=3.8",
     "SciencePlots>=2.0",
 ]
 
+[project.scripts]
+s4000-server = "nanovllm.entrypoints.openai.serve:main"
+
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage = "https://github.com/tmchao7/s4000-moe-engine"
+Upstream = "https://github.com/GeeeekExplorer/nano-vllm"
 
 [tool.setuptools.packages.find]
 where = ["."]

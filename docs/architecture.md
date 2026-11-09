@@ -25,6 +25,7 @@ nanovllm/
 │   ├── model_runner.py        # musa 设备抽象、shm 多进程、prefill/decode 批构造
 │   └── sequence.py            # 序列状态 + 请求级 TTFT/TPOT 指标
 ├── entrypoints/openai/
+│   ├── serve.py               # 产品入口 s4000-server（CLI/env）
 │   └── api_server.py          # /health /v1/models /v1/chat/completions(SSE) /metrics
 ├── models/
 │   ├── qwen3.py               # 上游 dense 实现

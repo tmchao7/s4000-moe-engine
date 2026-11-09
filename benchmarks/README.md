@@ -1,5 +1,7 @@
 # Benchmarks
 
+> **开发/审计证据，不是产品部署材料。** 发布包不包含本目录；部署只需要 `docs/DEPLOY.md`。
+
 实验报告目录。**当前轮报告在根目录**(P9-*),**P0–P8 历史报告在 `archive/`**;原始 JSON/JSONL 证据在 `data/`(gitignore,本地保留,sha256 写在各轮 nightly 总表里)。冻结门的逐实验日志见 git 历史 `docs/NIGHTLY-LOG.md`。
 
 ## 当前轮(P9)

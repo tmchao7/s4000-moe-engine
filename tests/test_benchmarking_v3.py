@@ -25,13 +25,11 @@ def _load_module(name, relative_path):
 
 REPO = Path(__file__).resolve().parents[1]
 
-# Stub the nanovllm package so loading scripts/benchmark_online.py does not
-# execute the real package __init__ (which imports torch/tqdm via the engine).
-# The real pure-python benchmarking module is registered under its name.
-sys.modules.setdefault("nanovllm", types.ModuleType("nanovllm"))
+# Load the pure-python benchmarking module directly.  Do NOT leave a fake
+# nanovllm package in sys.modules: other test modules (product API contract)
+# import the real package in the same pytest process.
 benchmarking = _load_module("nanovllm.benchmarking", "nanovllm/benchmarking.py")
 sys.modules["nanovllm.benchmarking"] = benchmarking
-sys.modules["nanovllm"].benchmarking = benchmarking
 
 classify_error = benchmarking.classify_error
 conforming = benchmarking.conforming
@@ -42,7 +40,19 @@ wilson_ci = benchmarking.wilson_ci
 
 
 def _load_client_module():
-    return _load_module("benchmark_online_v3", "scripts/benchmark_online.py")
+    # benchmark_online.py imports nanovllm.benchmarking; expose a temporary
+    # fake parent package only for this load, then restore the real package.
+    saved = sys.modules.get("nanovllm")
+    fake = types.ModuleType("nanovllm")
+    fake.benchmarking = benchmarking
+    sys.modules["nanovllm"] = fake
+    try:
+        return _load_module("benchmark_online_v3", "scripts/benchmark_online.py")
+    finally:
+        if saved is None:
+            sys.modules.pop("nanovllm", None)
+        else:
+            sys.modules["nanovllm"] = saved
 
 
 def test_wilson_ci_full_success():

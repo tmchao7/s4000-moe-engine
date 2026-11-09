@@ -1,0 +1,9 @@
+# Runtime dependencies that are safe to install into a MUSA environment.
+# torch / torch_musa are intentionally NOT listed: the vendor stack must be
+# installed first, and pip must not replace it with a CUDA torch wheel.
+fastapi>=0.115
+uvicorn>=0.30
+prometheus-client>=0.21
+transformers>=4.51.0
+xxhash
+tqdm
