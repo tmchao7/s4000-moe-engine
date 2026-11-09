@@ -55,8 +55,17 @@ of this module, but found tokenizers==0.22.2.
 
 这两项已在报告中如实标为“未验证”，不写成已通过。
 
-## 6. 产物
+## 6. 最终 release 复验
+
+修复提交后重新构建 `dist/s4000-moe-engine-0.1.0.tar.gz`，解包安装到全新 prefix：
+
+- 安装 rc=0，`nanovllm 0.1.0 import OK (target)`；
+- target import：`transformers 5.13.0 / tokenizers 0.22.2 / nanovllm 0.1.0`；
+- `/tmp/p30-final/bin/s4000-server --version` → `s4000-server 0.1.0`；
+- 0.6B：`/health` ok，chat 200；停止后双卡 0 MiB。
+
+## 7. 产物
 
 - 修复：`scripts/install_s4000.sh`（target fallback 的 transformers/tokenizers pin）；
-- release：`dist/s4000-moe-engine-0.1.0.tar.gz`（最终版本在修复后重建，待复验）；
+- release：`dist/s4000-moe-engine-0.1.0.tar.gz`（修复后重建并复验）；
 - 本地 commit 见最终提交。
