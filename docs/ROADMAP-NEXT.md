@@ -204,7 +204,15 @@
 - 不再新增 GPU 实验：overlap 调度已在 P23 定为 opt-in 且无步时收益（b1 0.9972×/b16 0.9978×，bitwise 正确）；继续做低 ROI。
 - 最终结论/面试口径：[P29-FINAL.md](P29-FINAL.md)。
 - P29 探索收敛：量化/DP2/RR/PP/SP 均为负结果或有明确前提；生产保持 TP2+EP2 + bf16 反量化，不再为填满 9 天重做已否路径。
-### 3.12 算子/量化优先级
+
+### 3.12 Day8 实测（2026-11-09）
+
+详细报告：[benchmarks/P29-day8-longctx.md](../benchmarks/P29-day8-longctx.md)。
+
+- 30B 生产栈跑通 8k/16k：8k prefill 13.96s / decode 210.8ms；16k prefill 30.91s / decode 284.8ms；无 OOM。
+- 1k/4k/8k 加载 651 blocks（KV 7.63GiB/rank）；16k 加载 525 blocks（6.15GiB/rank）。
+- 不修改默认 `max_model_len=4096`；8k 可作 opt-in 候选，16k 仅离线/研究；真实长文质量门未做。
+### 3.13 算子/量化优先级
 
 1. **P29-Q1**：FP8 权重保留 + fused dequant（低质量风险，先拿显存/带宽收益）。
 2. **P29-Q2**：W8A16（MATE 或自定义 Triton；先一层/一个专家，再 e2e）。

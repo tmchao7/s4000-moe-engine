@@ -15,7 +15,7 @@
 | 平台适配 | MUSA 全栈移植 + Triton-mtgpu 内核(paged/fused-moE)+ I28/I31/I34 等平台坑**定界/绕过**(三项在 ISSUES 仍为未结,I28 见 §B;不写成"已闭环") |
 | 验收修复(P27) | 独立验收审计 → 修 I39(overlap stale prefill 行越界)/I40(冻结记账)、p24 终止性判定、pytest 干净 checkout、公开复现链 `--model`/extras;回归扩 16 套(新增 CPU 边界门),强门 16/16、pytest 28/28;code review 补 C4(re-prefill)/C5(兜底 sync schedule)/g5 verdict/p16pri 离散门/p22 e2e/rsync 同步;生产默认未变 |
 | 产品化收尾(P28) | `s4000-server` 入口 + env/systemd/install/smoke/release;API 默认标准 OpenAI 响应 + 可选 Bearer;README/DEPLOY/OPERATIONS 产品化;benchmarks 降级为开发证据且发布包排除;0.6B smoke/install fallback/38 pytest/16 套全过;生产默认未变 |
-| P29 探索收口(11-09) | TP2+EP2 生产不变;30B DP2/RR 放置/8-bit/FP8 保留均有实测负结果或不可用前提;0.6B DP2 架构原型 1.20× 仅作证据;最终口径见 [P29-FINAL.md](./P29-FINAL.md);全量回归 16/16 rc=0 |
+| P29 探索收口(11-09) | TP2+EP2 生产不变;30B DP2/RR 放置/8-bit/FP8 保留均有实测负结果或不可用前提;0.6B DP2 架构原型 1.20× 仅作证据;30B 8k/16k 长上下文探测无 OOM(8k decode 210.8ms/16k 284.8ms,默认仍 4096);最终口径见 [P29-FINAL.md](./P29-FINAL.md);全量回归 16/16 rc=0 |
 
 ## B. 无法解决 — 厂商问题(我们修不了,需要摩尔线程)
 
