@@ -182,7 +182,15 @@
 - 30B 固定 4 prompt 贪心 8 token：**linear PASS，round_robin FAIL**（第 4 条从首 token 分叉）；RR 虽然 imbalance 低，但不能过 token 门。
 - 性能（1×128/8×128/32×128）：linear 174.82/190.52/241.38 ms，RR 174.49/189.53/237.79 ms，差异在跨加载噪声内，**没有可用速度收益**。
 - 决定：**RR NO-GO**，生产保持 linear；如继续 placement，先做逐专家权重审计 + 首 token logits margin，区分数值敏感性与装载 bug。
-### 3.9 算子/量化优先级
+
+### 3.9 Day5 实测（2026-11-09）
+
+详细报告：[benchmarks/P29-day5.md](../benchmarks/P29-day5.md)。
+
+- 0.6B 架构原型（dense）：TP2 median **232.75 tok/s**，DP2 两个单卡副本 median **279.13 tok/s**，**1.20×**；CV 1.6%/2.7%，设备隔离可用。
+- 30B 纸面：FP8/W8 完整模型 29GiB 单卡可放，DP2 聚合 KV 约 348k tokens（当前 TP2 约 265k）；但 loader 仍加载期反量化 bf16，30B DP2 需要先实现 FP8 保留。
+- 0.6B 的 1.20× 不能直接外推到 30B；DP2 暂不设默认。
+### 3.10 算子/量化优先级
 
 1. **P29-Q1**：FP8 权重保留 + fused dequant（低质量风险，先拿显存/带宽收益）。
 2. **P29-Q2**：W8A16（MATE 或自定义 Triton；先一层/一个专家，再 e2e）。
