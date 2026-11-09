@@ -39,6 +39,8 @@
 
 **Day1 进展**：已修复 target 安装的 transformers/tokenizers 版本冲突；release tarball + `--target` 安装 + `serve_s4000.sh` + 30B health/chat/stream 已实跑通过；systemd 实启与 venv 分支受当前实例限制，未验证（见 [day1 报告](../benchmarks/P30-day1-deploy-hardening.md)）。
 
+**Day2 进展**：8k 合成 needle-QA **9/9 PASS**（7615 tokens，3 code × 3 depth，整批 42.2s）；API 超长输入返回 400；8k 并发/SLO 探针已写但被交接中止，**没有 SLO 数字**（见 [day2 报告](../benchmarks/P30-day2-longctx-quality.md)）。下一任先重跑 SLO。
+
 ### A. 8k 长上下文产品化（2–3 天，第二优先）
 
 为什么值得：Day8 已证明 30B 在 8k 不 OOM，decode 210.8ms；这是**真实差异化能力**，而且不需要新 kernel。

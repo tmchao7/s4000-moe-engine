@@ -42,6 +42,14 @@
 
 [day1 报告](../benchmarks/P30-day1-deploy-hardening.md):修复 target fallback 的 transformers/tokenizers 版本冲突;release 安装 + serve 脚本 + 30B 健康/chat/stream 实跑通过;systemd/venv 受环境限制未验证。
 
+### P30-A Day2:8k 质量门(11-09)
+
+[day2 报告](../benchmarks/P30-day2-longctx-quality.md):合成 needle-QA 9/9;API 超长 400;8k 并发/SLO 探针被交接主动中止,无结果。
+
+### P30 夜间交接
+
+[NEXT-AGENT-PROMPT.md](NEXT-AGENT-PROMPT.md):给新 Agent 的可粘贴提示词。
+
 ### P29 候选(评估,未执行)
 
 独立评估 + 外部引擎调研 + 9 天候选任务见 [ROADMAP-NEXT.md](ROADMAP-NEXT.md);Day1/2/3/4/5/6 实测见 [benchmarks/P29-day1.md](../benchmarks/P29-day1.md)、[benchmarks/P29-day2.md](../benchmarks/P29-day2.md)、[benchmarks/P29-day3.md](../benchmarks/P29-day3.md)、[benchmarks/P29-day4.md](../benchmarks/P29-day4.md)、[benchmarks/P29-day5.md](../benchmarks/P29-day5.md)、[benchmarks/P29-day6.md](../benchmarks/P29-day6.md);收口/面试口径见 [P29-FINAL.md](P29-FINAL.md);长上下文见 [benchmarks/P29-day8-longctx.md](../benchmarks/P29-day8-longctx.md);多副本运维见 [benchmarks/P29-day9-dp2-ops.md](../benchmarks/P29-day9-dp2-ops.md)。当前生产默认不变。
