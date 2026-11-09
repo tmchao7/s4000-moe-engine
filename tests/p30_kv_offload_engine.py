@@ -51,6 +51,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="/root/autodl-tmp/models/Qwen3-0.6B")
     parser.add_argument("--out", default="/root/p30_data/kv_offload_engine.json")
+    parser.add_argument("--tp", type=int, default=1,
+                        help="tensor parallel size; 2 exercises the rank-"
+                             "symmetric offload command stream (slot streams "
+                             "must stay identical across ranks)")
     args = parser.parse_args()
 
     import random
@@ -58,7 +62,7 @@ def main():
     llm = LLM(
         args.model,
         enforce_eager=True,
-        tensor_parallel_size=1,
+        tensor_parallel_size=args.tp,
         attention_backend="triton_paged",
         max_model_len=2048,
         num_kvcache_blocks=14,      # tight: the junk load must evict
