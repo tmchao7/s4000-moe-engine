@@ -40,7 +40,7 @@ run pytest  env PYTHONPATH=. python3 -m pytest tests/test_benchmarking_v3.py tes
 run boundary env PYTHONPATH=. python3 tests/p25_overlap_prefill_boundary.py   # CPU: stale prefill row / frozen q / I37
 run p8      env PYTHONPATH=. python3 tests/p8_scheduler_gaps.py
 run p2      env PYTHONPATH=. python3 tests/p2_grouped_mm.py
-run p6      env PYTHONPATH=. python3 tests/p6_bmm_dense_tiny.py
+run p6      env PYTHONPATH=. python3 tests/p6_bmm_dense_tiny.py --strict
 run p23     env PYTHONPATH=. python3 tests/p23_overlap.py $MODEL_FLAG --out "$OUT_DIR/p23.json"
 run p25fix  env PYTHONPATH=. python3 tests/p25_overlap_fix.py $MODEL_FLAG --out "$OUT_DIR/p25_overlap_fix.json"
 

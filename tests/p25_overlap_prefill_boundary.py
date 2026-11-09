@@ -28,6 +28,15 @@ C5  A prefill completes in the in-flight collect while the seq is stranded in
     not emit it as a q=1 prefill row: batch mode must match the frozen row
     flags, and every row's block_table must cover its query range.
 
+C6  A cancel landing while the seq sits in the PARKED speculative batch
+    (_sched_next) must have its row PRUNED at launch (it was dropped, never
+    launched with a stale/deallocated block_table).
+
+C7  A cancel landing while the seq sits in the IN-FLIGHT batch (_pending)
+    must be SKIPPED at collect: the cancel already deallocated its blocks;
+    appending the collected token would re-grow a torn-down seq (it would
+    then linger in running forever — queues would never drain).
+
 Runs on the cheapest Python >= 3.10 (same re-exec trick as
 tests/p25_review_repro.py).  No torch / GPU / model needed.
 
@@ -376,16 +385,104 @@ def scenario_c3():
     return all_ok
 
 
+def scenario_c6_c7():
+    """C6/C7: cancel landing inside the overlap pipeline (both windows).
+
+    The async API cancels via scheduler.cancel() between engine steps, so the
+    cancelled seq can sit (a) in the IN-FLIGHT batch (_pending): postprocess
+    must SKIP it — the cancel already deallocated its blocks and cleared its
+    block_table, appending the collected token would re-grow a torn-down seq;
+    or (b) in the PARKED speculative batch (_sched_next): the row must be
+    PRUNED at launch (I39-style drop), never launched with a stale table.
+
+    No engine-level test exercised either window before P30 (the postprocess
+    skip and prune counters existed only by code inspection).
+
+    Validity gates: the cancel must demonstrably hit both defenses
+    (overlap_pruned_rows counts dropped parked rows; completion counters of
+    cancelled seqs must stay frozen at their cancel-time value), plus the
+    shared launch invariants and a clean block ledger at drain.
+    """
+    print("[C6/C7] cancel x overlap: in-flight skip (C7) + parked-row prune (C6)")
+    engine = make_engine(blocks=64, chunk=BS)
+    prompts = [list(range(3000 + i * 1000, 3000 + i * 1000 + 768))
+               for i in range(4)]
+    seqs = [Sequence(p, SamplingParams(max_tokens=8, temperature=0))
+            for p in prompts]
+    for seq in seqs:
+        engine.scheduler.add(seq)
+
+    cancelled = {}
+    steps = 0
+    parked_only = None
+    while not engine.is_finished() and steps < 100:
+        if steps == 1:
+            # After step 1 the first prefill chunk of every seq is IN FLIGHT
+            # (_pending) and the second chunk is PARKED (_sched_next).
+            pending_sids = [s.seq_id for s in engine._pending.sequences]
+            assert seqs[0].seq_id in pending_sids, (
+                f"test setup: seq0 not in flight: {pending_sids}")
+            before = seqs[0].num_completion_tokens
+            assert engine.scheduler.cancel(seqs[0].seq_id), "cancel seq0 missed"
+            cancelled[seqs[0].seq_id] = before          # C7 window
+        if steps == 2:
+            # A seq added between steps only ever exists in the parked batch
+            # until its first launch — the pure C6 window.
+            late = Sequence(list(range(9000, 9000 + 768)),
+                            SamplingParams(max_tokens=8, temperature=0))
+            engine.scheduler.add(late)
+        if steps == 3:
+            parked = [] if engine._sched_next is None else \
+                [s.seq_id for s in engine._sched_next.sequences]
+            assert parked_only is None
+            if late.seq_id in parked:
+                parked_only = late
+                assert engine.scheduler.cancel(late.seq_id), "cancel late missed"
+                cancelled[late.seq_id] = late.num_completion_tokens
+        engine.step()
+        steps += 1
+    assert parked_only is not None, (
+        "test setup: never caught the late seq parked (timing changed)")
+
+    launched_sids = {row[0] for _mode, rows in engine.model_runner.launches
+                     for row in rows}
+    bad = launch_invariant(engine)
+    frozen_ok = all(s.num_completion_tokens == cancelled[s.seq_id]
+                    for s in (seqs[0], parked_only))
+    ledger_clean = len(engine.scheduler.block_manager.used_block_ids) == 0
+    queues_empty = (not engine.scheduler.waiting
+                    and not engine.scheduler.running)
+    finished_ok = (seqs[0].is_finished and seqs[0].finish_reason == "cancelled"
+                   and parked_only.is_finished
+                   and parked_only.finish_reason == "cancelled"
+                   and all(s.is_finished and s.finish_reason == "length"
+                           for s in seqs[1:]))
+    ok = (not bad
+          and engine.overlap_pruned_rows >= 1
+          and parked_only.seq_id not in launched_sids
+          and frozen_ok and ledger_clean and queues_empty and finished_ok)
+    print("  steps=%d launches=%d pruned_rows=%d bad=%d ledger_clean=%s "
+          "queues_empty=%s frozen_ok=%s" %
+          (steps, len(engine.model_runner.launches),
+           engine.overlap_pruned_rows, len(bad), ledger_clean,
+           queues_empty, frozen_ok))
+    for item in bad[:5]:
+        print("  BAD:", item)
+    print("  -> PASS" if ok else "  -> FAIL")
+    return ok
+
+
 def main():
     c1 = scenario_c1()
     c2 = scenario_c2()
     c3 = scenario_c3()
     c4 = scenario_c4()
     c5 = scenario_c5()
+    c67 = scenario_c6_c7()
     print()
-    print("VERDICT:", "PASS" if (c1 and c2 and c3 and c4 and c5) else "FAIL",
-          "(C1=%s, C2=%s, C3=%s, C4=%s, C5=%s)" % (c1, c2, c3, c4, c5))
-    return 0 if (c1 and c2 and c3 and c4 and c5) else 1
+    print("VERDICT:", "PASS" if (c1 and c2 and c3 and c4 and c5 and c67) else "FAIL",
+          "(C1=%s, C2=%s, C3=%s, C4=%s, C5=%s, C6/C7=%s)" % (c1, c2, c3, c4, c5, c67))
+    return 0 if (c1 and c2 and c3 and c4 and c5 and c67) else 1
 
 
 if __name__ == "__main__":

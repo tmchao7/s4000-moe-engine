@@ -50,6 +50,10 @@
 
 [day3 报告](../benchmarks/P30-day3-longctx-slo.md):重跑 `scripts/p30_longctx_slo.py`(18×7600 随机 token,生产栈,opt-in 8k 配置)——TTFT p50/p95/max = 63.52/63.52/78.31 s,聚合 prefill ~2.1k tok/s(单流 ~3.9×),18 条全部完成无抢占。**判决:8k = 离线/批处理能力,非交互能力**(TTFT 超 2s 交互门 32×;单流 prefill ~14s 亦不可交互)。生产默认 `max_model_len=4096` 不变;8k 用法/时延口径写入 OPERATIONS §6。
 
+### P30 测试网补强(11-09)
+
+G6 闭合(p6 `--strict` 进一键回归)、G1 部分闭合(p25fix `--tp 2` 模式,0.6B TP2 三门全过)、C6/C7 新增(`p25_overlap_prefill_boundary.py` 引擎级 cancel×overlap 双窗口门)。变异验证:去掉 collect 跳过 → IndexError 硬崩;去掉 launch 剪行 → oob FAIL rc=1;两防御均承重。详见 TEST-MATRIX 与 HANDOFF。
+
 ### P30 夜间交接
 
 [NEXT-AGENT-PROMPT.md](NEXT-AGENT-PROMPT.md):给新 Agent 的可粘贴提示词。

@@ -27,6 +27,7 @@ Stages run in SEPARATE PROCESSES (same rationale as tests/p23_overlap.py):
   stage b  t3 KV-pressure load under overlap: completion + counters
 
 Run:  PYTHONPATH=. python3 tests/p25_overlap_fix.py       # parent (all stages)
+      PYTHONPATH=. python3 tests/p25_overlap_fix.py --tp 2  # TP2 window (G1)
 """
 import argparse
 import json
@@ -68,7 +69,7 @@ def run_with_flip(llm, prompts, sp, flips):
 def stage_a(args):
     from nanovllm import LLM, SamplingParams
     verdict, ok = {}, True
-    llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=1,
+    llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=args.tp,
               attention_backend="triton_paged", max_model_len=1024,
               max_num_seqs=16, gpu_memory_utilization=0.35,
               scheduler_policy="stall_free", scheduler_overlap=True)
@@ -115,7 +116,7 @@ def stage_b(args):
     # F1 end-to-end: the P23-t4 preemption load under overlap.  The old
     # per-seq pre-check could let sequential may_append_at allocation run the
     # free list off its end (IndexError); the cumulative gate defers instead.
-    llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=1,
+    llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=args.tp,
               attention_backend="triton_paged", max_model_len=1024,
               max_num_seqs=16, gpu_memory_utilization=0.5,
               num_kvcache_blocks=12, scheduler_policy="stall_free",
@@ -155,6 +156,10 @@ def main():
     parser.add_argument("--model", default="/root/autodl-tmp/models/Qwen3-0.6B")
     parser.add_argument("--out", default="/root/p25_data/overlap_fix.json")
     parser.add_argument("--stage", choices=list(STAGES) + ["all"], default="all")
+    parser.add_argument("--tp", type=int, default=1,
+                        help="tensor parallel size (2 exercises dual-rank "
+                             "runtime-flip paths: shm command channel + "
+                             "set_scheduler_overlap sync; TEST-MATRIX G1)")
     args = parser.parse_args()
 
     if args.stage != "all":
@@ -166,7 +171,7 @@ def main():
     for name, fn in STAGES.items():
         proc = subprocess.run(
             [sys.executable, os.path.abspath(__file__), "--stage", name,
-             "--model", args.model],
+             "--model", args.model, "--tp", str(args.tp)],
             env=env, capture_output=True, text=True, timeout=1800)
         print(proc.stdout, end="", flush=True)
         if proc.returncode != 0:

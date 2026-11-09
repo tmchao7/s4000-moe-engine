@@ -8,7 +8,7 @@
 | 规则(出处:AGENTS/HANDOFF SOP) | 对应测试 | 状态 |
 |---|---|---|
 | TP1/TP2 × 后端组合逐 token 全等(正确性底座) | `tests/p2_grouped_mm.py`(loop/grouped/fused × TP1/TP2 + round_robin + 重复确定性) | ✅ |
-| decode 后端(bmm_dense)六配置全等 | `tests/p6_bmm_dense_tiny.py`(默认 report-only:全等结果只打印、不设 rc 门;`--strict` 开启硬断言,见缺口 G6) | ✅(--strict 硬门;默认跑为报告性) |
+| decode 后端(bmm_dense)六配置全等 | `tests/p6_bmm_dense_tiny.py --strict`(硬断言;P30 起已接入 run_regression.sh 的 p6 行,G6 闭合) | ✅(--strict 硬门进一键回归) |
 | 调度契约:空批不崩/HOL 跳过保序/混合步契约/空 FCFS | `tests/p8_scheduler_gaps.py` 6/6 | ✅ |
 | 压测客户端口径(双 SLO/Wilson CI/分桶) | `tests/test_benchmarking_v3.py`(28) | ✅ |
 | 产品契约(CLI/env 优先级、认证、标准响应) | `tests/test_serve_config.py` + `tests/test_api_contract.py`(CPU;需 httpx) | ✅(P28 产品化新增) |
@@ -16,7 +16,7 @@
 | **块分配时序变化的实验必须带 bitwise 门**(I36 教训) | `tests/p23_overlap.py` t1/t2(稳态 bitwise)+ `tests/p25_overlap_fix.py` t1/t2(**中途翻转 bitwise,跨 256 块边界**) | ✅(I37/I38 后补齐) |
 | 投机预检查必须是执行的总和(I37) | `tests/p25_review_repro.py`(纯 CPU 门)+ p25fix t3(KV 压力 defer,引擎级门含 defers>0) | ✅ |
 | 运行时开关的排空式收尾,禁止"排了再丢"(I38) | `tests/p25_overlap_fix.py` t1(单次中途 disable)+ t2(翻转窗 ABA) | ✅ |
-| overlap stale prefill 行 / 冻结记账 + I37 累计门 + 抢占 re-prefill + 兜底调度(C1–C5) | `tests/p25_overlap_prefill_boundary.py`(纯 CPU:块边界 prompt 512/768/1024 不得 launch 已完成的 1-token prefill 行;200-token 中途到达按冻结 q 记账;fcfs/stall_free 累计门 defer;preempt 后 re-prefill 跨 prompt 长度不得被误丢;defer 后兜底 sync schedule 的 mode 必须与 frozen flags 一致且每行 block_table 覆盖) | ✅(P27 验收修复轮新增;C4/C5 为 review 回归门) |
+| overlap stale prefill 行 / 冻结记账 + I37 累计门 + 抢占 re-prefill + 兜底调度(C1–C5)+ **cancel×overlap 双窗口(C6/C7)** | `tests/p25_overlap_prefill_boundary.py`(纯 CPU:块边界 prompt 512/768/1024 不得 launch 已完成的 1-token prefill 行;200-token 中途到达按冻结 q 记账;fcfs/stall_free 累计门 defer;preempt 后 re-prefill 跨 prompt 长度不得被误丢;defer 后兜底 sync schedule 的 mode 必须与 frozen flags 一致且每行 block_table 覆盖;C6=取消落在投机批→launch 剪行、C7=取消落在在飞批→collect 跳过+账目清零) | ✅(P27 验收修复轮新增 C1–C5;C6/C7 为 P30 补的引擎级 cancel 覆盖——此前 cancel 只有 API stub,引擎窗口零测试) |
 | 抢占正确性(重算式,计数一致,全完成) | p23 t4 + p25fix t3 | ✅ |
 | 前缀缓存淘汰只动 ref==0 且活动序列 bitwise 不变 | `tests/p16_lru_evict.py` | ✅ |
 | 统一混合批结构门 | `tests/p16_mixed_unified.py` | ✅ |
@@ -30,12 +30,12 @@
 
 | # | 缺口 | 影响 | 补位条件 |
 |---|---|---|---|
-| G1 | **TP2 的运行时翻转回归缺**:p23/p25 全套在 TP1 跑;TP2 overlap 的 bitwise 证据在 30B 单载窗口(P23 ⑧)与 PD 线,但不在常跑回归里 | TP2 专属路径(shm 命令通道/双 rank 同步翻转)回归靠人肉 30B 窗口 | 下次 30B/TP2 窗口把 p25fix 加 `--tp 2` 模式 |
+| G1 | **TP2 的运行时翻转回归缺**:p23/p25 全套在 TP1 跑;TP2 overlap 的 bitwise 证据在 30B 单载窗口(P23 ⑧)与 PD 线,但不在常跑回归里 | TP2 专属路径(shm 命令通道/双 rank 同步翻转)回归靠人肉 30B 窗口 | **部分闭合(P30)**:`tests/p25_overlap_fix.py` 已支持 `--tp 2`,0.6B TP2 实跑三门全过(t1/t2 bitwise + t3 defers=3,与 TP1 判决数字一致,见 P30 轮记录);仍不在常跑回归(每轮翻倍 TP2 窗口成本)——TP2 相关改动合入前人工跑一次 `p25_overlap_fix.py --tp 2` |
 | G2 | `NANOVLLM_OVERLAP_NO_SPEC` 门控无专测 | 仅 E5 诊断开关,默认关 | 无需;若转正为正式模式再测 |
 | G3 | 无 soak/fuzz(长时随机负载) | 长尾状态(如数小时内存碎片)不可见 | 仅在有真实流量/长期部署时立项 |
 | G4 | 第三方负载交叉验证缺(ShareGPT 类标准 trace) | 见 README「口径与可信度边界」 | 收尾后按需 |
 | G5 | 测试序列长度:除 p25fix t2 外多数套件序列 < 256 token | 块边界族缺陷(p23 I36/I37/I38 全是)对新代码的检出依赖 p25fix 一处 | 新调度/状态机代码一律对照 p25fix t2 的翻转窗写法 |
-| G6 | bmm_dense 六配置全等的 `--strict` 硬门未接入一键回归(run_regression.sh 的 p6 行为默认 report-only) | 一键回归对 decode 后端 token 漂移不告警(全等结果只打印) | 下次 tiny/0.6B 服务器窗口实测 `--strict` 稳定后,给 run_regression.sh 的 p6 行加 `--strict` |
+| ~~G6~~ | ✅ **已闭合(P30)**:bmm_dense 六配置全等的 `--strict` 硬门已接入一键回归(run_regression.sh p6 行;本窗口实测 `--strict` rc=0 六配置全等) | 一键回归现在对 decode 后端 token 漂移告警 | — |
 
 ## 3. 轮末清单(每轮回填文档后跑)
 
