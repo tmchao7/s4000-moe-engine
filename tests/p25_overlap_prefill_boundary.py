@@ -472,6 +472,73 @@ def scenario_c6_c7():
     return ok
 
 
+def scenario_c8_lpm():
+    """C8: stall_free_lpm admission ordering (the policy had ZERO test
+    coverage — selectable via Config.scheduler_policy yet never exercised
+    by any suite, in the most defect-dense part of the engine).
+
+    Four-order assertion against _waiting_candidate():
+      1. lpm picks the MOST-CACHEABLE seq over the FIFO-first one (removing
+         the lpm branch would make this pick FIFO order -> FAIL);
+      2. the starvation guard outranks cacheability (a starved 0-cache seq
+         beats a cacheable one);
+      3. priority outranks everything (a priority-5 seq with the biggest
+         cache is picked last, behind priority-0 seqs);
+      4. within a tier the non-starved remainder falls back to lpm/FIFO.
+    Pure CPU, direct Scheduler drive (C3 style): donor seqs hold cached
+    prefix blocks so waiting seqs' can_allocate probes hit real hashes.
+    """
+    print("[C8] stall_free_lpm ordering: cacheable-first / starvation / priority")
+    cfg = SimpleNamespace(
+        max_num_seqs=8, max_num_batched_tokens=16384, eos=10,
+        kvcache_block_size=BS, scheduler_policy="stall_free_lpm",
+        prefill_chunk_size=256, scheduler_starvation_steps=32,
+        num_kvcache_blocks=32,
+    )
+    scheduler = Scheduler(cfg)
+    bm = scheduler.block_manager
+
+    def add(seq):
+        scheduler.add(seq)
+        return seq
+
+    # Donors hold cached prefixes so waiting seqs' probes hit real hashes.
+    donor_big = Sequence(list(range(2000, 2768)),
+                         SamplingParams(max_tokens=4))
+    donor_mid = Sequence(list(range(5000, 5256)),
+                         SamplingParams(max_tokens=4))
+    for donor in (donor_big, donor_mid):
+        bm.allocate(donor, 0)
+        bm.hash_blocks(donor, len(donor))
+        scheduler.running.append(donor)
+
+    tail_big = list(range(7000, 7064))
+    tail_mid = list(range(7100, 7164))
+    tail_none = list(range(9000, 9064))
+    s_none = add(Sequence(list(range(9000, 9768)) + tail_none,
+                          SamplingParams(max_tokens=4)))          # pri 0, 0 cached
+    s_mid = add(Sequence(list(range(5000, 5256)) + tail_mid,
+                         SamplingParams(max_tokens=4)))           # pri 0, 1 cached
+    s_big = add(Sequence(list(range(2000, 2768)) + tail_big,
+                         SamplingParams(max_tokens=4)))           # pri 0, 3 cached
+    s_lowpri = add(Sequence(list(range(2000, 2768)) + list(range(7500, 7564)),
+                            SamplingParams(max_tokens=4, priority=5)))  # pri 5, 3 cached
+    s_none.wait_steps = 99                   # starved: 0-cache but guard outranks lpm
+
+    # Expected: none first (starvation guard beats cacheability AND FIFO),
+    # then big over FIFO-earlier mid (lpm branch load-bearing: without it
+    # the within-tier pick would be FIFO -> mid before big -> FAIL),
+    # then mid, and finally lowpri whose priority-5 tier is excluded until
+    # every priority-0 seq is gone (priority dominates both lpm and cache).
+    order = [scheduler._waiting_candidate().seq_id for _ in range(4)]
+    expected = [s_none.seq_id, s_big.seq_id, s_mid.seq_id, s_lowpri.seq_id]
+    ok = order == expected
+    print("  pick order:", order, "expected:", expected)
+    assert not scheduler.waiting
+    print("  -> PASS" if ok else "  -> FAIL")
+    return ok
+
+
 def main():
     c1 = scenario_c1()
     c2 = scenario_c2()
@@ -479,10 +546,12 @@ def main():
     c4 = scenario_c4()
     c5 = scenario_c5()
     c67 = scenario_c6_c7()
+    c8 = scenario_c8_lpm()
     print()
-    print("VERDICT:", "PASS" if (c1 and c2 and c3 and c4 and c5 and c67) else "FAIL",
-          "(C1=%s, C2=%s, C3=%s, C4=%s, C5=%s, C6/C7=%s)" % (c1, c2, c3, c4, c5, c67))
-    return 0 if (c1 and c2 and c3 and c4 and c5 and c67) else 1
+    print("VERDICT:", "PASS" if (c1 and c2 and c3 and c4 and c5 and c67 and c8) else "FAIL",
+          "(C1=%s, C2=%s, C3=%s, C4=%s, C5=%s, C6/C7=%s, C8=%s)" % (
+              c1, c2, c3, c4, c5, c67, c8))
+    return 0 if (c1 and c2 and c3 and c4 and c5 and c67 and c8) else 1
 
 
 if __name__ == "__main__":
