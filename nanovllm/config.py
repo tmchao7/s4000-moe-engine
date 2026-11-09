@@ -45,6 +45,12 @@ class Config:
     # P23: one-batch-in-flight overlap pipeline (speculative scheduling hidden
     # under the GPU forward).  Opt-in; the serial step loop stays the default.
     scheduler_overlap: bool = False
+    # P30-R1: opt-in KV offload — LRU-evicted prefix blocks are swapped to a
+    # pinned host pool and copied back on prefix revival (SGLang-HiCache-style
+    # capacity extension).  Init-time only: no runtime switch (I36/I38 — the
+    # flip surface is the most defect-dense area in this engine's history).
+    kv_offload_enabled: bool = False
+    kv_offload_host_blocks: int = 256
     metrics_path: str | None = None
     enable_profiling: bool = False
 
@@ -66,6 +72,11 @@ class Config:
         )
         assert self.attention_backend in ("sdpa", "triton_paged")
         assert self.kv_cache_dtype in ("bf16", "int8")
+        if self.kv_offload_enabled:
+            assert self.kv_cache_dtype == "bf16", (
+                "KV offload requires the bf16 KV cache (int8 is "
+                "opt-in-experimental and carries side-channel scales)")
+            assert self.kv_offload_host_blocks >= 0
         assert self.expert_placement in ("linear", "round_robin", "profiled")
         assert self.scheduler_policy in ("fcfs", "stall_free", "stall_free_lpm")
         assert self.prefill_chunk_size > 0

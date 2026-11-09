@@ -25,6 +25,7 @@
 | 采样面(掩码/penalty/logprobs 与参考逐位) | `tests/p22_sampler_face.py` + `tests/p22_bugfix_regress.py`(b1/b2/b3 回归);runner 带 `--e2e`(引擎级 stop/logprobs 功能门;t5 baseline 缺失时 SKIP) | ✅ |
 | 结构化输出(位掩码/合法率/终止) | `tests/p24_guided.py` | ✅ |
 | A/B 噪声协议:墙钟对比不设硬 rc 门(AGENTS「A/B 噪声协议」同源) | p23 stage c t5(b1/b16 decode 步时 A/B,交错 x3、中位数,CV 随 verdict 记录);p24 g5(x5)、p22sam e2e、p16pri anchor/TTFT 同规则 | ⚠️ 信息性记录(P26/P27 修正:墙钟比不做 rc 门;p23 t5 x3 低于协议 ≥5,数字按 INVALID 级噪声读,判决基线=benchmarks/P23-overlap.md 的 b1 0.9972/b16 0.9978) |
+| KV offload 复活正确性(opt-in `kv_offload_enabled`,P30-R1)+ **raw-id 词表边界**(离线 add_request 越界 id 曾致 MUSA 无栈楔死) | `tests/p30_kv_offload_engine.py`(0.6B:同引擎三臂——junk 挤出前缀 puts>0 → 复活 gets>0 → **输出与参考 bitwise 相等**;R2 消歧历史效应;池账目闭环;OOB 正/负 id 均 ValueError)+ `tests/p30_kv_offload_unit.py`(池五门含 MUSA 12MiB 块 bitwise 往返) | ✅(P30-R1;默认关,不进一键回归——需要时人工跑) |
 
 ## 2. 已知覆盖缺口(如实标注,合入相关代码时人工补位)
 

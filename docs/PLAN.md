@@ -56,7 +56,11 @@ G6 闭合(p6 `--strict` 进一键回归)、G1 部分闭合(p25fix `--tp 2` 模�
 
 ### P30 新特性调研:KV offload 探针(11-09)
 
-SGLang HiCache 同思路(GPU→CPU 分层缓存)预注册探针:pinned 6MB D2H 29.68 GB/s(H2D 29.80;64MB 档 ~52;unpinned 6.5× 慢)⇒ **立项候选**,实施需独立轮次(opt-in swap + bitwise 门)。DWDP 先验不成立不探。详见 P30-OPPORTUNITIES §4.5。
+SGLang HiCache 同思路(GPU→CPU 分层缓存)预注册探针:pinned 6MB D2H 29.68 GB/s(H2D 29.80;64MB 档 ~52;unpinned 6.5× 慢)⇒ **立项候选**(口径修正:TP2 30B KV 块=12 MiB,换入换出 ~0.85 ms ≈ decode 步 0.6%)。DWDP 先验不成立不探。详见 P30-OPPORTUNITIES §4.5。
+
+### P30-R1 KV offload 立项轮(11-09/10)
+
+Round A 基础件(HostBlockPool 五门)+ Round B 引擎接线(opt-in `--kv-offload`,init-only)+ 引擎级门全过(**复活 bitwise** puts=9/revives=3/逐位相等 + 账目闭环 + 词表门)。**附带修复:离线 add_request 词表边界校验**(越界 id 曾致 MUSA 无栈楔死,判别矩阵定位)。报告 benchmarks/P30-kv-offload.md;默认关。
 
 ### P30 夜间交接
 

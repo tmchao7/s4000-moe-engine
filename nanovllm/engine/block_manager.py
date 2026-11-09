@@ -55,6 +55,23 @@ class BlockManager:
         self.allocations = 0
         self.reclaims = 0
         self.evictions = 0
+        # P30-R1 opt-in KV offload: evicted cached blocks are swapped to a
+        # pinned host pool instead of being dropped, and copied back when a
+        # prefix is revived.  Metadata (hash -> (slot, token_ids)) lives here;
+        # the byte moves run per-rank through the executor's call() channel
+        # (BlockManager is driver-only, the KV halves are not).  None = the
+        # feature is off and every path below is byte-for-byte the legacy one.
+        self._offload_exec = None
+        self._host_map: dict[int, tuple[int, list[int]]] = {}
+        self.host_puts = 0
+        self.host_revives = 0
+        self.host_drops = 0
+
+    def set_offload_executor(self, runner):
+        """Driver-side wiring (LLMEngine init): the executor's call(method,
+        *args) broadcasts to every rank AND runs it locally, so pool slot
+        streams stay identical across ranks.  Pass None to disarm."""
+        self._offload_exec = runner
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -100,10 +117,34 @@ class BlockManager:
         self._lru.pop(block_id, None)
         self._fresh_set.discard(block_id)
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
+            # P30-R1: evict-to-host instead of dropping.  The data copy must
+            # happen HERE — after pop, before reset overwrites the block.  A
+            # full pool degrades to the legacy drop (host_drops), never an
+            # error: offload must not create new failure paths.
+            if self._offload_exec is not None:
+                slot = self._offload_exec.call("offload_put", block_id)
+                if slot != -1:
+                    self._host_map[block.hash] = (slot, list(block.token_ids))
+                    self.host_puts += 1
+                else:
+                    self.host_drops += 1
             del self.hash_to_block_id[block.hash]
         block.reset()
         self.used_block_ids.add(block_id)
         self.allocations += 1
+        return block_id
+
+    def _revive_from_host(self, hash_key: int) -> int:
+        """Copy a host-swapped block back into a fresh device block and
+        restore its cache identity (hash + token_ids), so later prefix
+        blocks chain-hash and future allocations find it device-side."""
+        slot, token_ids = self._host_map.pop(hash_key)
+        block_id = self._allocate_block()
+        self._offload_exec.call("offload_get", slot, block_id)
+        self._offload_exec.call("offload_release", slot)
+        self.blocks[block_id].update(hash_key, token_ids)
+        self.hash_to_block_id[hash_key] = block_id
+        self.host_revives += 1
         return block_id
 
     def _deallocate_block(self, block_id: int):
@@ -126,20 +167,29 @@ class BlockManager:
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                break
-            num_cached_blocks += 1
-            # Touch on hit: a queued request's prefix is about to be hot —
-            # move it to MRU so interleaved allocations don't sacrifice it.
-            # NOTE: the LPM ranking probe (scheduler._waiting_candidate) runs
-            # with the touch=True default, so probing a queued candidate DOES
-            # move its prefix hits to MRU — the touch=False variant has no
-            # caller today (P26 audit); wire it into the probe or drop the
-            # knob when scheduler policy work reopens.
-            if touch and self.lru_enabled and block_id in self._lru:
-                self._lru.move_to_end(block_id)
-            if block_id in self.used_block_ids:
-                num_new_blocks -= 1
+            if block_id != -1 and self.blocks[block_id].token_ids == token_ids:
+                num_cached_blocks += 1
+                # Touch on hit: a queued request's prefix is about to be hot —
+                # move it to MRU so interleaved allocations don't sacrifice it.
+                # NOTE: the LPM ranking probe (scheduler._waiting_candidate) runs
+                # with the touch=True default, so probing a queued candidate DOES
+                # move its prefix hits to MRU — the touch=False variant has no
+                # caller today (P26 audit); wire it into the probe or drop the
+                # knob when scheduler policy work reopens.
+                if touch and self.lru_enabled and block_id in self._lru:
+                    self._lru.move_to_end(block_id)
+                if block_id in self.used_block_ids:
+                    num_new_blocks -= 1
+                continue
+            # P30-R1: device miss — the prefix block may be host-swapped.
+            # It still counts as cached (no recompute) but needs a fresh
+            # device block on allocate, so num_new_blocks is NOT decremented.
+            if self._offload_exec is not None:
+                entry = self._host_map.get(h)
+                if entry is not None and entry[1] == token_ids:
+                    num_cached_blocks += 1
+                    continue
+            break
         if len(self.free_block_ids) < num_new_blocks:
             return -1
         return num_cached_blocks
@@ -152,6 +202,12 @@ class BlockManager:
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
+            if h not in self.hash_to_block_id:
+                # P30-R1: host-swapped prefix — can_allocate verified it.
+                # _revive_from_host allocates a FRESH device block (ref 1 via
+                # reset) and restores hash + token_ids on it.
+                seq.block_table.append(self._revive_from_host(h))
+                continue
             block_id = self.hash_to_block_id[h]
             block = self.blocks[block_id]
             if block_id in self.used_block_ids:
@@ -240,10 +296,19 @@ class BlockManager:
             "kv_lru_size": len(self._lru),
             "kv_lru_evictions_total": self.evictions,
             "kv_lru_enabled": 1 if self.lru_enabled else 0,
+            # P30-R1: KV offload counters (all zero when the feature is off)
+            "kv_offload_host_entries": len(self._host_map),
+            "kv_offload_puts_total": self.host_puts,
+            "kv_offload_revives_total": self.host_revives,
+            "kv_offload_drops_total": self.host_drops,
         }
 
     def clear_prefix_cache(self):
         """Drop reusable hashes without touching blocks owned by live requests."""
+        if self._offload_exec is not None:
+            for _h, (slot, _tok) in self._host_map.items():
+                self._offload_exec.call("offload_release", slot)
+        self._host_map.clear()
         self.hash_to_block_id.clear()
         for block in self.blocks:
             block.hash = -1

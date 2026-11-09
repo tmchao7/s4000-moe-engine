@@ -40,8 +40,11 @@ class HostBlockPool:
         self.pin = pin
         self._buf = None
         if self.num_slots:
+            # Explicit CPU: the engine creates the pool under a MUSA default
+            # device (allocate_kv_cache), and pin_memory requires a dense CPU
+            # tensor regardless of the ambient default device.
             self._buf = torch.empty((self.num_slots, *self.block_shape),
-                                    dtype=dtype, pin_memory=pin)
+                                    dtype=dtype, device="cpu", pin_memory=pin)
         # LIFO free list: reusing the most recently released slot keeps the
         # working set hot in cache and makes slot choice deterministic.
         self._free = list(range(self.num_slots - 1, -1, -1))
@@ -79,6 +82,15 @@ class HostBlockPool:
                 f"pool expects {self.block_shape}")
         out.copy_(self._buf[slot])
         self.gets += 1
+
+    def view(self, slot: int) -> torch.Tensor:
+        """Borrow the pinned slot tensor (engine path: caller moves it with
+        .to(device) — the PD kv_channel M2-proven H2D pattern — instead of a
+        copy_ into a device view)."""
+        if slot not in self._in_use:
+            raise KeyError(f"slot {slot} is not in use")
+        self.gets += 1
+        return self._buf[slot]
 
     def release(self, slot: int):
         if slot not in self._in_use:

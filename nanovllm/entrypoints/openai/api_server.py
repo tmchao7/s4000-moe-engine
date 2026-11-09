@@ -628,6 +628,15 @@ def build_parser():
     parser.add_argument("--scheduler-overlap", action=argparse.BooleanOptionalAction,
                         default=_env("NANOVLLM_SCHEDULER_OVERLAP", "0") == "1",
                         help="advanced one-batch-in-flight pipeline (opt-in)")
+    parser.add_argument("--kv-offload", action=argparse.BooleanOptionalAction,
+                        default=_env("NANOVLLM_KV_OFFLOAD", "0") == "1",
+                        help="swap LRU-evicted KV blocks to pinned host memory "
+                             "and copy back on prefix revival (opt-in; bf16 "
+                             "KV cache only)")
+    parser.add_argument("--kv-offload-host-blocks", type=int,
+                        default=_env_int("NANOVLLM_KV_OFFLOAD_HOST_BLOCKS", 256),
+                        help="host pool capacity in KV blocks (0 disables the "
+                             "pool; offload then degrades to plain eviction)")
     parser.add_argument("--log-level", default=_env("NANOVLLM_LOG_LEVEL", "info"),
                         choices=("critical", "error", "warning", "info", "debug", "trace"))
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -689,6 +698,8 @@ def main(argv=None):
         max_model_len=args.max_model_len,
         enforce_eager=args.enforce_eager,
         scheduler_overlap=args.scheduler_overlap,
+        kv_offload_enabled=args.kv_offload,
+        kv_offload_host_blocks=args.kv_offload_host_blocks,
         **({"max_num_seqs": args.max_num_seqs} if args.max_num_seqs is not None else {}),
     )
     model_name = args.served_model_name or args.model.rstrip("/").rsplit("/", 1)[-1]

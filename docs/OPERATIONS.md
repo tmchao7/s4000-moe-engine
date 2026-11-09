@@ -85,6 +85,7 @@ mthreads-gmi | grep MiB
 - `tools`/`tool_choice`、多模态、embeddings 未实现；请求会 400。
 - `priority`、`guided_json`、`stop_token_ids` 是可选扩展，不是 OpenAI 标准。
 - 结构化输出在温度采样下可能合法地写满 `max_tokens`（JSON 空白），这是模型/预算行为，不是服务错误。
+- KV offload（`NANOVLLM_KV_OFFLOAD=1` + `NANOVLLM_KV_OFFLOAD_HOST_BLOCKS`）是 opt-in 实验特性：LRU 逐出的 KV 块换入 pinned 主机内存、前缀复活时换回，扩展有效容量；仅支持 bf16 KV cache，拷贝为阻塞式（逐出 ~1-2 ms/块），正确性门见 [P30-kv-offload.md](../benchmarks/P30-kv-offload.md)，容量/性能数字未在 30B 上测量，不要当 SLA 引用。
 
 ## 10. 多副本（0.6B 验证）
 

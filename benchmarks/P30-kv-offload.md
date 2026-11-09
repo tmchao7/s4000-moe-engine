@@ -2,7 +2,7 @@
 
 > 特性：LRU 逐出的 KV 块换入 pinned 主机内存，前缀复活时换回——SGLang HiCache 同思路的容量扩展。
 > 定位：**opt-in**（`kv_offload_enabled`，默认关），不改生产默认；本报告随轮次滚动追加。
-> 依据链：[P30-OPPORTUNITIES §4.5](./P30-OPPORTUNITIES.md)（调研+预注册探针门）→ 本文。
+> 依据链：[P30-OPPORTUNITIES §4.5](../docs/P30-OPPORTUNITIES.md)（调研+预注册探针门）→ 本文。
 
 ## 0. 为什么立项（判决依据）
 
@@ -45,6 +45,22 @@
 
 **风险预注册**：host 复活占用的"新设备块"分配可能再逐出别的 host 块（一层递归）——put 失败即降级丢 hash，不递归入池；`get` 前 out 视图必须 `.contiguous()` 语义由 `kv_cache[:,:,bid]` 切片天然满足（I28 教训复核点）。
 
-## 3. 结果滚动区
+## 3. Round B（2026-11-10 凌晨）：引擎接线 + 引擎级门 ✅（含一个意外的重要发现）
 
-（Round B 实施后回填：门结果、数字、判决）
+**接线**（最小 diff，默认路径零变更）：config `kv_offload_enabled=False`/`kv_offload_host_blocks=256`（init 时 only，无运行时开关）；BlockManager 持 hash→(slot, token_ids) 元数据 + evict-to-host 钩子（`_allocate_block` 逐出处，池满降级丢 hash）+ `_revive_from_host`（复活=新设备块+H2D+hash 链修复）；字节搬运经 `runner.call` 三命令（`offload_put/get/release`）广播双 rank（各 rank 搬各自 KV 半边，slot 流对称）；CLI `--kv-offload`/`--kv-offload-host-blocks`（env `NANOVLLM_KV_OFFLOAD*`）。
+
+**意外发现（本轮最有价值的产出）**：引擎门测试首跑楔死——调参三连（strided copy_ / contiguous+copy_ / PD 同款 index_select+pinned）全楔，offload-OFF 对照**同样楔死** → 与本特性无关。逐层排除后定位：**测试负载的 junk prompt 用了越界 token id（≥0.6B 词表 151,936）→ embedding 越界读 → MUSA 提交路径楔死（0% GPU、无栈、I36 signature）**；改为合法范围后同负载顺利跑完（steps=8、evict=12）。教训两条：① 判别实验矩阵（off/off 对照）必须最先跑，"卡死≠厂商、卡死≠新代码"再次应验，这次连"卡死≠被测特性"都成立；② **离线 `add_request` 原本不校验词表边界**——已修：raw-id prompt 驱动侧校验 `[0, vocab_size)`，越界 raise ValueError（API 路径自动 400），离线路径从"无栈楔死"变清晰报错。复核：修后引擎门内两断言（正/负 id）全过。
+
+**引擎级门结果（`tests/p30_kv_offload_engine.py`，0.6B TP1，rc=0）**：
+
+| 门 | 判据 | 结果 |
+|---|---|---|
+| t1（硬，bitwise） | 臂 X：junk 挤出 P 前缀（puts=9）→ P 重跑复活（**revives=3**）→ 输出与臂 R **逐位相等** | ✅ |
+| t1 消歧 | 臂 R2（无 junk 重跑）== 臂 R（历史效应排除） | ✅ |
+| t2（硬，账目） | pool in_use == len(host_map)；clear_prefix_cache 后双方归零 | ✅ |
+| t3（记录性） | 重跑前缀命中 tokens 增长（复活即缓存命中） | ✅ |
+| 词表门（硬） | OOB 正/负 id add_request 均 ValueError | ✅ |
+
+**判决**：KV offload 机制在 0.6B 上**正确性门全过**（bitwise 复活 + 账目闭环 + 词表加固）。默认关；30B 窗口的容量/性能测量（t3 容量收益的正式数字）留待有真实需求时补测——本特性至此达到"opt-in 可用、有回归门"状态。
+
+**边界**：阻塞拷贝 v1（逐出 ~1-2 ms/块）；异步双缓冲未做（预注册后续轮）；int8 KV 不支持（config assert）；TP2 双 rank 对称性由 slot 流确定性保证（同一命令序列），未单独实测 TP2 门（p25fix `--tp 2` 的先例模式，需要时人工跑）。

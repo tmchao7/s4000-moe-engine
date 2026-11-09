@@ -262,6 +262,43 @@ class ModelRunner:
         from nanovllm.kernels import paged_attention
         paged_attention.set_paged_config(value)
 
+    # P30-R1 KV offload byte-movers: BlockManager (driver) decides WHICH
+    # block and slot; these run on EVERY rank through call() so each rank's
+    # local KV half is swapped symmetrically.  I28 (kv_channel doc): a
+    # cross-block strided view copied D2H through pinned staging is BROKEN
+    # on this MUSA stack — gather with index_select (contiguous output)
+    # first, then ONE pinned copy; the write side goes back through
+    # .to(device) + index_copy_.  Found live in this round: a plain strided
+    # .contiguous()+copy_ D2H wedged the submission path (0% GPU, next
+    # forward's launch never returned).
+
+    def _ensure_offloader(self):
+        from nanovllm.engine.kv_offload import HostBlockPool
+        if self.kv_offloader is None:
+            self.kv_offloader = HostBlockPool(
+                self.kv_offload_host_blocks,
+                tuple(self.kv_cache[:, :, 0].shape),
+                dtype=self.kv_cache.dtype,
+            )
+
+    def offload_put(self, block_id: int) -> int:
+        self._ensure_offloader()
+        torch.musa.synchronize()   # I28: snapshot only after prior async work
+        idx = torch.tensor([block_id], device=self.kv_cache.device,
+                           dtype=torch.long)
+        gathered = self.kv_cache.index_select(2, idx).squeeze(2)
+        return self.kv_offloader.put(gathered)
+
+    def offload_get(self, slot: int, block_id: int) -> None:
+        self._ensure_offloader()
+        dev = self.kv_offloader.view(slot).to(self.kv_cache.device)
+        idx = torch.tensor([block_id], device=self.kv_cache.device,
+                           dtype=torch.long)
+        self.kv_cache.index_copy_(2, idx, dev.unsqueeze(2))
+
+    def offload_release(self, slot: int) -> None:
+        self.kv_offloader.release(slot)
+
     def set_moe_backend(self, backend: str, decode_backend: str | None = None):
         """Set the MoE backend; ``decode_backend`` defaults to the same one."""
         assert backend in (
@@ -434,6 +471,15 @@ class ModelRunner:
             self.kv_out_idx2d = None
             self.kv_head_n_out = None
         self.kv_cache_is_int8 = kv_int8
+        # P30-R1 opt-in KV offload: one pinned host pool per rank, sized for
+        # this rank's KV half.  Created LAZILY on the first offload_put —
+        # allocate_kv_cache runs under a MUSA default device, and the pinned
+        # pool must be born in a CPU context (PD kv_channel precedent).  Slot
+        # streams stay identical across ranks because every put/get/release
+        # rides the call() command channel in the same order.
+        self.kv_offloader = None
+        self.kv_offload_enabled = bool(config.kv_offload_enabled)
+        self.kv_offload_host_blocks = config.kv_offload_host_blocks
         self.scratch_block_id = config.num_kvcache_blocks
         self.scratch_slot = config.num_kvcache_blocks * self.block_size
         layer_id = 0

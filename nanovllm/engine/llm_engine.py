@@ -59,6 +59,12 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        # P30-R1: KV offload is wired driver-side only — the BlockManager
+        # holds the hash->slot metadata; the byte moves broadcast to every
+        # rank through the runner's call() channel (each rank swaps its own
+        # KV half).  Init-time config only, no runtime switch.
+        if config.kv_offload_enabled:
+            self.scheduler.block_manager.set_offload_executor(self.model_runner)
         self.last_token_events = []
         self.schedule_mode_counts = Counter()
         self.step_count = 0
@@ -188,6 +194,20 @@ class LLMEngine:
                 f"request needs {total} tokens but KV capacity is "
                 f"{kv_token_capacity} tokens"
             )
+        if isinstance(prompt, list) and prompt:
+            # P30-R1: an out-of-vocab token id turns the embedding gather into
+            # an OOB device read, which on MUSA wedges the submission path with
+            # no traceback (found live in this round: raw-id junk prompts with
+            # ids >= vocab_size froze the GPU at 0% util inside the next
+            # forward).  String prompts are tokenizer-bounded; raw-id prompts
+            # are the offline path's responsibility, so gate them here — the
+            # API maps ValueError to 400.
+            vocab = config.hf_config.vocab_size
+            if max(prompt) >= vocab or min(prompt) < 0:
+                bad = max(prompt) if max(prompt) >= vocab else min(prompt)
+                raise ValueError(
+                    f"prompt token id {bad} outside vocab range [0, {vocab})"
+                )
         seq = Sequence(prompt, sampling_params)
         if seq.guided_json is not None or seq.guided_regex is not None:
             self._attach_grammar(seq)
