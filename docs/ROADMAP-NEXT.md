@@ -198,7 +198,13 @@
 - FP8 保留的 naive 路径：本地专家层 dequant 15.38 ms/层 × 48 层 = **738 ms/forward**，当前 decode step 约 142 ms，**不可行**。
 - fused dequant 也不通：Triton FP8 relocation 编译失败（Day2）、MATE 不可用（Day3）、`_scaled_mm` 不支持（Day1）。
 - **30B DP=2 在当前 MUSA 栈上 NO-GO**；量化线收口，生产保持 TP2+EP2 + bf16 反量化。
-### 3.11 算子/量化优先级
+
+### 3.11 Day7 收口（2026-11-09）
+
+- 不再新增 GPU 实验：overlap 调度已在 P23 定为 opt-in 且无步时收益（b1 0.9972×/b16 0.9978×，bitwise 正确）；继续做低 ROI。
+- 最终结论/面试口径：[P29-FINAL.md](P29-FINAL.md)。
+- P29 探索收敛：量化/DP2/RR/PP/SP 均为负结果或有明确前提；生产保持 TP2+EP2 + bf16 反量化，不再为填满 9 天重做已否路径。
+### 3.12 算子/量化优先级
 
 1. **P29-Q1**：FP8 权重保留 + fused dequant（低质量风险，先拿显存/带宽收益）。
 2. **P29-Q2**：W8A16（MATE 或自定义 Triton；先一层/一个专家，再 e2e）。
