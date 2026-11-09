@@ -69,6 +69,10 @@
 
 `tests/p30_kv_offload_engine.py --tp 2`（0.6B TP2，rc=0）：junk_puts=9、revives=3、**x/r2 复活输出均与参考 bitwise 相等**、池账目闭环——双 rank 各自搬运 KV 半边、slot 流经同一命令序列保持一致的设计拿到实测证据。报告 §3 的"未单独实测 TP2 门"边界自此闭合。
 
+### 3.2 池满降级门（2026-11-10 补测，✅）
+
+30B 收益轮 drops=0（host 池 1024 slots 没被打满），预注册降级语义"**池满降级为现状逐出，不新增失败路径、无正确性变化**"此前只是代码推断——补 `poolfull` stage（host_blocks=4 故意挤爆）：junk 三波后 puts=4（P 的 3 个 LRU 最冷前缀块先进池）+ **drops=5/full_count=5**，P 重跑 **revives=3 且输出与参考 bitwise 相等**（被 drop 的块走普通逐出、重算确定性），slot 有界、账目闭环、clear 归零。测试改造为 parent+两 stage 子进程（p25fix 同款，规避同进程多引擎 churn）。至此 §4.1 的"负结果:drops=0 未测到降级"边界也闭合。
+
 ## 4. 30B 收益测量（预注册，先写门再跑；单载 A/B，一次 GPU 任务）
 
 **口径**（`scripts/p30_offload_30b.py`，生产栈 + `kv_offload_enabled=True`、host_blocks=1024=12 GiB pinned，max_model_len 8192，util 0.85）：
