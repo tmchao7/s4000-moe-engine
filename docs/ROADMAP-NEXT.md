@@ -190,7 +190,15 @@
 - 0.6B 架构原型（dense）：TP2 median **232.75 tok/s**，DP2 两个单卡副本 median **279.13 tok/s**，**1.20×**；CV 1.6%/2.7%，设备隔离可用。
 - 30B 纸面：FP8/W8 完整模型 29GiB 单卡可放，DP2 聚合 KV 约 348k tokens（当前 TP2 约 265k）；但 loader 仍加载期反量化 bf16，30B DP2 需要先实现 FP8 保留。
 - 0.6B 的 1.20× 不能直接外推到 30B；DP2 暂不设默认。
-### 3.10 算子/量化优先级
+
+### 3.10 Day6 实测（2026-11-09）
+
+详细报告：[benchmarks/P29-day6.md](../benchmarks/P29-day6.md)。
+
+- FP8 保留的 naive 路径：本地专家层 dequant 15.38 ms/层 × 48 层 = **738 ms/forward**，当前 decode step 约 142 ms，**不可行**。
+- fused dequant 也不通：Triton FP8 relocation 编译失败（Day2）、MATE 不可用（Day3）、`_scaled_mm` 不支持（Day1）。
+- **30B DP=2 在当前 MUSA 栈上 NO-GO**；量化线收口，生产保持 TP2+EP2 + bf16 反量化。
+### 3.11 算子/量化优先级
 
 1. **P29-Q1**：FP8 权重保留 + fused dequant（低质量风险，先拿显存/带宽收益）。
 2. **P29-Q2**：W8A16（MATE 或自定义 Triton；先一层/一个专家，再 e2e）。
