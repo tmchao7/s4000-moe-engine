@@ -13,6 +13,7 @@
 | **stall_free_lpm 准入排序**(可选策略,P30 前零覆盖):lpm 压 FIFO / 饥饿守卫压 cacheability / priority 压一切 / 移除 lpm 分支即失败(变异验证);**探针 touch=False 不动 LRU + 真实准入 touch-on-hit 正对照**(P26 审计遗留项闭合:touch=False 有了调用者) | `tests/p25_overlap_prefill_boundary.py` scenario C8(纯 CPU,直接驱动 Scheduler 四序断言 + LRU 中性/正对照) | ✅(P30 补;随 boundary 进一键回归) |
 | KV offload 引擎门(opt-in `kv_offload_enabled`):复活 bitwise + 池满降级 + 词表边界(I41) | `tests/p30_kv_offload_engine.py`(parent + revival/poolfull 两 stage 子进程) | ✅(P30-R1;**已进一键回归 p30kvo 行**,套件数见脚本) |
 | **KV offload host_map 槽位互斥**(P30 review 修复):池满丢块打断设备哈希链 → 重算块时旧 host 副本必须释放;否则下次驱逐 put 覆盖 map 条目,旧槽位永久孤儿(`in_use > host_map`,clear 也清不掉) | `tests/p30_kv_offload_hostmap.py`(纯 CPU:真 BlockManager + 假 executor 槽位记账;逐步断言 `len(in_use)==len(host_map)`;**变异验证**:去掉 hash_blocks 的释放 → "A recompute"/"re-evict"/"clear" 三处 FAIL) | ✅(P30 review;**已进一键回归 p30host 行**) |
+| **KV offload 满池/禁用路径无死工作**(I43):`put` 判满前不得做设备 sync/gather;早退后 `full_count` 仍计数 | `tests/p30_kv_offload_unit.py` t6(full/disabled/recovery)+ `tests/p30_kv_offload_engine.py` poolfull(drops=5/full_count=5/bitwise,随 p30kvo 进一键回归) | ✅(P30 follow-up;消融实测 2.5ms/掉块 → 0.003ms) |
 | 压测客户端口径(双 SLO/Wilson CI/分桶) | `tests/test_benchmarking_v3.py`(28) | ✅ |
 | 产品契约(CLI/env 优先级、认证、标准响应) | `tests/test_serve_config.py` + `tests/test_api_contract.py`(CPU;需 httpx) | ✅(P28 产品化新增) |
 | 冻结门阈值边界(门文件被误改/阈值漂移即 fail) | `tests/p5_decide.py`(纯 CPU;P26 补入回归) | ✅ |

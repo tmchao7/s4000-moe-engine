@@ -10,6 +10,9 @@ Pre-registered gates:
       printed): a realistic TP2 30B block shape [2, 48, 256, 2, 128] bf16
       (12 MiB) roundtrips through the pool BITWISE from and to a MUSA
       device, with the swap timing recorded.
+  t6  no-room fast path: a full or disabled pool reports has_room()==False
+      so the engine can skip the device sync + gather on the drop path;
+      note_full() keeps full_count truthful; releasing restores room.
 
 Run:  PYTHONPATH=. python3 tests/p30_kv_offload_unit.py        # rc 0 = pass
 """
@@ -105,6 +108,27 @@ def t5_musa_block_roundtrip():
     return ok
 
 
+def t6_no_room_fast_path():
+    """Full/disabled pool must expose no_room so the engine can skip the
+    device sync + gather on the drop path (measured ~2.5 ms of dead work per
+    dropped put before the fix; benchmark section 6.2).  note_full keeps the
+    full_count metric truthful for the engine-level poolfull gate."""
+    pool = HostBlockPool(1, BLOCK_SHAPE, dtype=torch.bfloat16, pin=False)
+    has_room_empty = pool.has_room()
+    slot = pool.put(torch.randn(*BLOCK_SHAPE, dtype=torch.bfloat16), "a")
+    full = not pool.has_room()
+    rc = pool.note_full()
+    counted = pool.metrics()["kv_offload_full_total"] == 1
+    disabled = HostBlockPool(0, BLOCK_SHAPE, dtype=torch.bfloat16, pin=False)
+    disabled_ok = (not disabled.has_room() and disabled.note_full() == -1)
+    pool.release(slot)
+    recovered = pool.has_room()
+    ok = (has_room_empty and slot != -1 and full and rc == -1 and counted
+          and disabled_ok and recovered)
+    print(f"[t6] no-room fast path (full + disabled + recovery): {ok}")
+    return ok
+
+
 def main():
     results = {
         "t1": t1_roundtrip_bitwise(),
@@ -112,6 +136,7 @@ def main():
         "t3": t3_full_pool_degrades(),
         "t4": t4_shape_mismatch_raises(),
         "t5": t5_musa_block_roundtrip(),
+        "t6": t6_no_room_fast_path(),
     }
     print("VERDICT:", "PASS" if all(results.values()) else "FAIL", results)
     return 0 if all(results.values()) else 1

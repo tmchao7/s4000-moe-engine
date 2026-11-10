@@ -123,3 +123,55 @@ KV 池实测 526 块/rank（block_bytes 12,582,912 = 12 MiB，与 §0 口径修�
 3. `clear_prefix_cache` 复用同一 helper。
 
 **门**：`tests/p30_kv_offload_hostmap.py`（纯 CPU，进一键回归 `p30host` 行）逐步断言 `len(pool.in_use) == len(bm._host_map)` 且在 drop / 复活 / 重算 / 再驱逐 / clear 五个节点给出精确期望值。**变异验证**：只回退第 1 条 → "A recompute"（host_map=1 应为 0）、"re-evict"（in_use=2 vs 1）、"clear"（in_use=1 应为 0）三处 FAIL；修复后全 PASS。offload 关闭时 `_host_map` 恒空，helper 无调用，行为零变化。
+
+## 6. offload × overlap 共开代价实测（预注册，2026-11-10；门先写、结果后填）
+
+**问题**：`offload_put` 先做全设备 `torch.musa.synchronize()` 再快照。串行步循环里调度发生在 GPU 空闲时，sync 几乎免费；P23 overlap 的尾部投机调度跑在刚发射的 forward 之下，此时每个 `offload_put` 都要等整个在飞 forward。这个代价是否可见到值得做异步双缓冲（预注册的后续轮）？
+
+**臂**（每臂独立进程；0.6B、TP1、eager、`triton_paged`、`fcfs`）：
+- `overlap_off`：overlap ON、offload OFF（墙钟基线）
+- `overlap_offload`：overlap ON、offload ON（目标臂）
+- `serial_offload`：overlap OFF、offload ON（空闲拷贝基线）
+
+**冻结负载**（刻意把驱逐放进投机调度窗口；这是执行版，修订原因见下）：KV 池 36 块；12 条请求一次填满（无 fresh 块剩余）——6 条 "long" 600-token（3 块、最后一块不满，首次增长在 len=769 即第 169 个 decode token）`max_tokens=200`+`ignore_eos`，6 条 "short" 768-token `max_tokens=1`（第一个 decode token 后结束，18 个已哈希块进 LRU）；另 4 条 768-token 等待请求上线即入队。short 结束后，投机调度在 long 行的 forward 在飞时准入 4 条等待请求（12 块）；约 169 个 decode 步后 long 行再增长 6 块（又一次投机调度）。两批分配全是驱逐，且都落在在飞窗口内。
+
+> **负载修订记录（诚实注记）**：首版负载用 12×768-token + long `max_tokens=48`，想让边界增长与 short 结束发生在同一步——实跑发现边界增长需要第 4 块时 free=0，投机预检查 `defer`，所有驱逐落进串行兜底调度（G2 判 INVALID，`put_inflight=0`），**没有**打到目标窗口。于是把 long 行改成 600-token 的非对齐 prompt，把边界推到第 169 个 decode token，让 short 先释放 18 个 LRU 块。G1–G5 未改。
+
+**预注册门**：
+- **G1（硬）** `overlap_offload` 的 greedy token 输出 == `overlap_off`；不等 → INVALID（I31/I34 历史效应注记），不作结论。
+- **G2（硬）** 目标臂 `puts > 0` 且至少一次 offload 调用发生在 `engine._pending != None` 的窗口；否则 → INVALID（负载没打到窗口）。
+- **G3（硬）** 池账目闭环：`slots_in_use == len(host_map)`。
+- **G4（决策）** 墙钟中位数惩罚 = (target − baseline) / baseline，样本 = ≥5 轮**交错** A/B（协议修正见 6.1；门不变）：
+  - ≤ +5% → 阻塞 v1 可接受，**异步双缓冲不立项**（触发条件维持未满足）；
+  - 5–10% → 灰区，加重复次数再判；
+  - > +10% → 立项做 opt-in 异步原型。
+  臂内 CV > 5% → 决策 INVALID（噪声协议）。
+- **G5（记录）** 在飞 vs 空闲 offload 调用 p50、offload 总耗时、串行臂拷贝基线、驱逐计数。
+
+### 6.1 首轮（顺序分臂）与协议修正
+
+首轮按 `overlap_off → overlap_offload → overlap_offload_zero → serial_offload` 顺序各跑一个进程，结果自相矛盾：**0 槽消融臂（严格多做 sync+gather）墙钟比基线快 7.6%**，而两臂之间没有任何机制差异能解释它 → 判**臂间 GPU 时钟/电源漂移**，整轮作废。这正是 A/B 协议要求交错执行的原因；臂内 CV 只有 0.2–0.5%，抓不到臂间漂移。
+
+协议修正：每轮每臂一个新引擎进程，臂序逐轮交替，取引擎内第二次 repeat（首次 warmup 丢弃）。门与阈值不变。首轮唯一的有效产出是**机制数据**（与后续有效轮一致）：
+- **在飞 put 的 `synchronize()` 最大 44.6–45.1 ms**（等一次在飞 forward），p90 仅 0.7 ms——同一调度里第一次 sync 付掉等待，后续 put 只付拷贝；
+- put p50 ≈ **3.17 ms**（28 MiB/块：gather + pinned copy；0.6B 的 KV 块是 28 MiB，30B TP2 才是 12 MiB），串行臂同样 3.16 ms → 拷贝本身与 overlap 无关；
+- 每轮 puts=18（12 次准入 + 6 次边界增长），offload 总耗时 ≈ 103 ms。
+
+### 6.2 交错 A/B 判决
+
+| 轮数 | base 中位 (s) | target 中位 (s) | penalty | CV base/target | 判决 |
+|---:|---:|---:|---:|---|---|
+| 5 | 11.456 | 11.916 | **+4.02%** | 6.3% / 4.1% | INVALID（基线 CV 超 5%） |
+| 7 | 11.333 | 11.241 | **−0.81%** | 2.7% / 2.3% | **NOT_JUSTIFIED** |
+
+7 轮（有效）：G1 输出逐位相等、G2 puts=18 且 6 次在飞、G3 账目闭环；**墙钟差落在噪声内且符号为负**。机制上界一致：offload 全部工作 102.9 ms ≈ 墙钟 **0.9%**，其中 sync 45.7 ms ≈ 0.4%——即使把整体完全串行化也 <1.5%，远低于 5% 门。
+
+**判决：阻塞 v1 保持；异步双缓冲不立项（触发条件维持未满足）。** 依据：sync 等的那次 forward 本来也要跑，它吃掉的 overlap 时间上限就是本引擎 overlap 的收益（P23 实测 0.9972×，约 0.3%）。30B 上块更小（12 MiB）、sync 仍只等 forward、拷贝 ~0.4 ms/块，结论按比例不变。
+
+**重开条件**（写死，避免"感觉该做"）：① overlap 隐藏的调度占比显著变大（调度时间 >5% 步时）；或 ② 驱逐密度升一个量级（每步多次驱逐且 host 池常满）。满足任一条再用本探针复测，探针已含 `--rounds` 交错模式与 sync 分段计时。
+
+### 6.3 附带修复（I43）：满池/禁用池的 put 仍做全设备 sync + gather
+
+消融臂暴露：`offload_put` 在 `put` 判满返回 -1 **之前**已经做了 `torch.musa.synchronize()` + 28 MiB `index_select` gather；0 槽消融臂实测每次掉块白付 **~2.5 ms**（18 次 ≈ 84 ms/轮）。池满时每次驱逐都是 drop，这笔死工作按驱逐数线性放大。
+
+修复：`HostBlockPool.has_room()` + `note_full()`；`ModelRunner.offload_put` 在无空槽时直接返回 -1（`full_count` 计数保留；各 rank 槽位流一致 → 同分支）。修复后同一消融臂：**put p50 2.51 → 0.003 ms，offload 总耗时 84 → 0.1 ms，sync_max 44.9 → 0 ms**，drops=18 不变；`p30kvo` poolfull 仍 puts=4 / drops=5 / full_count=5 / revives=3 / bitwise（账目语义未变）。单元门 t6 覆盖 full/disabled/recovery 三种状态。

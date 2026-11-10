@@ -38,7 +38,7 @@ ssh s4000 'pgrep -fa "^/usr/bin/python3|^python3|^[s]pawn_main" || echo IDLE; mt
 - P29 已判 NO-GO：30B DP2、FP8 保留、8/4-bit、RR 放置、PP/SP/CP、PD 产品化、图路线；不要重开，除非有**新证据**。
 - P30-B Day1：修复了 installer `--target` fallback 的 transformers/tokenizers 版本冲突；release 安装 + `serve_s4000.sh` + 30B health/chat/stream 已实跑通过；systemd 实启与 venv 分支受当前实例限制，**未验证**，不要伪造。
 - P30-A：8k 合成 needle-QA **9/9 PASS**；API 超长输入 400；**8k 并发/SLO 探针已完成**（[day3 报告](../benchmarks/P30-day3-longctx-slo.md)）：18×7600 并发 TTFT p50 63.5s / 聚合 prefill ~2.1k tok/s，**判决 8k = 离线/批处理能力，非交互能力**；用法与 KV 容量表（util 0.9→651 块/rank≈20×8k；0.85→526≈16×8k）写入 OPERATIONS §6。P30-A 收口，不要重跑。
-- **P30-R1 KV offload 已完整收口，不要重做**（[报告](../benchmarks/P30-kv-offload.md)）：Round A 池基础件 + Round B 引擎接线（opt-in `--kv-offload`，init-only）+ 门矩阵全过——块级 bitwise 往返、TP1/TP2 复活 bitwise、**30B 单载 A/B 复活 TTFT 1.16s vs 冷 22.41s（19.3×）**、池满降级 drops>0 仍 bitwise、变异验证承重。附带修复 I41（离线 add_request 词表边界校验——越界 id 曾致 MUSA 无栈楔死）。剩余触发条件未满足项：异步双缓冲（搬运占比小不紧迫）、30B 容量规划数字（留真实流量）。
+- **P30-R1 KV offload 已完整收口，不要重做**（[报告](../benchmarks/P30-kv-offload.md)）：Round A 池基础件 + Round B 引擎接线（opt-in `--kv-offload`，init-only）+ 门矩阵全过——块级 bitwise 往返、TP1/TP2 复活 bitwise、**30B 单载 A/B 复活 TTFT 1.16s vs 冷 22.41s（19.3×）**、池满降级 drops>0 仍 bitwise、变异验证承重。附带修复 I41（离线 add_request 词表边界校验——越界 id 曾致 MUSA 无栈楔死）。**offload × overlap 共开实测也已完成（报告 §6）**：交错 7 轮 penalty −0.81%（CV 2.7%/2.3%），机制上界 0.9% → **异步双缓冲判不立项**（重开条件写死 §6.2）；附带修复 I43（满池/禁用池 put 早退，p50 2.51→0.003 ms）。唯一剩余触发条件：**真实流量下的 30B 容量规划数字**。
 - 测试网：G6 闭合（p6 `--strict` 进回归）；`p25_overlap_fix.py --tp 2`（G1 半闭合）；boundary 套件 C1–C8（C6/C7 cancel×overlap、**C8 stall_free_lpm 排序**——可选策略此前零覆盖）；`p30host`（KV offload `host_map` 槽位互斥——review 发现并修复的池泄漏回归门）。
 - 生产默认 `max_model_len` 仍 4096；8k 是 opt-in（`NANOVLLM_MAX_MODEL_LEN=8192`），定位离线/批处理。
 

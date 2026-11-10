@@ -283,6 +283,14 @@ class ModelRunner:
 
     def offload_put(self, block_id: int) -> int:
         self._ensure_offloader()
+        if not self.kv_offloader.has_room():
+            # Full or disabled pool: the caller degrades to the legacy drop,
+            # so skip the device-wide sync + block gather entirely.  Doing
+            # that work for a put that cannot land was pure waste on the
+            # drop path (measured ~2.5 ms per dropped put on 0.6B; see
+            # benchmarks/P30-kv-offload.md section 6).  Slot streams are
+            # rank-identical, so every rank takes the same branch.
+            return self.kv_offloader.note_full()
         torch.musa.synchronize()   # I28: snapshot only after prior async work
         idx = torch.tensor([block_id], device=self.kv_cache.device,
                            dtype=torch.long)

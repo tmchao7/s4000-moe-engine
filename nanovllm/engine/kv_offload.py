@@ -54,6 +54,21 @@ class HostBlockPool:
         self.releases = 0
         self.full_count = 0
 
+    def has_room(self) -> bool:
+        """True when put() would take a slot (mirrors its own two checks).
+
+        The engine checks this BEFORE the device-wide sync + block gather:
+        a put that cannot land degrades to the legacy drop, and doing the
+        copy work for it is pure waste on the full-pool drop path
+        (benchmark P30-kv-offload section 6.2).  Every rank's pool sees the
+        identical slot stream, so all ranks take the same branch."""
+        return self._buf is not None and bool(self._free)
+
+    def note_full(self) -> int:
+        """Record a put the caller skipped because the pool is full/disabled."""
+        self.full_count += 1
+        return -1
+
     def put(self, tensor: torch.Tensor, key: object = None) -> int:
         """Copy `tensor` into a free slot; -1 when full (caller degrades)."""
         if self._buf is None:

@@ -66,6 +66,10 @@ Round A 基础件(HostBlockPool 五门)+ Round B 引擎接线(opt-in `--kv-offlo
 
 对最近已 push commit 逐 diff 自检;发现并修复 **I42**(opt-in KV offload:池满丢块 + 前缀重算 → `_host_map` 条目被覆盖、旧 host 槽位永久孤儿 → 池容量静默泄漏)。修复 = `host_map` 与 `hash_to_block_id` 互斥(`_release_host_entry` 统一收口);新增纯 CPU 门 `tests/p30_kv_offload_hostmap.py`(进一键回归 `p30host` 行,变异验证旧代码三处 FAIL)。详见 [P30-kv-offload.md](../benchmarks/P30-kv-offload.md) §5 与 [ISSUES I42](ISSUES.md)。
 
+### P30 follow-up:offload × overlap 共开代价实测(11-10)
+
+预注册 §6 后开测:顺序分臂因臂间时钟漂移作废(0 槽消融臂反快 7.6%)→ 改交错 A/B;7 轮有效样本 **penalty −0.81%(CV 2.7%/2.3%)**,机制上界 offload 总工作 102.9ms ≈ 墙钟 0.9%(在飞 sync 最大 44.9ms)→ **异步双缓冲不立项,阻塞 v1 保持**(重开条件写死报告 §6.2)。附带修复 **I43**:满池/禁用池 put 早退 → p50 2.51→0.003ms。探针 `scripts/p30_offload_overlap_probe.py`;详见 [P30-kv-offload.md](../benchmarks/P30-kv-offload.md) §6。
+
 ### P30 夜间交接
 
 [NEXT-AGENT-PROMPT.md](NEXT-AGENT-PROMPT.md):给新 Agent 的可粘贴提示词。
