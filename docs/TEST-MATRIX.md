@@ -11,6 +11,7 @@
 | decode 后端(bmm_dense)六配置全等 | `tests/p6_bmm_dense_tiny.py --strict`(硬断言;P30 起已接入 run_regression.sh 的 p6 行,G6 闭合) | ✅(--strict 硬门进一键回归) |
 | 调度契约:空批不崩/HOL 跳过保序/混合步契约/空 FCFS | `tests/p8_scheduler_gaps.py` 6/6 | ✅ |
 | **stall_free_lpm 准入排序**(可选策略,P30 前零覆盖):lpm 压 FIFO / 饥饿守卫压 cacheability / priority 压一切 / 移除 lpm 分支即失败(变异验证);**探针 touch=False 不动 LRU + 真实准入 touch-on-hit 正对照**(P26 审计遗留项闭合:touch=False 有了调用者) | `tests/p25_overlap_prefill_boundary.py` scenario C8(纯 CPU,直接驱动 Scheduler 四序断言 + LRU 中性/正对照) | ✅(P30 补;随 boundary 进一键回归) |
+| KV offload 引擎门(opt-in `kv_offload_enabled`):复活 bitwise + 池满降级 + 词表边界(I41) | `tests/p30_kv_offload_engine.py`(parent + revival/poolfull 两 stage 子进程) | ✅(P30-R1;**已进一键回归 p30kvo 行**,17 套) |
 | 压测客户端口径(双 SLO/Wilson CI/分桶) | `tests/test_benchmarking_v3.py`(28) | ✅ |
 | 产品契约(CLI/env 优先级、认证、标准响应) | `tests/test_serve_config.py` + `tests/test_api_contract.py`(CPU;需 httpx) | ✅(P28 产品化新增) |
 | 冻结门阈值边界(门文件被误改/阈值漂移即 fail) | `tests/p5_decide.py`(纯 CPU;P26 补入回归) | ✅ |

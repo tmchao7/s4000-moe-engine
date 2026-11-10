@@ -45,6 +45,7 @@ run p23     env PYTHONPATH=. python3 tests/p23_overlap.py $MODEL_FLAG --out "$OU
 run p25fix  env PYTHONPATH=. python3 tests/p25_overlap_fix.py $MODEL_FLAG --out "$OUT_DIR/p25_overlap_fix.json"
 
 # Feature regression nets (judged capabilities; keep green or justify).
+run p30kvo  env PYTHONPATH=. python3 tests/p30_kv_offload_engine.py $MODEL_FLAG --out "$OUT_DIR/p30_kvo.json"  # KV offload: revival bitwise (TP1) + pool-full degrade + vocab gate
 run p16lru  env PYTHONPATH=. python3 tests/p16_lru_evict.py $MODEL_FLAG --out "$OUT_DIR/p16_lru.json"
 run p16mix  env PYTHONPATH=. python3 tests/p16_mixed_unified.py $MODEL_FLAG --out "$OUT_DIR/p16_mixed.json"
 run p16pri  env PYTHONPATH=. python3 tests/p16_priority_sched.py $MODEL_FLAG --out "$OUT_DIR/p16_priority.json"
