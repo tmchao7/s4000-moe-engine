@@ -31,8 +31,12 @@ def bench(size_bytes, reps, pin):
     host = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=pin)
     dev = torch.empty(size_bytes, dtype=torch.uint8, device="musa")
     out = {}
-    for name, op in (("d2h", lambda: dev.copy_(host, non_blocking=True)),
-                     ("h2d", lambda: host.copy_(dev, non_blocking=True))):
+    # d2h reads the device into host memory; h2d writes the device from host.
+    # (Review fix: the first version had these two lambdas swapped — both
+    # directions were measured with the same method and came out near-equal,
+    # so the recorded 29.68/29.80 pair stands; only the labels were wrong.)
+    for name, op in (("d2h", lambda: host.copy_(dev, non_blocking=True)),
+                     ("h2d", lambda: dev.copy_(host, non_blocking=True))):
         op()
         torch.musa.synchronize()          # warmup + I28: sync before timing D2H
         samples = []

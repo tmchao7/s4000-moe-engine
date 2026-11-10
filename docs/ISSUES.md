@@ -10,20 +10,20 @@
 
 | 系列 | 范围 | 编号 |
 |---|---|---|
-| **I** | P6 遗留技术债（引擎/图/数值/验证） | I1–I41（沿用历史编号；I16–I18 已迁入 E 系列，见 §3） |
+| **I** | P6 遗留技术债（引擎/图/数值/验证） | I1–I42（沿用历史编号；I16–I18 已迁入 E 系列，见 §3） |
 | **S** | P7 投机解码 | S1–S6 |
 | **E** | 生态与厂商（autotune 手搓边界、runtime 限制） | E1–E6 |
 
-**统计(P30-R1 后:I 38 项 = 已关闭 26 + 未结 12(I35–I38 已修;I39/I40 为 P27 验收发现并修复;I41 为 P30-R1 发现并修复);S 6 项;E 6 项)**
+**统计(P30 review 后:I 39 项 = 已关闭 27 + 未结 12(I35–I38 已修;I39/I40 为 P27 验收发现并修复;I41 为 P30-R1 发现并修复;I42 为 P30 review 发现并修复);S 6 项;E 6 项)**
 
 | 系列 | 已关闭 | 未结 | 未结条目 |
 |---|---:|---:|---|
-| I 技术债 | 25 | 12 | I1、I2、I3、I12、I14、**I19**、I20、I27、I28、**I31**、**I32**、**I34** |
+| I 技术债 | 27 | 12 | I1、I2、I3、I12、I14、**I19**、I20、I27、I28、**I31**、**I32**、**I34** |
 | S 投机解码 | 1 | 5 | S2–S6(S5 随 S1 搁置) |
 | E 生态厂商 | 1 | 5 | E2(可手搓)、E3–E6(厂商侧) |
 
-已关闭 28 项(I 26 + S1 + E1):I4、I5、I6、I7、I8、I9、I10、I11、I13、I15、I21、I22、I23、I24(部分修)、I25、I26、**I29、I30、I33**、**I35、I36、I37、I38、I39、I40、I41**、S1、E1。
-> 编号：I16–I18 已迁入 E 系列（E2/E5/E6），不再单独计数，故 I 系列实际 38 项（I1–I15、I19–I41）。
+已关闭 29 项(I 27 + S1 + E1):I4、I5、I6、I7、I8、I9、I10、I11、I13、I15、I21、I22、I23、I24(部分修)、I25、I26、**I29、I30、I33**、**I35、I36、I37、I38、I39、I40、I41、I42**、S1、E1。
+> 编号：I16–I18 已迁入 E 系列（E2/E5/E6），不再单独计数，故 I 系列实际 39 项（I1–I15、I19–I42）。
 > I8 已用有效跑闭合（1.0–1.15k token、384/384、rank1 存活）；三档 SLO 0% 是真实容量结论（瓶颈在 TTFT），P13 补齐机理与解法（见 I8 条目 P13 终局）。
 
 状态图例：🔴 阻塞主路径／决定立项　🟡 收益被冻结或覆盖缺口　🟢 工程债/低优　⚪ 厂商 runtime，我们不可修
@@ -111,6 +111,7 @@
 - **I39 overlap 投机批已完成 prefill 行被按 1-token 重发 → block_table 越界(🆕 P27 验收发现并修复)**:_prune_batch 对 parked prefill 行只做 min(frozen, live remaining);当在飞 collect 已把 prompt 做完(prompt 长度恰为 block_size 整数倍)时剩余被 clamp 成 1,行仍以 is_prefill=True、num_cached=prompt_len 发射;_prepare_rows 用 num_cached//block_size 取 block_table → IndexError(512/768/1024 token prompt 复现)。修复 = prune 用冻结 prefill_flags,以 **live is_prefill 是否被 postprocess 清掉**作为 prefill 完成信号(不能再用 `num_cached >= num_prompt_tokens`:被抢占的 seq 从 0 重 prefill 时 num_tokens > num_prompt_tokens,中途合法 chunk 会跨过 prompt 长度;该反例在 code review 中发现并补了 C4 回归);回归 tests/p25_overlap_prefill_boundary.py(纯 CPU,旧代码失败、新代码通过)。**review 二轮同族 high(I39b)**:overlap 兜底 sync schedule 在 `_sched_next=None` 时,若某 seq 在飞批完成 prefill 但被更早的投机 schedule 留在 waiting,会被当作 `q=1` prefill 行以 `mode=prefill` 发射 → 块边界 `_prepare_rows` 用 `start_block=len(block_table)` IndexError;修复 = `Scheduler.postprocess` 在最终 prefill 块完成后把仍在 waiting 的 seq 提升到 running(完成时用 `_remove_from_queues` 从两队列安全移除);C5 门(blocks=8/chunk=256/[512,600,768]/max_tokens=20)断言 `mode==derived(flags)` 且每行 block_table 覆盖,旧代码 C5 2 bad/FAIL、新代码 PASS。证据 docs/ACCEPTANCE-REPORT.md §3-C1。
 - **I40 投机调度改写 in-flight 行 → num_cached 少记(🆕 P27 验收发现并修复)**:尾部投机 schedule 在当前批 collect 前改写同一 seq 的 num_scheduled_tokens/is_prefill(为下一批);postprocess 按活值记账 → 200-token prefill 行只 +1,num_cached 失真(hashing/lpm/clamp 输入偏离)。修复 = ScheduledBatch 冻结 prefill_flags,postprocess/_finish_step 一律用冻结 query_lens/prefill_flags(与 vLLM V1 output processing consumes scheduler_output.num_scheduled_tokens 同规则);回归同上测试 C2。
 - **I41 离线 add_request 不校验词表边界 → 越界 token id 致 MUSA 无栈楔死(🆕 P30-R1 发现并修复)**:raw-id prompt 的 token id ≥ vocab_size 时 embedding gather 越界读,MUSA 表现为提交路径楔死(0% GPU、无 traceback、无 Python 异常,下一个 forward 的 kernel launch 永不返回)——本机最恶性失败形态,I36 signature 的输入侧变体。判别矩阵定位(核验点:offload-OFF 对照同样楔死;合法 id 后同负载 steps=8 finals=8 evict=12 全过;三次不同拷贝实现楔死排除本特性嫌疑)。修复 = `LLMEngine.add_request` 驱动侧校验 raw-id prompt 落在 `[0, vocab_size)`,越界 raise ValueError(API 路径 ValueError→400 已有;字符串 prompt 经 tokenizer 天然有界不受影响)。门:`tests/p30_kv_offload_engine.py` 内正/负 id 两断言。**教训:判别实验矩阵(off/on 对照)必须最先跑——"卡死≠厂商、卡死≠新代码"这次连"卡死≠被测特性"都成立;离线路径的输入信任边界要在引擎侧守住,不能假设调用方给的 id 合法。**
+- **I42 KV offload 池满丢块 + 重算 → host 槽位孤儿(🆕 P30 review 自检发现并修复)**:host 池满后驱逐走 legacy drop(删设备 hash、无 host 条目),设备哈希链断开;后续请求共享该前缀时 `can_allocate` 在丢块处 break、整段重算,`hash_blocks` 在旧 host 副本仍映射时把后继块重新登记为设备块;该设备块再被驱逐且 `offload_put` 成功时,`_allocate_block` 覆盖 `_host_map[h]` 条目,旧 slot 永久留在池 `in_use`(`in_use > len(host_map)`、`clear_prefix_cache` 放不掉)→ 池容量静默泄漏,长期退化为纯丢块。**不是正确性问题**(host 副本内容有效、设备优先),是资源/账目问题;drops=0 的 30B 收益轮与既有功能门都没走到该路径,故此前全绿。修复 = `_release_host_entry` 统一收口,确立 **`host_map` 与 `hash_to_block_id` 互斥**:`hash_blocks` 登记前释放陈旧条目(根因)、`_allocate_block` 覆盖前防御性释放、`clear_prefix_cache` 复用;offload 关闭时零行为变化。门:`tests/p30_kv_offload_hostmap.py`(纯 CPU,真 BlockManager + 假 executor 槽位记账,drop/复活/重算/再驱逐/clear 五节点逐步断言 `in_use == len(host_map)`;**变异验证**只回退根因修复 → 三处 FAIL),已进一键回归 `p30host` 行。**教训:map 存在"两处登记同一逻辑键"的可能时必须显式建立互斥不变量;功能门(bitwise/降级)全绿 ≠ 账目零泄漏,降级路径的"事后状态"要单独门。**
 - **I38 运行时关 overlap 丢弃已排投机批 → block_table 不变式破坏(🆕 P25 评审发现并修复)**:`set_scheduler_overlap(False)` 原实现直接丢 `_sched_next`,只 drain `_pending`;投机 schedule 对 inflight 跨界 decode 行已把 block_table 抬到 `ceil((L+1)/bs)`,批被丢弃后 token 永不追加 → 串行不变式 `len(table)==ceil(len/bs)` 破坏,`prepare_decode` 按 `block_table[-1]` 算写槽 → KV 写偏一块(复现中写到 slot 767 应为 511),该序列从跨界点起持续坏输出。同族:`NANOVLLM_OVERLAP_NO_SPEC=1` 原为"排了再丢"。修复 = disable 改**排空式收尾**(drain):在飞批照常 collect、 parked 批照常 launch(其 launch 时刻块覆盖恰在 collect 后成立)、仅停尾部投机调度,≤2 步排空后回串行;NO_SPEC 改为门控不排。回归 `tests/p25_overlap_fix.py` t1(中途 disable bitwise)/t2(翻转窗 ABA bitwise,跨 768 边界)。
 - **I21 per-rank KV 容量不一致(✅ 本轮修复)**:`allocate_kv_cache` 后 `dist.all_reduce(MIN)` 统一两 rank 的 `num_kvcache_blocks`;tiny TP2 六配置回归全等 rc=0,两 rank `[kvcache] blocks=` 一致(343080/343080、341994/341994;本轮加载内启发式恰好相同,真 divergence 钳制待 30B 长上下文确认)。
 - **I22 graph replay padding 写 KV slot 0(✅ 根因确认 + 修复 + TP1 验证;TP2 另有独立故障)**:scratch-slot 修复(`allocate_kv_cache` 多留 1 块 + replay 前 `slot_mapping/block_tables` 填 scratch);tiny/0.6B/8B 验证:GB 5/5 token 全等(paged)、GC 共享前缀全等、GD 捕获零失败;**30B TP2 首次 replay 楔死是独立故障**(见 I29),30B 图维持否决、默认 eager。详见 `benchmarks/archive/P8-graph.md`。

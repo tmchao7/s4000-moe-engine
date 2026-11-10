@@ -39,7 +39,7 @@ ssh s4000 'pgrep -fa "^/usr/bin/python3|^python3|^[s]pawn_main" || echo IDLE; mt
 - P30-B Day1：修复了 installer `--target` fallback 的 transformers/tokenizers 版本冲突；release 安装 + `serve_s4000.sh` + 30B health/chat/stream 已实跑通过；systemd 实启与 venv 分支受当前实例限制，**未验证**，不要伪造。
 - P30-A：8k 合成 needle-QA **9/9 PASS**；API 超长输入 400；**8k 并发/SLO 探针已完成**（[day3 报告](../benchmarks/P30-day3-longctx-slo.md)）：18×7600 并发 TTFT p50 63.5s / 聚合 prefill ~2.1k tok/s，**判决 8k = 离线/批处理能力，非交互能力**；用法与 KV 容量表（util 0.9→651 块/rank≈20×8k；0.85→526≈16×8k）写入 OPERATIONS §6。P30-A 收口，不要重跑。
 - **P30-R1 KV offload 已完整收口，不要重做**（[报告](../benchmarks/P30-kv-offload.md)）：Round A 池基础件 + Round B 引擎接线（opt-in `--kv-offload`，init-only）+ 门矩阵全过——块级 bitwise 往返、TP1/TP2 复活 bitwise、**30B 单载 A/B 复活 TTFT 1.16s vs 冷 22.41s（19.3×）**、池满降级 drops>0 仍 bitwise、变异验证承重。附带修复 I41（离线 add_request 词表边界校验——越界 id 曾致 MUSA 无栈楔死）。剩余触发条件未满足项：异步双缓冲（搬运占比小不紧迫）、30B 容量规划数字（留真实流量）。
-- 测试网：G6 闭合（p6 `--strict` 进回归）；`p25_overlap_fix.py --tp 2`（G1 半闭合）；boundary 套件 C1–C8（C6/C7 cancel×overlap、**C8 stall_free_lpm 排序**——可选策略此前零覆盖）。
+- 测试网：G6 闭合（p6 `--strict` 进回归）；`p25_overlap_fix.py --tp 2`（G1 半闭合）；boundary 套件 C1–C8（C6/C7 cancel×overlap、**C8 stall_free_lpm 排序**——可选策略此前零覆盖）；`p30host`（KV offload `host_map` 槽位互斥——review 发现并修复的池泄漏回归门）。
 - 生产默认 `max_model_len` 仍 4096；8k 是 opt-in（`NANOVLLM_MAX_MODEL_LEN=8192`），定位离线/批处理。
 
 ### 2. 今晚的目标（通用、探索性）
@@ -61,7 +61,7 @@ ssh s4000 'pgrep -fa "^/usr/bin/python3|^python3|^[s]pawn_main" || echo IDLE; mt
 1. **观察**：读代码/日志/测试，提出一个具体假设（“这里可能错”“这个门可能假绿”“8k 并发会排队”）。
 2. **复现**：写最小复现或先跑现有测试；没有复现就不改。
 3. **修复/实现**：最小 diff；保持 opt-in；不碰生产默认。
-4. **验证**：旧代码应失败/新代码通过；跑相关 pytest/单测；需要时跑 `bash tests/run_regression.sh --model /root/autodl-tmp/models/Qwen3-0.6B`（全量 16 套，一次只一个 GPU 任务）。
+4. **验证**：旧代码应失败/新代码通过；跑相关 pytest/单测；需要时跑 `bash tests/run_regression.sh --model /root/autodl-tmp/models/Qwen3-0.6B`（全量套件，清单与顺序以脚本为准；一次只一个 GPU 任务）。
 5. **记录**：在 `benchmarks/` 写数据/负结果，在 HANDOFF/PLAN 更新；数字必须可复现。
 6. **提交**：本地 commit；写清“改了什么/为什么/怎么验证”。
 
@@ -87,7 +87,7 @@ ssh s4000 'pgrep -fa "^/usr/bin/python3|^python3|^[s]pawn_main" || echo IDLE; mt
 
 - 一段最终总结：做了什么、修了什么 bug、验证了什么、什么没做完；
 - 本地 commit 列表（不 push）；
-- 测试/回归结果（`check_docs`、pytest、16 套；不要把没跑的写成通过）；
+- 测试/回归结果（`check_docs`、pytest、全量套件；不要把没跑的写成通过）；
 - 服务器状态：双卡 0 MiB、无进程、shm 干净；
 - 更新 `docs/HANDOFF.md` 和相关 `benchmarks/` 报告。
 

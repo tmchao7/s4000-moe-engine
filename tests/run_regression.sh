@@ -38,6 +38,7 @@ run repro   env PYTHONPATH=. python3 tests/p25_review_repro.py
 run p5decide python3 tests/p5_decide.py
 run pytest  env PYTHONPATH=. python3 -m pytest tests/test_benchmarking_v3.py tests/test_serve_config.py tests/test_api_contract.py -q
 run boundary env PYTHONPATH=. python3 tests/p25_overlap_prefill_boundary.py   # CPU: stale prefill row / frozen q / I37
+run p30host env PYTHONPATH=. python3 tests/p30_kv_offload_hostmap.py         # CPU: offload host_map/slot invariant (drop + recompute)
 run p8      env PYTHONPATH=. python3 tests/p8_scheduler_gaps.py
 run p2      env PYTHONPATH=. python3 tests/p2_grouped_mm.py
 run p6      env PYTHONPATH=. python3 tests/p6_bmm_dense_tiny.py --strict

@@ -62,6 +62,10 @@ SGLang HiCache 同思路(GPU→CPU 分层缓存)预注册探针:pinned 6MB D2H 2
 
 Round A 基础件(HostBlockPool 五门)+ Round B 引擎接线(opt-in `--kv-offload`,init-only)+ 引擎级门全过(**复活 bitwise** puts=9/revives=3/逐位相等 + 账目闭环 + 词表门)。**附带修复:离线 add_request 词表边界校验**(越界 id 曾致 MUSA 无栈楔死,判别矩阵定位)。报告 benchmarks/P30-kv-offload.md;默认关。 补测(11-10):TP2 门 PASS;**30B 单载 A/B:复活 TTFT 1.16s vs 冷 22.41s(19.3×),revives=116,bitwise 过**。
 
+### P30 提交自检 / code review(11-10)
+
+对最近已 push commit 逐 diff 自检;发现并修复 **I42**(opt-in KV offload:池满丢块 + 前缀重算 → `_host_map` 条目被覆盖、旧 host 槽位永久孤儿 → 池容量静默泄漏)。修复 = `host_map` 与 `hash_to_block_id` 互斥(`_release_host_entry` 统一收口);新增纯 CPU 门 `tests/p30_kv_offload_hostmap.py`(进一键回归 `p30host` 行,变异验证旧代码三处 FAIL)。详见 [P30-kv-offload.md](../benchmarks/P30-kv-offload.md) §5 与 [ISSUES I42](ISSUES.md)。
+
 ### P30 夜间交接
 
 [NEXT-AGENT-PROMPT.md](NEXT-AGENT-PROMPT.md):给新 Agent 的可粘贴提示词。

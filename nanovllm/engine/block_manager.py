@@ -73,6 +73,20 @@ class BlockManager:
         streams stay identical across ranks.  Pass None to disarm."""
         self._offload_exec = runner
 
+    def _release_host_entry(self, hash_key: int):
+        """Drop a host-swapped entry and return its slot (no-op when absent).
+
+        P30 review: host_map and hash_to_block_id must never describe the
+        same block at once.  A dropped eviction (full pool) breaks the device
+        hash chain, so a later prefill can recompute a block whose host copy
+        is still mapped; when that new device copy is evicted, the put would
+        overwrite the map entry and orphan the old slot forever (in_use >
+        host_map, clear_prefix_cache cannot drain it).  Callers below keep
+        the two maps exclusive."""
+        entry = self._host_map.pop(hash_key, None)
+        if entry is not None:
+            self._offload_exec.call("offload_release", entry[0])
+
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         h = xxhash.xxh64()
@@ -124,6 +138,10 @@ class BlockManager:
             if self._offload_exec is not None:
                 slot = self._offload_exec.call("offload_put", block_id)
                 if slot != -1:
+                    # Defensive (hash_blocks already keeps the maps
+                    # exclusive): overwriting a stale entry here would orphan
+                    # its slot.  Costs one dict lookup on the eviction path.
+                    self._release_host_entry(block.hash)
                     self._host_map[block.hash] = (slot, list(block.token_ids))
                     self.host_puts += 1
                 else:
@@ -280,6 +298,12 @@ class BlockManager:
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
+            # P30 review: a full-pool drop breaks the device hash chain, so a
+            # later prefill recomputes this block while its host copy may
+            # still be mapped.  The device copy supersedes it — keeping both
+            # would orphan the slot on the next eviction (put overwrite).
+            if h in self._host_map:
+                self._release_host_entry(h)
             self.hash_to_block_id[h] = block.block_id
 
     def metrics(self):
@@ -305,8 +329,8 @@ class BlockManager:
     def clear_prefix_cache(self):
         """Drop reusable hashes without touching blocks owned by live requests."""
         if self._offload_exec is not None:
-            for _h, (slot, _tok) in self._host_map.items():
-                self._offload_exec.call("offload_release", slot)
+            for hash_key in list(self._host_map):
+                self._release_host_entry(hash_key)
         self._host_map.clear()
         self.hash_to_block_id.clear()
         for block in self.blocks:

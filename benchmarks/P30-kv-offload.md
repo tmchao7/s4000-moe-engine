@@ -7,7 +7,7 @@
 ## 0. 为什么立项（判决依据）
 
 - PLAN backlog「swap 抢占/KV offload」**从未被判决**（不在 P29 已否清单）；
-- 带宽探针（[cc6d8fe]）：pinned 6MB D2H **29.68 GB/s** / 64MB ~52 GB/s；**口径修正**：一个 TP2 30B KV 块 = 2×48L×256 tok×2 kvh×128×bf16 = **12 MiB**（探针注释初版误写 6 MB，已改；按实测带宽，12 MiB 块换入+换出 ≈ 0.85 ms ≈ 142 ms decode 步的 **0.6%**，判决不变）；
+- 带宽探针（[cc6d8fe]）：pinned 6MB D2H **29.68 GB/s** / 64MB ~52 GB/s；**口径修正**：一个 TP2 30B KV 块 = 2×48L×256 tok×2 kvh×128×bf16 = **12 MiB**（探针注释初版误写 6 MB，已改；按实测带宽，12 MiB 块换入+换出 ≈ 0.85 ms ≈ 142 ms decode 步的 **0.6%**，判决不变）；**review 注记**：探针首版把两条拷贝的 d2h/h2d 标签写反（`dev.copy_(host)` 实为 H2D），两向实测近等（29.68/29.80），判决不受影响，脚本已修正；
 - 引擎已有全部前置件：LRU 淘汰（P16-B）、hash→块映射、MUSA KV 搬运先例（PD 线 M2）；
 - 8k 判决为离线/批处理能力后，容量扩展是其自然下一步。
 
@@ -108,3 +108,18 @@ KV 池实测 526 块/rank（block_bytes 12,582,912 = 12 MiB，与 §0 口径修�
 - **负结果如实记录**：drops=0 说明本轮未测到池满降级路径（1024 slots 足够大）；junk 的 TTFT（21-25 s）印证 8k 批量 prefill 的离线定位（与 [day3](./P30-day3-longctx-slo.md) 一致）。
 
 **30B 窗口运维注记**：第一次启动因"杀 driver 未杀 spawn worker"（pgrep 模式缺 `^[s]pawn_main` 锚定）留下 rank1 残显存，第二次启动 rank1 撞残留 OOM——AGENTS.md 红线"杀进程须锚定三模式"的实例教训，清理后第三次启动正常。
+
+## 5. 收口后自检发现的记账 bug（2026-11-10，P30 review 轮）
+
+**触发条件**：host 池满 → 驱逐 `put` 返回 -1 → 走 legacy drop（`host_drops+1`，删 `hash_to_block_id[h]`，不建 host 条目）。设备哈希链就此断开；后续请求共享该前缀时 `can_allocate` 在丢块处 break（`num_cached_blocks=0`），整段重算，`hash_blocks` 把已丢块的后继块重新登记为设备块——**而它的旧 host 副本仍映射在 `_host_map` 里**。
+
+**后果**：该设备块下一次被驱逐时 `offload_put` 成功（某个别的 hash 复活腾出了槽位），`_allocate_block` 直接 `_host_map[h] = (slot, …)` **覆盖**旧条目，旧 slot 永远留在池的 `in_use` 里：`in_use > len(host_map)`、`clear_prefix_cache()` 也放不掉。每次这样的事件泄漏 1 个槽位，池容量被静默蚕食，最终 offload 退化为纯丢块。**不是正确性问题**（host 副本内容有效、设备优先），是资源/账目问题；`drops=0` 的 30B 收益轮与现有门都没走到这条路径，所以此前全绿。
+
+**最小复现（纯 CPU，真 BlockManager + 假 executor 槽位记账）**：8 块设备池 + 2 槽 host 池；donor X（1 个缓存块）、A（2 个缓存块）deallocate 后 LRU 顺序 `[X0, A1, A0]`（`deallocate` 逆序遍历，后段前缀块先老化）。一次 8 块分配依次把 X0 换到 host slot0、A1 换到 slot1（池满）、A0 丢块；重跑 X 复活并腾出 slot0；重跑 A 在丢块处断链、全部重算（此时 `hash_blocks` 重新登记 A1，旧 host 条目仍在）；再驱逐 A1 的新设备块 → put 落到 slot0、覆盖 map → slot1 孤儿。
+
+**修复**（`nanovllm/engine/block_manager.py`，26 行）：新增 `_release_host_entry(hash_key)`（pop + `offload_release`），确立不变量 **`host_map` 与 `hash_to_block_id` 互斥**：
+1. `hash_blocks` 登记设备块前释放同 hash 的陈旧 host 条目（设备副本覆盖 host 副本，根因修复）；
+2. `_allocate_block` put 成功后覆盖前防御性释放（未来新增登记路径的护栏；正常路径只多一次 dict 查找）；
+3. `clear_prefix_cache` 复用同一 helper。
+
+**门**：`tests/p30_kv_offload_hostmap.py`（纯 CPU，进一键回归 `p30host` 行）逐步断言 `len(pool.in_use) == len(bm._host_map)` 且在 drop / 复活 / 重算 / 再驱逐 / clear 五个节点给出精确期望值。**变异验证**：只回退第 1 条 → "A recompute"（host_map=1 应为 0）、"re-evict"（in_use=2 vs 1）、"clear"（in_use=1 应为 0）三处 FAIL；修复后全 PASS。offload 关闭时 `_host_map` 恒空，helper 无调用，行为零变化。
