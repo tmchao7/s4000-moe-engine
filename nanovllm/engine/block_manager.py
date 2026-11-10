@@ -169,13 +169,12 @@ class BlockManager:
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id != -1 and self.blocks[block_id].token_ids == token_ids:
                 num_cached_blocks += 1
-                # Touch on hit: a queued request's prefix is about to be hot —
+                # Touch on hit: a REAL admission's prefix is about to be hot —
                 # move it to MRU so interleaved allocations don't sacrifice it.
-                # NOTE: the LPM ranking probe (scheduler._waiting_candidate) runs
-                # with the touch=True default, so probing a queued candidate DOES
-                # move its prefix hits to MRU — the touch=False variant has no
-                # caller today (P26 audit); wire it into the probe or drop the
-                # knob when scheduler policy work reopens.
+                # The lpm ranking probe (scheduler._waiting_candidate) passes
+                # touch=False (P30): ranking must not reorder the LRU on
+                # phantom hits — only admitted prefixes get bumped.  (P26
+                # audit item closed: touch=False now has a caller.)
                 if touch and self.lru_enabled and block_id in self._lru:
                     self._lru.move_to_end(block_id)
                 if block_id in self.used_block_ids:

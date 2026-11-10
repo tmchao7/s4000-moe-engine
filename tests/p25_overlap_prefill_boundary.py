@@ -488,7 +488,8 @@ def scenario_c8_lpm():
     Pure CPU, direct Scheduler drive (C3 style): donor seqs hold cached
     prefix blocks so waiting seqs' can_allocate probes hit real hashes.
     """
-    print("[C8] stall_free_lpm ordering: cacheable-first / starvation / priority")
+    print("[C8] stall_free_lpm ordering: cacheable-first / starvation / priority "
+          "/ probes must not reorder LRU")
     cfg = SimpleNamespace(
         max_num_seqs=8, max_num_batched_tokens=16384, eos=10,
         kvcache_block_size=BS, scheduler_policy="stall_free_lpm",
@@ -502,7 +503,9 @@ def scenario_c8_lpm():
         scheduler.add(seq)
         return seq
 
-    # Donors hold cached prefixes so waiting seqs' probes hit real hashes.
+    # Donors mint cached prefixes, then RELEASE them (ref 0 -> blocks sit in
+    # the free list + _lru) so the waiting seqs' probes hit live LRU entries
+    # and the touch semantics are observable.
     donor_big = Sequence(list(range(2000, 2768)),
                          SamplingParams(max_tokens=4))
     donor_mid = Sequence(list(range(5000, 5256)),
@@ -510,7 +513,7 @@ def scenario_c8_lpm():
     for donor in (donor_big, donor_mid):
         bm.allocate(donor, 0)
         bm.hash_blocks(donor, len(donor))
-        scheduler.running.append(donor)
+        bm.deallocate(donor)
 
     tail_big = list(range(7000, 7064))
     tail_mid = list(range(7100, 7164))
@@ -530,11 +533,35 @@ def scenario_c8_lpm():
     # the within-tier pick would be FIFO -> mid before big -> FAIL),
     # then mid, and finally lowpri whose priority-5 tier is excluded until
     # every priority-0 seq is gone (priority dominates both lpm and cache).
+    lru_before = list(bm._lru.keys())
     order = [scheduler._waiting_candidate().seq_id for _ in range(4)]
     expected = [s_none.seq_id, s_big.seq_id, s_mid.seq_id, s_lowpri.seq_id]
     ok = order == expected
     print("  pick order:", order, "expected:", expected)
     assert not scheduler.waiting
+
+    # P30: the ranking probe defaults to touch=False — four picks probing
+    # cached prefixes must NOT have reordered the LRU (losers of the ranking
+    # keep their recency; only real admissions bump).
+    lru_after = list(bm._lru.keys())
+    probe_neutral = lru_after == lru_before
+    print("  probes leave LRU untouched:", probe_neutral)
+    ok &= probe_neutral
+
+    # Positive control: a REAL admission (touch=True) does bump — proves the
+    # neutrality assertion above is meaningful, not vacuous.
+    h = -1
+    big_block_ids = []
+    for i in range(3):
+        h = bm.compute_hash(s_big.block(i), h)
+        big_block_ids.append(bm.hash_to_block_id[h])
+    bm.can_allocate(s_big, touch=True)
+    lru_touched = list(bm._lru.keys())
+    real_touch_works = lru_touched != lru_before and \
+        lru_touched[-3:] == big_block_ids
+    print("  real admission bumps prefix to MRU:", real_touch_works)
+    ok &= real_touch_works
+
     print("  -> PASS" if ok else "  -> FAIL")
     return ok
 

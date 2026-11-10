@@ -192,11 +192,18 @@ class Scheduler:
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, "decode"
 
-    def _waiting_candidate(self, touch: bool = True):
+    def _waiting_candidate(self, touch: bool = False):
         """P16-C: highest priority (lowest value) first; within a tier the
         policy applies — FIFO for stall_free, most-cacheable for lpm.  The
         starvation guard outranks priority so a long-queued low tier still
         makes progress (bounded fairness instead of hard starvation).
+
+        ``touch`` governs the lpm PROBE only and defaults to False (P30):
+        ranking must not reorder the LRU — when several candidates are
+        probed but only one is admitted, the losers' prefixes must not be
+        bumped to MRU on a phantom hit.  Real admissions keep touch-on-hit
+        (can_allocate's default): that is where the "about to be hot"
+        rationale holds.
 
         wait_steps is incremented once per schedule() pass (in
         _schedule_stall_free), NOT per candidate pick — a per-pick count made
